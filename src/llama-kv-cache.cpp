@@ -1759,9 +1759,10 @@ llama_kv_stream_attn llama_kv_cache::get_kv_stream_attn(ggml_context * ctx, ggml
         res.k = get_k(ctx, il, n_kv, sinfo);
         res.v = get_v(ctx, il, n_kv, sinfo);
         res.table = ikv;
-        if (n_tokens > llama_kv_stream::decode_max_tokens) {
-            res.runs = stream->page_runs();
-        }
+        // RDNA2 uses the chunked page-run TILE path even for one-token decode.
+        // Keep the runs available for every paged-attention batch; RDNA4's
+        // specialized short-decode kernel simply ignores them.
+        res.runs = stream->page_runs();
         if (stream->synced()) {
             // same layout as the pool views
             res.ring_k = ggml_view_4d(ctx, sk, hparams.n_embd_head_k(il), sk->ne[1], hparams.n_head_kv(il), 1,

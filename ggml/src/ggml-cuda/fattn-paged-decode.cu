@@ -37,8 +37,20 @@ static bool pd_shapes_ok(int device, const ggml_tensor * dst, int64_t max_nb) {
     const ggml_tensor * pages = dst->src[GGML_FA_SRC_PAGES];
     float params[3];
     memcpy(params, dst->op_params, sizeof(params)); // scale, max_bias, logit_softcap
-    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) return false;
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0) return false;
+    // The page-run prefill path uses stock flash attention and can also work
+    // on RDNA2. Only the specialized decode kernel below needs RDNA4 WMMA.
+    const bool rdna2 = GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[device].cc);
+    // RDNA4's specialized WMMA decoder is restricted to Q8_0/Q4_0. The
+    // RDNA2 page-run implementation instead calls the stock TILE kernel,
+    // which can dequantize Q4_0/Q8_0 or consume an F16 KV pair. In
+    // particular, this accepts the user's Swift KV Q4_0/Q4_0 configuration.
+    const bool rdna2_quant =
+        (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) ||
+        (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
+        (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) ||
+        (K->type == GGML_TYPE_F16  && V->type == GGML_TYPE_F16);
+    if (Q->type != GGML_TYPE_F32 ||
+        (rdna2 ? !rdna2_quant : (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0))) return false;
     if (Q->ne[0] != PD_D || K->ne[0] != PD_D || V->ne[0] != PD_D) return false;
     if (Q->ne[1] < 1 || Q->ne[1] > max_nb || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) return false;
     if (K->ne[2] < 1 || Q->ne[2] != PD_GQA * K->ne[2] || V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1]) return false;
@@ -59,6 +71,10 @@ static bool pd_shapes_ok(int device, const ggml_tensor * dst, int64_t max_nb) {
 }
 
 bool ggml_cuda_fattn_paged_decode_enabled(int device, const ggml_tensor * dst) {
+    // gfx1030 has no gfx12 WMMA: never dispatch the RDNA4 decode kernel.
+    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
     const bool paged = dst->src[GGML_FA_SRC_PAGES] != nullptr;
     // Paged K/V has no other CUDA path, so the switch only applies to contiguous K/V.
     if (!paged && pd_disabled()) {
@@ -123,7 +139,10 @@ bool ggml_cuda_fattn_paged_prefill_enabled(int device, const ggml_tensor * dst) 
     const ggml_tensor * K     = dst->src[1];
     const bool          paged = dst->src[GGML_FA_SRC_PAGES] != nullptr;
     const int64_t       chunk = (int64_t) pd_prefill_chunk_pages()*PD_PAGE;
-    if (Q->ne[1] <= PD_DECODE_MAX_NB) {
+    // On RDNA2 the paged decoder cannot run. Use stock tile attention over
+    // bounded page runs for short decode batches too, including one token.
+    const bool rdna2 = GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[device].cc);
+    if (Q->ne[1] <= PD_DECODE_MAX_NB && !(paged && rdna2)) {
         return false;
     }
     // paged K/V needs the runs; contiguous K/V is one run, worth splitting when longer than a chunk (bounds the stock
@@ -134,8 +153,12 @@ bool ggml_cuda_fattn_paged_prefill_enabled(int device, const ggml_tensor * dst) 
     if (!pd_shapes_ok(device, dst, INT32_MAX) || dst->src[4]) {
         return false;
     }
-    // the stock kernel for a part must write the log-sum-exp
-    pd_part part(dst, nullptr, nullptr, 0, 0, std::min<int64_t>(chunk, K->ne[1]), nullptr, nullptr);
+    // The stock RDNA2 tile kernel writes per-row LSE for page-run parts;
+    // gfx12 continues to use MMA_F16 and its existing LSE path.
+    // The runtime part always requests LSE. Probe exactly that kernel choice:
+    // without the pointer, RDNA2 picks VEC for 1-2 tokens and rejects paging.
+    float lse_probe = 0.0f;
+    pd_part part(dst, nullptr, nullptr, 0, 0, std::min<int64_t>(chunk, K->ne[1]), nullptr, &lse_probe);
     return ggml_cuda_flash_attn_ext_writes_lse(device, &part.dst);
 }
 
@@ -151,7 +174,10 @@ struct pd_prefill_scratch {
         const int64_t chunk = (int64_t) pd_prefill_chunk_pages()*PD_PAGE;
         // parts of paged K/V can be as long as a chunk whatever the pool size, parts of contiguous K/V as long as K/V
         const int64_t n_tok = dst->src[GGML_FA_SRC_PAGES] ? chunk : std::min(chunk, K->ne[1]);
-        pd_part part(dst, nullptr, nullptr, 0, 0, n_tok, nullptr, nullptr);
+        // Size the scratch for the same TILE kernel used at runtime. A null
+        // LSE pointer could select VEC and underestimate its f16 staging.
+        float lse_probe = 0.0f;
+        pd_part part(dst, nullptr, nullptr, 0, 0, n_tok, nullptr, &lse_probe);
         dst_size  = GGML_PAD(ggml_nbytes(dst), 256);
         // the f16 copies inside a part are aligned to 128 B from the start of the buffer
         part_size = GGML_PAD(ggml_cuda_flash_attn_ext_get_alloc_size(device, &part.dst) + 256, 256);

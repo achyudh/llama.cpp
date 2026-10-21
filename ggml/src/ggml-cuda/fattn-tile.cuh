@@ -813,7 +813,9 @@ static __global__ void flash_attn_tile(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         float      * __restrict__ lse) {
-    GGML_UNUSED(lse);
+    // The chunked paged-attention fallback on RDNA2 merges normalized
+    // outputs from disjoint page runs. Its merge kernel needs the actual
+    // per-query log(sum(exp(scores))), including the running maximum.
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
@@ -1096,6 +1098,13 @@ static __global__ void flash_attn_tile(
         const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + j)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
+
+        // A paged KV part is deliberately launched without split-K blocks:
+        // otherwise the log-sum-exp would describe only this block's subset.
+        if (lse && gridDim.y == 1 && threadIdx.x == 0) {
+            lse[j_dst_unrolled] = KQ_sum[jc0] > 0.0f
+                ? KQ_max[jc0] + logf(KQ_sum[jc0]) : -INFINITY;
+        }
 
 #ifdef FAST_FP16_AVAILABLE
         constexpr int cpy_ne_D = cpy_ne/2 < (DVp/2)/warp_size ? cpy_ne/2 : (DVp/2)/warp_size;

@@ -630,6 +630,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // On RDNA2, paged attention merges independently normalized page runs.
+    // Select TILE only for requests with an LSE output, leaving ordinary
+    // attention dispatch unchanged (RDNA4 still uses its WMMA implementation).
+    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+        float * lse = nullptr;
+        memcpy(&lse, dst->op_params + GGML_FA_PARAM_LSE, sizeof(lse));
+        if (lse != nullptr && Q->ne[0] == 256 && V->ne[0] == 256) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -791,7 +802,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_writes_lse(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+    return kernel == BEST_FATTN_KERNEL_MMA_F16 ||
+           (kernel == BEST_FATTN_KERNEL_TILE && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[device].cc));
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

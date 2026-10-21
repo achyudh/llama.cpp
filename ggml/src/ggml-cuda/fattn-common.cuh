@@ -1142,10 +1142,14 @@ void launch_fattn(
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
+    float * lse = nullptr;
+    memcpy(&lse, KQV->op_params + GGML_FA_PARAM_LSE, sizeof(lse));
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
-    int parallel_blocks = max_blocks_per_sm;
+    // Per-run LSE must cover all KV tokens in the run. Split-K requires
+    // another LSE reduction, so bound LSE-enabled page runs to one split.
+    int parallel_blocks = lse ? 1 : max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
@@ -1206,7 +1210,7 @@ void launch_fattn(
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= (lse ? 1 : ntiles_KV); ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
@@ -1236,9 +1240,6 @@ void launch_fattn(
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
-
-    float * lse = nullptr;
-    memcpy(&lse, KQV->op_params + GGML_FA_PARAM_LSE, sizeof(lse));
 
     memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
     memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
