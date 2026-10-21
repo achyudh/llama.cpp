@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <vector>
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) && !defined(_WIN32)
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 
@@ -61,16 +61,22 @@ static ggml_backend_copy_engine_t ggml_cuda_copy_engine_init(ggml_backend_dev_t 
         return HSA_STATUS_SUCCESS;
     }, &ce->cpu));
 
-    uint32_t mask = 0;
-    HSA_CHECK(hsa_amd_memory_copy_engine_status(ce->gpu, ce->cpu, &mask));
+    uint32_t available_mask = 0;
+    HSA_CHECK(hsa_amd_memory_copy_engine_status(ce->gpu, ce->cpu, &available_mask));
+    uint32_t mask = available_mask;
     if (const char * env = getenv("GGML_CUDA_COPY_ENGINE_SDMA")) {
-        mask = (uint32_t) strtoul(env, nullptr, 0);
+        // Overrides may narrow the available engines, but must never
+        // request an unavailable engine or reuse HIP's primary SDMA 0x1.
+        mask &= (uint32_t) strtoul(env, nullptr, 0);
     }
-    GGML_ASSERT(mask != 0 && "no SDMA engine for host to device copies");
+    if ((mask & ~1u) == 0) {
+        GGML_LOG_ERROR("%s: independent SDMA is unavailable (ROCr mask 0x%x, selected 0x%x); "
+                       "refusing a potential HIP copy/compute deadlock\n", __func__, available_mask, mask);
+        delete ce;
+        return nullptr;
+    }
+    mask &= ~1u;
     uint32_t engine = 1u << (31 - __builtin_clz(mask));
-    if (engine == 1) {
-        GGML_LOG_WARN("%s: only SDMA engine 0x1 is available, which HIP also uses: copies may stall\n", __func__);
-    }
     ce->engine = (hsa_amd_sdma_engine_id_t) engine;
 
     ce->events.resize(n_events);
@@ -160,8 +166,13 @@ static void ggml_cuda_copy_engine_record(ggml_backend_copy_engine_t ce, int i) {
 }
 
 static bool ggml_cuda_copy_engine_done(ggml_backend_copy_engine_t ce, int i) {
+#if defined(GGML_USE_HIP)
+    const cudaError_t err = hipEventQuery(ce->events[i]);
+    if (err == hipErrorNotReady) {
+#else
     const cudaError_t err = cudaEventQuery(ce->events[i]);
     if (err == cudaErrorNotReady) {
+#endif
         (void) cudaGetLastError();
         return false;
     }
@@ -169,7 +180,7 @@ static bool ggml_cuda_copy_engine_done(ggml_backend_copy_engine_t ce, int i) {
     return true;
 }
 
-#endif // defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) && !defined(_WIN32)
 
 static void * ggml_cuda_copy_engine_alloc_shared(ggml_backend_copy_engine_t ce, size_t size) {
     ggml_cuda_set_device(ce->device);
@@ -195,5 +206,12 @@ static const ggml_backend_copy_engine_i ggml_cuda_copy_engine_iface = {
 };
 
 const ggml_backend_copy_engine_i * ggml_cuda_copy_engine_get_iface(void) {
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+    // HIP on Windows does not expose HSA SDMA engine selection. Do not run
+    // a graph which polls host-copy completion on an unsafely shared queue.
+    // The opt-in KV stream fails closed; standard/KVMem execution is unaffected.
+    return nullptr;
+#else
     return &ggml_cuda_copy_engine_iface;
+#endif
 }
