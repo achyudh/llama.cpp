@@ -66,7 +66,13 @@ struct pd_kv {
     }
 };
 
+#if defined(_WIN32)
+// Windows resets the GPU (TDR) when a kernel runs for more than TdrDelay (2 s by default): trap well before that, so a
+// stalled copy queue fails with a GPU exception instead of a driver reset. A layer's copies take milliseconds.
+static constexpr uint64_t PD_SYNC_TIMEOUT = 15ull * 10000000ull; // 1.5 s of wall_clock64()
+#else
 static constexpr uint64_t PD_SYNC_TIMEOUT = 60ull * 100000000ull; // 60 s of wall_clock64()
+#endif
 
 // K/V written by another queue (ggml_flash_attn_ext_set_sync): the copy queue publishes *ready >= tag once the data has
 // landed; the combine kernel publishes *consumed = tag once every block has read it. Flags are monotonic and compared

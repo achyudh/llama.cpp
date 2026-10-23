@@ -46,7 +46,22 @@ endif()
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
-find_package(hsa-runtime64 REQUIRED) # copy engine (copy-engine.cu)
+
+# Copy engine (copy-engine.cu): on Linux the KV streaming copies go straight to a dedicated SDMA engine through ROCr
+# (the HSA runtime). The Windows HIP SDK has no ROCr (its HIP runtime sits on PAL), so there the copy engine is a
+# non-blocking HIP stream instead. GGML_HIP_COPY_ENGINE_HSA=OFF forces the stream path on Linux too.
+if (WIN32)
+    set(GGML_HIP_COPY_ENGINE_HSA_DEFAULT OFF)
+else()
+    set(GGML_HIP_COPY_ENGINE_HSA_DEFAULT ON)
+endif()
+option(GGML_HIP_COPY_ENGINE_HSA "ggml: KV streaming copy engine on an SDMA engine through ROCr (Linux only)" ${GGML_HIP_COPY_ENGINE_HSA_DEFAULT})
+if (GGML_HIP_COPY_ENGINE_HSA)
+    if (WIN32)
+        message(FATAL_ERROR "GGML_HIP_COPY_ENGINE_HSA needs ROCr (the HSA runtime), which the Windows HIP SDK does not ship")
+    endif()
+    find_package(hsa-runtime64 REQUIRED)
+endif()
 
 if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
@@ -106,6 +121,10 @@ if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()
 
+if (GGML_HIP_COPY_ENGINE_HSA)
+    add_compile_definitions(GGML_HIP_COPY_ENGINE_HSA)
+endif()
+
 if (NOT GGML_HIP_MMQ_MFMA)
     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
 endif()
@@ -142,4 +161,8 @@ if (GGML_HIP_RCCL)
     target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
 endif()
 
-target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas hsa-runtime64::hsa-runtime64)
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+if (GGML_HIP_COPY_ENGINE_HSA)
+    target_link_libraries(ggml-hip PRIVATE hsa-runtime64::hsa-runtime64)
+endif()

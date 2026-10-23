@@ -6,10 +6,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 
 static inline void cpu_relax() {
-#if defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    _mm_pause(); // also MSVC; __builtin_ia32_pause is GCC/Clang only
 #else
     std::this_thread::yield();
 #endif
@@ -516,7 +521,7 @@ void llama_kv_stream::copier_main() {
 
         // nothing queued behind a decode ubatch: copy the first layers of the next one while the host works
         bool idle = false;
-        if (j.small) {
+        if (j.small_ub) {
             std::lock_guard<std::mutex> lock(mtx);
             idle = jobs.empty() && !stop;
         }

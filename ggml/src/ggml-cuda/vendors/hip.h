@@ -60,10 +60,12 @@
 #define cudaError_t hipError_t
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+#define cudaErrorNotReady hipErrorNotReady
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecord hipEventRecord
+#define cudaEventQuery hipEventQuery
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
@@ -122,6 +124,7 @@
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaStreamSynchronize hipStreamSynchronize
+#define cudaStreamQuery hipStreamQuery
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaGraphExec_t hipGraphExec_t
 #define cudaGraphNode_t hipGraphNode_t

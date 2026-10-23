@@ -178,7 +178,7 @@ private:
         uint32_t tag;
         std::vector<run> copies; // page: host page, slot: page index in the device slot
         ggml_backend_event_t wb = nullptr; // write-backs the copies read, recorded on the compute stream
-        bool small = false;                // a decode ubatch (decode_max_tokens): prefetch the next one
+        bool small_ub = false;               // a decode ubatch (decode_max_tokens): prefetch the next one
         uint64_t ubatch = 0;               // n_prepared when it was queued
     };
 
