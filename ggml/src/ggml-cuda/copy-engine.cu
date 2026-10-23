@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <vector>
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_COPY_ENGINE_HSA)
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 
@@ -116,7 +116,8 @@ static bool ggml_cuda_copy_engine_done(ggml_backend_copy_engine_t ce, int i) {
 
 #else
 
-// A non-blocking stream for host -> device copies.
+// A non-blocking stream for host -> device copies (CUDA, and HIP without ROCr: the Windows HIP SDK).
+// On Windows the runtime batches stream commands, so record() submits them: the attention kernels spin until they land.
 struct ggml_backend_copy_engine {
     int                      device;
     cudaStream_t             stream;
@@ -157,6 +158,15 @@ static void ggml_cuda_copy_engine_copy_to_device(ggml_backend_copy_engine_t ce, 
 static void ggml_cuda_copy_engine_record(ggml_backend_copy_engine_t ce, int i) {
     ggml_cuda_set_device(ce->device);
     CUDA_CHECK(cudaEventRecord(ce->events[i], ce->stream));
+#if defined(_WIN32)
+    // submit the batch now (see above); not ready is the expected answer
+    const cudaError_t err = cudaStreamQuery(ce->stream);
+    if (err == cudaErrorNotReady) {
+        (void) cudaGetLastError();
+    } else {
+        CUDA_CHECK(err);
+    }
+#endif
 }
 
 static bool ggml_cuda_copy_engine_done(ggml_backend_copy_engine_t ce, int i) {
@@ -169,7 +179,7 @@ static bool ggml_cuda_copy_engine_done(ggml_backend_copy_engine_t ce, int i) {
     return true;
 }
 
-#endif // defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) && defined(GGML_HIP_COPY_ENGINE_HSA)
 
 static void * ggml_cuda_copy_engine_alloc_shared(ggml_backend_copy_engine_t ce, size_t size) {
     ggml_cuda_set_device(ce->device);
