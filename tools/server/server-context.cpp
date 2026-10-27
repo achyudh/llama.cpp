@@ -15,6 +15,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -254,6 +255,14 @@ struct server_batch {
     }
 };
 
+static bool server_moe_perf_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_MOE_PERF");
+        return value && std::string(value) == "1";
+    }();
+    return enabled;
+}
+
 struct server_slot {
     int id;
 
@@ -405,6 +414,50 @@ struct server_slot {
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
+    std::vector<uint64_t> perf_tested_per_pos;
+    std::map<size_t, uint64_t> perf_verify_widths;
+    uint64_t perf_checkpoint_restores = 0;
+    uint64_t perf_replay_verifications = 0;
+    int64_t perf_last_us = 0;
+    int perf_end_reason = 0;
+    uint64_t perf_target_wall_us = 0;
+    uint64_t perf_target_calls = 0;
+
+    void perf_log(bool final) {
+        if (!server_moe_perf_enabled() || !task) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        if (!final && now - perf_last_us < 5000000) {
+            return;
+        }
+        json record = {
+            {"schema", 1}, {"us", now}, {"task", task->id}, {"slot", id}, {"final", final},
+            {"reason", perf_end_reason}, {"state", (int) state}, {"stop", (int) stop},
+            {"input", task->n_tokens()}, {"context", prompt.n_tokens()},
+            {"cached", stats.n_prompt_cached}, {"processed", stats.n_prompt_processed},
+            {"generated", stats.n_gen}, {"prompt_ms", stats.t_prompt_ms()}, {"decode_ms", stats.t_gen_ms()},
+            {"drafted", stats.n_draft_tokens}, {"accepted", stats.n_draft_accepted},
+            {"verify_steps", stats.n_draft_verif_steps}, {"checkpoint_restores", perf_checkpoint_restores},
+            {"replay_verifications", perf_replay_verifications},
+            {"target_wall_us", perf_target_wall_us}, {"target_calls", perf_target_calls}
+        };
+        record["accepted_pos"] = json::array();
+        record["tested_pos"] = json::array();
+        record["verify_widths"] = json::array();
+        for (uint64_t n : n_accepted_per_pos) {
+            record["accepted_pos"].push_back(n);
+        }
+        for (uint64_t n : perf_tested_per_pos) {
+            record["tested_pos"].push_back(n);
+        }
+        for (const auto & entry : perf_verify_widths) {
+            record["verify_widths"].push_back(json::array({entry.first, entry.second}));
+        }
+        SLT_INF(*this, "request_perf: %s\n", record.dump().c_str());
+        common_speculative_print_stats(spec);
+        perf_last_us = now;
+    }
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -441,6 +494,12 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        perf_tested_per_pos.clear();
+        perf_verify_widths.clear();
+        perf_checkpoint_restores = perf_replay_verifications = 0;
+        perf_last_us = 0;
+        perf_end_reason = 0;
+        perf_target_wall_us = perf_target_calls = 0;
 
         n_predict_max = -1;
 
@@ -643,6 +702,9 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
+            perf_log(true);
+            llama_perf_moe_flush(ctx_tgt, true);
+            llama_perf_moe_flush(ctx_dft, true);
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
@@ -1115,6 +1177,14 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                slot.perf_end_reason = 4;
+                slot.perf_log(true);
+            }
+        }
+        llama_perf_moe_flush(ctx_tgt, true);
+        llama_perf_moe_flush(ctx_dft, true);
         spec.reset();
         spec_init.reset();
 
@@ -2275,7 +2345,8 @@ private:
         send_error(task.id, error, type);
     }
 
-    void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+    void send_error(server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        slot.perf_end_reason = 2;
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
 
@@ -2352,6 +2423,7 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        slot.perf_end_reason = 1;
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2459,7 +2531,7 @@ private:
         queue_results.send(std::move(res));
     }
 
-    void send_decision(const server_slot & slot, const common_batch & batch, int32_t i_batch) {
+    void send_decision(server_slot & slot, const common_batch & batch, int32_t i_batch) {
         auto res = std::make_unique<server_task_result_decision>();
         res->id       = slot.task->id;
         res->index    = slot.task->index;
@@ -3046,6 +3118,7 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            slot.perf_end_reason = 3;
                             slot.release();
                             break;
                         }
@@ -3445,7 +3518,32 @@ private:
         return false;
     }
 
+    void perf_scope() {
+        int64_t task = -1;
+        int slot_id = -1;
+        int phase = 0;
+        int active = 0;
+        for (auto & slot : slots) {
+            if (slot.is_processing() && slot.task) {
+                ++active;
+                task = slot.task->id;
+                slot_id = slot.id;
+                phase = slot.state == SLOT_STATE_GENERATING ? 2 : 1;
+                slot.perf_log(false);
+            }
+        }
+        if (active > 1) {
+            task = slot_id = -1;
+            phase = 3;
+        }
+        llama_perf_moe_scope(ctx_tgt, task, slot_id, phase);
+        llama_perf_moe_scope(ctx_dft, task, slot_id, phase);
+    }
+
     void update_slots() {
+        if (server_moe_perf_enabled()) {
+            perf_scope();
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3498,6 +3596,9 @@ private:
             return;
         }
 
+        if (server_moe_perf_enabled()) {
+            perf_scope();
+        }
         // note: TTS slots bypass the shared batch entirely
         try {
             process_tts_slots();
@@ -4170,6 +4271,9 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        if (server_moe_perf_enabled()) {
+                                            slot.perf_checkpoint_restores++;
+                                        }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -4573,6 +4677,7 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_work = server_moe_perf_enabled() ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
@@ -4580,6 +4685,20 @@ private:
             }
         });
 
+        if (server_moe_perf_enabled()) {
+            server_slot * single = nullptr;
+            int active = 0;
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    single = &slot;
+                    ++active;
+                }
+            }
+            if (active == 1) {
+                single->perf_target_wall_us += ggml_time_us() - t_work;
+                single->perf_target_calls++;
+            }
+        }
         if (ret != 0) {
             {
                 std::string err;
@@ -4807,6 +4926,14 @@ private:
 
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
+            if (server_moe_perf_enabled()) {
+                slot.perf_verify_widths[n_draft + 1]++;
+                slot.perf_tested_per_pos.resize(std::max(slot.perf_tested_per_pos.size(), n_draft), 0);
+                for (size_t i = 0; i < n_draft; ++i) {
+                    slot.perf_tested_per_pos[i]++;
+                }
+                slot.perf_replay_verifications += slot.spec_is_replay;
+            }
 
             GGML_ASSERT(n_draft > 0);
 
@@ -4861,6 +4988,9 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        if (server_moe_perf_enabled()) {
+                            slot.perf_checkpoint_restores++;
+                        }
                         GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                         if (slot.ctx_dft) {

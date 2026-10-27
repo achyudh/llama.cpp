@@ -2,11 +2,29 @@
 
 #include "ggml-backend.h"
 
+#include <array>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <vector>
 
 struct llama_model;
+
+bool llama_moe_perf_enabled();
+
+struct llama_moe_perf_data {
+    enum metric {
+        hits, misses, evictions, hit_bytes, fill_bytes, fill_calls, bypass_bytes, bypass_calls,
+        bypass_large, bypass_other, padding_bytes, d2d_bytes, d2d_calls, id_bytes, id_calls,
+        id_wait_us, plan_us, submit_us, copy_le64k, copy_le1m, copy_le4m, copy_gt4m, count
+    };
+    std::array<uint64_t, count> values = {};
+
+    void upload(size_t bytes, bool fill);
+    void print(int64_t task, int slot, int phase, int role, int layer, int type, bool total) const;
+    llama_moe_perf_data & operator+=(const llama_moe_perf_data & other);
+    llama_moe_perf_data operator-(const llama_moe_perf_data & other) const;
+};
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
@@ -31,6 +49,8 @@ public:
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+
+    void perf_flush(int64_t task, int slot, int phase, int role, bool final);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

@@ -29,10 +29,12 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cinttypes>
 #include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1270,6 +1272,12 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // Release registrations before ctxs_bufs and mappings.
+    std::mutex host_registration_mutex;
+    ggml_backend_reg_t host_registration_backend = nullptr;
+    size_t host_registration_bytes = 0;
+    std::vector<std::unique_ptr<void, void (*)(void *)>> host_registrations;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1351,6 +1359,41 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+}
+
+void llama_model::register_host_weights(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors, size_t budget) const {
+    std::lock_guard<std::mutex> lock(pimpl->host_registration_mutex);
+    const int64_t begin = ggml_time_us();
+    size_t attempted = 0, failed = 0, skipped = 0;
+    if (budget) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto acquire = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+        auto release = reg ? (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer") : nullptr;
+        if (!acquire || !release || (pimpl->host_registration_backend && pimpl->host_registration_backend != reg)) {
+            throw std::runtime_error("host registration backend is unavailable or changed");
+        }
+        for (const ggml_tensor * w : tensors) {
+            if (std::any_of(pimpl->host_registrations.begin(), pimpl->host_registrations.end(), [&](const auto & p) { return p.get() == w->data; })) {
+                continue;
+            }
+            const size_t size = ggml_nbytes(w);
+            if (!w->data || !w->buffer || !ggml_backend_buffer_is_host(w->buffer) || size > budget || pimpl->host_registration_bytes > budget - size) {
+                skipped++;
+                continue;
+            }
+            attempted++;
+            if (!acquire(w->data, size)) {
+                failed++;
+                continue;
+            }
+            std::unique_ptr<void, void (*)(void *)> entry(w->data, release);
+            pimpl->host_registrations.push_back(std::move(entry));
+            pimpl->host_registration_bytes += size;
+            pimpl->host_registration_backend = reg;
+        }
+    }
+    LLAMA_LOG_INFO("moe_host_registration: schema=1 budget=%zu registered_bytes=%zu attempted=%zu completed=%zu failed=%zu skipped=%zu us=%" PRId64 "\n",
+        budget, pimpl->host_registration_bytes, attempted, pimpl->host_registrations.size(), failed, skipped, ggml_time_us() - begin);
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {

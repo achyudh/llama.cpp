@@ -618,6 +618,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    perf_moe_flush(true);
 
     if (phase_leader) {
         auto & f = phase_leader->phase_followers;
@@ -1680,6 +1681,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    static const bool trace_moe = std::getenv("GGML_CPU_MOE_TRACE") != nullptr;
+    if (trace_moe) {
+        uint32_t outputs = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            outputs += ubatch.output[i] != 0;
+        }
+        LLAMA_LOG_INFO("moe_trace_graph: us=%" PRId64 " role=%s tokens=%u outputs=%u pos0=%d\n",
+            ggml_time_us(), cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target", ubatch.n_tokens, outputs, ubatch.pos[0]);
+    }
+
+    if (llama_moe_perf_enabled()) {
+        moe_perf_widths[ubatch.n_tokens]++;
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -2943,12 +2957,24 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
+    const bool observe = llama_moe_perf_enabled();
+    auto * perf = observe ? &lctx->moe_perf_bypass[src->type] : nullptr;
+    if (perf) {
+        perf->values[ids->ne[1] > 32 ? llama_moe_perf_data::bypass_large : llama_moe_perf_data::bypass_other]++;
+    }
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+        const int64_t t_ids = observe ? ggml_time_us() : 0;
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);
+        if (perf) {
+            perf->values[llama_moe_perf_data::id_wait_us] += ggml_time_us() - t_ids;
+            perf->values[llama_moe_perf_data::id_bytes] += ggml_nbytes(ids);
+            perf->values[llama_moe_perf_data::id_calls]++;
+        }
 
+        const int64_t t_plan = observe ? ggml_time_us() : 0;
         st.used.assign(n_expert, false);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
@@ -2959,7 +2985,19 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+        if (perf) {
+            perf->values[llama_moe_perf_data::plan_us] += ggml_time_us() - t_plan;
+        }
     }
+
+    auto upload = [&](size_t offset, size_t bytes) {
+        const int64_t t_submit = observe ? ggml_time_us() : 0;
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, bytes);
+        if (perf) {
+            perf->upload(bytes, false);
+            perf->values[llama_moe_perf_data::submit_us] += ggml_time_us() - t_submit;
+        }
+    };
 
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
@@ -2981,7 +3019,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                upload(next*expert_size, (e - next)*expert_size);
             }
             e   += n;
             next = e;
@@ -2992,7 +3030,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            upload(offset, size);
+            if (perf) {
+                perf->values[llama_moe_perf_data::padding_bytes] += padding;
+            }
         }
 
         first = last + 1;
@@ -3835,6 +3876,59 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
 //
 // perf
 //
+
+void llama_context::perf_moe_scope(int64_t task, int slot, int phase) {
+    if (!llama_moe_perf_enabled()) {
+        return;
+    }
+    if (task != moe_perf_task || slot != moe_perf_slot || phase != moe_perf_phase) {
+        perf_moe_flush(true);
+        moe_perf_task = task;
+        moe_perf_slot = slot;
+        moe_perf_phase = phase;
+    }
+    perf_moe_flush(false);
+}
+
+void llama_context::perf_moe_flush(bool final) {
+    if (!llama_moe_perf_enabled()) {
+        return;
+    }
+    const int64_t now = ggml_time_us();
+    if (!final && now - moe_perf_last < 5000000) {
+        return;
+    }
+    const int role = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0;
+    if (moe_cache) {
+        moe_cache->perf_flush(moe_perf_task, moe_perf_slot, moe_perf_phase, role, final);
+    }
+    for (const auto & entry : moe_perf_bypass) {
+        (entry.second - moe_perf_bypass_last[entry.first]).print(moe_perf_task, moe_perf_slot, moe_perf_phase, role, -2, entry.first, false);
+    }
+    moe_perf_bypass_last = moe_perf_bypass;
+    if (final) {
+        moe_perf_bypass.clear();
+        moe_perf_bypass_last.clear();
+    }
+    for (const auto & entry : moe_perf_widths) {
+        LLAMA_LOG_INFO("moe_width: schema=1 us=%" PRId64 " task=%" PRId64 " slot=%d phase=%d role=%d width=%u graphs=%" PRIu64 "\n",
+            now, moe_perf_task, moe_perf_slot, moe_perf_phase, role, entry.first, entry.second);
+    }
+    moe_perf_widths.clear();
+    moe_perf_last = now;
+}
+
+void llama_perf_moe_scope(llama_context * ctx, int64_t task, int32_t slot, int32_t phase) {
+    if (ctx) {
+        ctx->perf_moe_scope(task, slot, phase);
+    }
+}
+
+void llama_perf_moe_flush(llama_context * ctx, bool final) {
+    if (ctx) {
+        ctx->perf_moe_flush(final);
+    }
+}
 
 llama_perf_context_data llama_context::perf_get_data() const {
     llama_perf_context_data data = {};

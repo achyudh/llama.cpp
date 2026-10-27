@@ -6,9 +6,60 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <cinttypes>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+
+bool llama_moe_perf_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_MOE_PERF");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void llama_moe_perf_data::upload(size_t bytes, bool fill) {
+    values[fill ? fill_bytes : bypass_bytes] += bytes;
+    values[fill ? fill_calls : bypass_calls]++;
+    values[bytes <= 65536 ? copy_le64k : bytes <= 1048576 ? copy_le1m : bytes <= 4194304 ? copy_le4m : copy_gt4m]++;
+}
+
+llama_moe_perf_data & llama_moe_perf_data::operator+=(const llama_moe_perf_data & other) {
+    for (size_t i = 0; i < count; ++i) {
+        values[i] += other.values[i];
+    }
+    return *this;
+}
+
+llama_moe_perf_data llama_moe_perf_data::operator-(const llama_moe_perf_data & other) const {
+    llama_moe_perf_data result;
+    for (size_t i = 0; i < count; ++i) {
+        result.values[i] = values[i] - other.values[i];
+    }
+    return result;
+}
+
+void llama_moe_perf_data::print(int64_t task, int slot, int phase, int role, int layer, int type, bool total) const {
+    if (std::all_of(values.begin(), values.end(), [](uint64_t n) { return n == 0; })) {
+        return;
+    }
+    static const char * names[count] = {
+        "hits", "misses", "evictions", "hit_bytes", "fill_bytes", "fill_calls", "bypass_bytes", "bypass_calls",
+        "bypass_large", "bypass_other", "padding_bytes", "d2d_bytes", "d2d_calls", "id_bytes", "id_calls",
+        "id_wait_us", "plan_us", "submit_us", "copy_le64k", "copy_le1m", "copy_le4m", "copy_gt4m"
+    };
+    std::ostringstream fields;
+    for (size_t i = 0; i < count; ++i) {
+        fields << ' ' << names[i] << '=' << values[i];
+    }
+    LLAMA_LOG_INFO("moe_perf: schema=1 us=%" PRId64 " task=%" PRId64 " slot=%d phase=%d role=%d layer=%d type=%d total=%d%s\n",
+        ggml_time_us(), task, slot, phase, role, layer, type, total, fields.str().c_str());
+}
 
 namespace {
 
@@ -105,9 +156,10 @@ struct moe_cache_slru {
 
     // give a slot to each expert selected by ids in layer il, evicting from probation first
     // returns false if the ids select more distinct experts than there are slots
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit) {
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, size_t & n_evicted) {
         fills.clear();
         n_hit = 0;
+        n_evicted = 0;
 
         if (++seen_gen == 0) {
             std::fill(seen.begin(), seen.end(), 0);
@@ -142,6 +194,7 @@ struct moe_cache_slru {
             }
             const int32_t s = victim(il);
             if (key_of[s] >= 0) {
+                n_evicted++;
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
             }
             key_of[s] = il*n_expert + e;
@@ -213,6 +266,8 @@ struct llama_moe_cache::impl {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+        llama_moe_perf_data perf;
+        llama_moe_perf_data perf_last;
     };
 
     struct binding {
@@ -483,6 +538,28 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        register_host_experts(model);
+    }
+
+    void register_host_experts(const llama_model & model) {
+        const char * value = std::getenv("LLAMA_MOE_HOST_REGISTER_MIB");
+        if (!value) {
+            return;
+        }
+        errno = 0;
+        char * end = nullptr;
+        const unsigned long long mib = std::strtoull(value, &end, 10);
+        if (errno || end == value || *end || value[0] == '-' || mib > SIZE_MAX/(1024*1024)) {
+            throw std::runtime_error("invalid LLAMA_MOE_HOST_REGISTER_MIB");
+        }
+        if (mib && devices.size() != 1) {
+            throw std::runtime_error("host registration experiment requires one GPU backend");
+        }
+        std::vector<ggml_tensor *> tensors;
+        for (const layer & l : layers) {
+            tensors.insert(tensors.end(), l.experts.begin(), l.experts.end());
+        }
+        model.register_host_weights(devices[0].backend, tensors, size_t(mib)*1024*1024);
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -538,7 +615,14 @@ struct llama_moe_cache::impl {
         ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
         ggml_backend_view_init(src_view);
         ggml_backend_view_init(dst_view);
+        const int64_t t_submit = llama_moe_perf_enabled() ? ggml_time_us() : 0;
         ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+        if (llama_moe_perf_enabled()) {
+            auto & perf = layers[b.il].perf.values;
+            perf[llama_moe_perf_data::d2d_bytes] += ggml_nbytes(src_view);
+            perf[llama_moe_perf_data::d2d_calls]++;
+            perf[llama_moe_perf_data::submit_us] += ggml_time_us() - t_submit;
+        }
 
         stats_copy.hits  += n;
         stats_copy.bytes += ggml_nbytes(src_view);
@@ -552,7 +636,7 @@ struct llama_moe_cache::impl {
             return false;
         }
         const int32_t il = it->second;
-        const layer & l = layers[il];
+        layer & l = layers[il];
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
@@ -569,7 +653,7 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(lookup != nullptr);
 
         // the selected experts must be computed in an earlier split
-        // the scheduler starts a new split at the lookup because it reads a host weight, but only if the split already has inputs
+        // the host weight at the lookup starts a new split after the selected experts
         const ggml_tensor * sel = lookup->src[1];
         for (int i = 0; i < n_nodes; ++i) {
             const ggml_tensor * node = ggml_graph_node(graph, i);
@@ -580,14 +664,31 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
+        const bool observe = llama_moe_perf_enabled();
+        const int64_t t_ids = observe ? ggml_time_us() : 0;
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        const int64_t t_plan = observe ? ggml_time_us() : 0;
 
-        size_t n_hit = 0;
-        if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+        size_t n_hit = 0, n_evicted = 0;
+        if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit, n_evicted)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
 
+        const int64_t t_submit = observe ? ggml_time_us() : 0;
+        if (observe) {
+            auto & perf = l.perf.values;
+            perf[llama_moe_perf_data::id_wait_us] += t_plan - t_ids;
+            perf[llama_moe_perf_data::id_bytes] += ggml_nbytes(sel);
+            perf[llama_moe_perf_data::id_calls]++;
+            perf[llama_moe_perf_data::plan_us] += t_submit - t_plan;
+            perf[llama_moe_perf_data::hits] += n_hit;
+            perf[llama_moe_perf_data::misses] += fills.size();
+            perf[llama_moe_perf_data::evictions] += n_evicted;
+            for (const auto * w : l.experts) {
+                perf[llama_moe_perf_data::hit_bytes] += n_hit*w->nb[2];
+            }
+        }
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -599,8 +700,15 @@ struct llama_moe_cache::impl {
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
+                const int64_t t_copy = observe ? ggml_time_us() : 0;
                 ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                if (observe) {
+                    l.perf.values[llama_moe_perf_data::submit_us] += ggml_time_us() - t_copy;
+                }
                 bytes += n*expert_size;
+                if (observe) {
+                    l.perf.upload(n*expert_size, true);
+                }
                 i += n;
             }
         }
@@ -611,9 +719,33 @@ struct llama_moe_cache::impl {
         st.bytes  += bytes;
 
         // the next copy synchronizes the backend before it changes the slot map again
+        const int64_t t_map = observe ? ggml_time_us() : 0;
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        if (observe) {
+            l.perf.values[llama_moe_perf_data::submit_us] += ggml_time_us() - t_map;
+        }
 
         return true;
+    }
+
+    void perf_flush(int64_t task, int slot, int phase, int role, bool final) {
+        std::map<int, llama_moe_perf_data> delta;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            auto & l = layers[il];
+            if (l.ig < 0) {
+                continue;
+            }
+            const int type = groups[l.ig].ref.front()->type;
+            delta[type] += l.perf - l.perf_last;
+            l.perf_last = l.perf;
+            if (final) {
+                l.perf.print(task, slot, phase, role, il, type, true);
+                l.perf = l.perf_last = {};
+            }
+        }
+        for (const auto & entry : delta) {
+            entry.second.print(task, slot, phase, role, -1, entry.first, false);
+        }
     }
 
     void log_stats() const {
@@ -638,6 +770,10 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
+
+void llama_moe_cache::perf_flush(int64_t task, int slot, int phase, int role, bool final) {
+    pimpl->perf_flush(task, slot, phase, role, final);
+}
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);

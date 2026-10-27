@@ -195,6 +195,8 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+    void perf_moe_scope(int64_t task, int slot, int phase);
+    void perf_moe_flush(bool final);
 
     llama_memory_breakdown memory_breakdown() const;
 
@@ -308,6 +310,13 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    int64_t moe_perf_task = -1;
+    int moe_perf_slot = -1;
+    int moe_perf_phase = 0;
+    int64_t moe_perf_last = 0;
+    std::map<int, llama_moe_perf_data> moe_perf_bypass;
+    std::map<int, llama_moe_perf_data> moe_perf_bypass_last;
+    std::map<uint32_t, uint64_t> moe_perf_widths;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

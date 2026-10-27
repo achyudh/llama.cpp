@@ -10,6 +10,10 @@
 #include <map>
 #include <vector>
 
+// Numeric diagnostic scope: phase 0 idle, 1 prefill, 2 generation, 3 shared/mixed.
+LLAMA_API void llama_perf_moe_scope(struct llama_context * ctx, int64_t task, int32_t slot, int32_t phase);
+LLAMA_API void llama_perf_moe_flush(struct llama_context * ctx, bool final);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
