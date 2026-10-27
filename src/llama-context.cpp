@@ -2874,6 +2874,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.model       =*/ &model,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -2946,11 +2947,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
     const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+    const bool exl3 = node->op == GGML_OP_MUL_MAT_EXL3;
+    if ((!exl3 && node->op != GGML_OP_MUL_MAT_ID) ||
+        (node->src[0] != dst && (!exl3 || (node->src[2] != dst && node->src[3] != dst)))) {
         return false;
     }
 
-    const ggml_tensor * ids = node->src[2];
+    const ggml_tensor * ids = node->src[exl3 ? 4 : 2];
+    if (!ids) {
+        return false;
+    }
     if (ggml_nelements(ids) == 0) {
         return true;
     }
@@ -3027,7 +3033,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
         const size_t offset  = next*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+        const size_t padding = !exl3 && last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             upload(offset, size);

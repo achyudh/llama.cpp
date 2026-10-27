@@ -315,6 +315,9 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
+llama_build_and_test(test-exl3.cpp LINK ggml)
+target_include_directories(test-exl3 PRIVATE ../ggml/src)
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -379,3 +382,6 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+llama_build(test-exl3-model.cpp LINK llama)
+target_include_directories(test-exl3-model PRIVATE ../ggml/src)

@@ -6233,6 +6233,39 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
 }
 
 // GGML_OP_MUL_MAT_ID
+struct test_mul_mat_exl3 : public test_case {
+    const int bits_x2;
+    const int rows;
+    const bool routed;
+
+    test_mul_mat_exl3(int bits_x2, int rows, bool routed) : bits_x2(bits_x2), rows(rows), routed(routed) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(bits_x2, rows, routed);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int experts = routed ? 2 : 1;
+        auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 128 / 16 * (256 / 16) * 8 * bits_x2, 1, experts);
+        auto * su = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 128, experts);
+        auto * sv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, experts);
+        auto * x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 1, rows) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, rows);
+        auto * ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, rows) : nullptr;
+        if (ids) { ggml_set_name(ids, "exl3_test_ids"); }
+        return ggml_mul_mat_exl3(ctx, p, su, sv, x, ids, bits_x2);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto * ids = ggml_get_tensor(ctx, "exl3_test_ids");
+        if (ids) {
+            std::vector<int32_t> data(ggml_nelements(ids));
+            for (size_t i = 0; i < data.size(); ++i) { data[i] = i % 2; }
+            ggml_backend_tensor_set(ids, data.data(), 0, ggml_nbytes(ids));
+        }
+    }
+};
+
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -10761,6 +10794,13 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int bits_x2 : {7, 8, 10, 12, 14}) {
+        for (int rows : {1, 4, 5}) {
+            for (bool routed : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, routed));
+            }
+        }
+    }
 
     // Decode shapes of the RDNA4 Q8_0/Q4_0 paged decode kernel (4 KV heads x GQA 6, head 256, 1-8 query tokens).
     for (int kv : { 256, 1000, 8192, 32768, }) {

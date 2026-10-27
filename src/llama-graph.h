@@ -21,6 +21,7 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_model;
 
 class llama_moe_cache;
 
@@ -831,6 +832,7 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
+    const llama_model * model = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1089,6 +1091,7 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+    const llama_model * model_weights;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

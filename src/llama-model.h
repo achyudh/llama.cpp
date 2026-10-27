@@ -227,6 +227,8 @@ struct llama_layer_shortconv {
 
 struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
+    struct ggml_tensor * fc_embedding          = nullptr;
+    struct ggml_tensor * fc_hidden             = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
     struct ggml_tensor * eh_proj_in_s          = nullptr;
     struct ggml_tensor * embed_tokens          = nullptr;
@@ -718,6 +720,15 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+
+    struct exl3_weight {
+        ggml_tensor * suh;
+        ggml_tensor * svh;
+        int bits_x2;
+        llm_tensor tensor;
+        bool gdn;
+    };
+    std::unordered_map<const ggml_tensor *, exl3_weight> exl3;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;

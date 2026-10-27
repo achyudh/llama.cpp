@@ -24,6 +24,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-exl3.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2428,6 +2429,64 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
+    const std::string rate_key = "exl3." + tn.str() + ".bits_x2";
+    const int64_t rate_id = gguf_find_key(ml.metadata, rate_key.c_str());
+    if (rate_id >= 0) {
+        auto require_key = [&](const char * key, gguf_type type) {
+            const int64_t id = gguf_find_key(ml.metadata, key);
+            if (id < 0 || gguf_get_kv_type(ml.metadata, id) != type) {
+                throw std::runtime_error(format("invalid EXL3 metadata: %s", key));
+            }
+            return id;
+        };
+        const int64_t version = require_key("exl3.version", GGUF_TYPE_UINT32);
+        const int64_t book = require_key("exl3.codebook", GGUF_TYPE_STRING);
+        if (arch != LLM_ARCH_QWEN4EXP || gguf_get_val_u32(ml.metadata, version) != 1 ||
+            strcmp(gguf_get_val_str(ml.metadata, book), "mul1") ||
+            gguf_get_kv_type(ml.metadata, rate_id) != GGUF_TYPE_UINT32 ||
+            !tn.suffix || (strcmp(tn.suffix, "weight") &&
+                !(tn.tensor == LLM_TENSOR_NEXTN_EH_PROJ &&
+                    (!strcmp(tn.suffix, "embedding.weight") || !strcmp(tn.suffix, "hidden.weight")))) ||
+            ne.size() < 2 || ne.size() > 3) {
+            throw std::runtime_error(format("unsupported EXL3 weight: %s", tn.str().c_str()));
+        }
+        const uint32_t rate = gguf_get_val_u32(ml.metadata, rate_id);
+        const int64_t k = ne.begin()[0], n = ne.begin()[1], e = ne.size() == 3 ? ne.begin()[2] : 1;
+        const size_t tile = rate <= 16 ? ggml_exl3_tile_size(rate) : 0;
+        if (!tile || k <= 0 || n <= 0 || e <= 0 || k % 128 || n % 128 ||
+            uint64_t(k/16) > uint64_t(INT64_MAX)/uint64_t(n/16)/tile/uint64_t(e)) {
+            throw std::runtime_error(format("invalid EXL3 dimensions/rate: %s", tn.str().c_str()));
+        }
+        const int64_t words = (k/16)*(n/16)*(tile/2);
+        const std::string su_suffix = std::string(tn.suffix) + ".suh";
+        const std::string sv_suffix = std::string(tn.suffix) + ".svh";
+        const LLM_TN_IMPL su_name(tn.arch, tn.tensor, su_suffix.c_str(), tn.bid, tn.xid);
+        const LLM_TN_IMPL sv_name(tn.arch, tn.tensor, sv_suffix.c_str(), tn.bid, tn.xid);
+        for (const auto & entry : {std::make_pair(tn.str(), GGML_TYPE_I16),
+                                  std::make_pair(su_name.str(), GGML_TYPE_F16),
+                                  std::make_pair(sv_name.str(), GGML_TYPE_F16)}) {
+            const int64_t id = gguf_find_tensor(ml.metadata, entry.first.c_str());
+            const auto * meta = ml.get_tensor_meta(entry.first.c_str());
+            if (meta ? meta->type != entry.second : (id < 0 || gguf_get_tensor_type(ml.metadata, id) != entry.second)) {
+                throw std::runtime_error(format("invalid EXL3 tensor type: %s", entry.first.c_str()));
+            }
+        }
+        auto load = [&](const LLM_TN_IMPL & name, std::initializer_list<int64_t> shape) {
+            return ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list,
+                pimpl->dev_output.buft_list, buft_list_layer, name, shape,
+                (flags & ~TENSOR_ALLOW_RESHAPE) | llama_model_loader::TENSOR_EXL3);
+        };
+        auto * packed = load(tn, {words, 1, e});
+        auto * suh = load(su_name, {k, 1, e});
+        auto * svh = load(sv_name, {n, 1, e});
+        if (packed) {
+            if (!suh || !svh) {
+                throw std::runtime_error(format("incomplete EXL3 bank: %s", tn.str().c_str()));
+            }
+            exl3.emplace(packed, exl3_weight{suh, svh, int(rate), tn.tensor, tn.bid >= 0 && hparams.is_recr(tn.bid)});
+        }
+        return packed;
+    }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
@@ -3953,7 +4012,8 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
         if (ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
             trunk = TENSOR_NOT_REQUIRED;
         }
-        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
+        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr &&
+            ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "embedding.weight", hparams.n_layer()).str().c_str()) == nullptr) {
             mtp = TENSOR_NOT_REQUIRED;
         }
     }

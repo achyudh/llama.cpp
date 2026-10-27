@@ -602,6 +602,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MUL_MAT_EXL3,
+
         GGML_OP_COUNT,
     };
 
@@ -1497,8 +1499,20 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
 
+    // EXL3 packed I16 [words, 1, experts], F16 scales [K, experts]/[N, experts].
+    // Without ids: F32 x [K, rows] -> [N, rows], experts == 1.
+    // With I32 ids [used, rows]: x [K, slots, rows] -> [N, used, rows], used % slots == 0.
+    // Returns NULL for an invalid descriptor. Routing IDs use bank-local expert indices.
+    GGML_API struct ggml_tensor * ggml_mul_mat_exl3(
+            struct ggml_context * ctx,
+            struct ggml_tensor * packed,
+            struct ggml_tensor * suh,
+            struct ggml_tensor * svh,
+            struct ggml_tensor * x,
+            struct ggml_tensor * ids,
+            int bits_x2);
+
     // indirect matrix multiplication
-    //
     // [TAG_MUL_MAT_ID_DUPLICATE_ID]
     // note: this op has undefined behaviour if a given `a` is referenced more than once for a given `b`
     //       (i.e. duplicate experts per token are not guaranteed to be supported in all backends)

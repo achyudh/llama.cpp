@@ -77,7 +77,7 @@ void llama_model_saver::add_kv(const enum llm_kv key, const char value) {
 template <typename Container>
 void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, const bool per_layer) {
     GGML_ASSERT(model != nullptr || !per_layer);
-    const size_t n_values = per_layer ? size_t(model->hparams.n_layer()) : value.size();
+    const size_t n_values = per_layer ? size_t(model->exl3.empty() ? model->hparams.n_layer() : model->hparams.n_layer_all) : value.size();
     GGML_ASSERT(n_values <= value.size());
 
     if (n_values == 0) {
@@ -148,6 +148,15 @@ void llama_model_saver::add_tensor(const struct ggml_tensor * tensor) {
 void llama_model_saver::add_kv_from_model() {
     const llama_hparams & hparams = model->hparams;
     const llama_vocab   & vocab   = model->vocab;
+
+    if (!model->exl3.empty()) {
+        gguf_set_val_u32(gguf_ctx, "exl3.version", 1);
+        gguf_set_val_str(gguf_ctx, "exl3.codebook", "mul1");
+        for (const auto & entry : model->exl3) {
+            const std::string key = std::string("exl3.") + entry.first->name + ".bits_x2";
+            gguf_set_val_u32(gguf_ctx, key.c_str(), entry.second.bits_x2);
+        }
+    }
 
     const int32_t n_vocab = vocab.n_tokens();
     std::vector<std::string> tokens(n_vocab);
@@ -472,6 +481,10 @@ void llama_model_saver::add_kv_from_model() {
 }
 
 void llama_model_saver::add_tensors_from_model() {
+    for (const auto & entry : model->exl3) {
+        add_tensor(entry.second.suh);
+        add_tensor(entry.second.svh);
+    }
     if (model->output != nullptr &&
             std::string(model->output->name) != std::string(model->tok_embd->name)) {
         add_tensor(model->tok_embd); // some models use the same tensor for tok_embd and output

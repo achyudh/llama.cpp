@@ -291,7 +291,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         load_block(il, mtp_flags);
 
         auto & nextn = layers[il].nextn;
-        nextn.eh_proj      = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,      "weight", il), { 2*n_embd, n_embd }, mtp_flags);
+        const auto embedding = tn(LLM_TENSOR_NEXTN_EH_PROJ, "embedding.weight", il);
+        if (ml.get_weight(embedding.str().c_str()) || gguf_find_tensor(ml.metadata, embedding.str().c_str()) >= 0) {
+            if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il).str().c_str())) {
+                throw std::runtime_error("MTP cannot contain both combined and separate input projections");
+            }
+            nextn.fc_embedding = create_tensor(embedding, { n_embd, n_embd }, mtp_flags);
+            nextn.fc_hidden = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "hidden.weight", il), { n_embd, n_embd }, mtp_flags);
+        } else {
+            nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2*n_embd, n_embd }, mtp_flags);
+        }
         nextn.enorm        = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,        "weight", il), { n_embd }, mtp_flags);
         // RMS per hc stream of the trunk residual, so the gammas load as [n_embd, hc] like the mixer norms
         nextn.hnorm        = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,        "weight", il), { n_embd, hc }, mtp_flags | TENSOR_ALLOW_RESHAPE);
@@ -532,7 +541,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int il = hparams.n_layer();
     const auto & layer = model.layers[il];
 
-    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm && layer.nextn.hc_head_norm &&
+    GGML_ASSERT((layer.nextn.eh_proj || (layer.nextn.fc_embedding && layer.nextn.fc_hidden)) &&
+            layer.nextn.enorm && layer.nextn.hnorm && layer.nextn.hc_head_norm &&
             "MTP block missing, load the model with MTP enabled");
 
     int sections[4];
@@ -585,7 +595,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    ggml_tensor * res_hc = layer.nextn.eh_proj ?
+        build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)) :
+        ggml_add(ctx0, build_lora_mm(layer.nextn.fc_embedding, e_norm), build_lora_mm(layer.nextn.fc_hidden, h_norm));
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;

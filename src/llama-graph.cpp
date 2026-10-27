@@ -1613,6 +1613,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    model_weights    (params.model),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1671,7 +1672,40 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     cur = build_hadamard_input(w, cur);
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res;
+    if (model_weights && model_weights->exl3.count(w)) {
+        const auto & b = model_weights->exl3.at(w);
+        ggml_tensor * x = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+        const int64_t rows = cur->ne[1]*cur->ne[2]*cur->ne[3];
+        x = ggml_reshape_2d(ctx0, x, cur->ne[0], rows);
+        const int64_t nk = hparams.ssm_n_group, nv = hparams.ssm_dt_rank, hd = hparams.ssm_d_state;
+        auto reorder = [&](ggml_tensor * t, bool to_tiled) {
+            t = ggml_reshape_4d(ctx0, t, hd, to_tiled ? nv/nk : nk, to_tiled ? nk : nv/nk, rows);
+            t = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
+            return ggml_reshape_2d(ctx0, t, hd*nv, rows);
+        };
+        if (b.gdn && nk != nv && b.tensor == LLM_TENSOR_SSM_OUT) {
+            x = reorder(x, false);
+        }
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx0, x, GGML_TYPE_F32);
+        }
+        res = ggml_mul_mat_exl3(ctx0, w, b.suh, b.svh, x, nullptr, b.bits_x2);
+        if (!res) {
+            throw std::runtime_error("invalid EXL3 projection graph");
+        }
+        if (b.gdn && nk != nv && b.tensor == LLM_TENSOR_ATTN_GATE) {
+            res = reorder(res, true);
+        } else if (b.gdn && nk != nv && b.tensor == LLM_TENSOR_ATTN_QKV) {
+            const int64_t qk = 2*nk*hd;
+            auto * qk_rows = ggml_view_2d(ctx0, res, qk, rows, res->nb[1], 0);
+            auto * v_rows = ggml_view_2d(ctx0, res, nv*hd, rows, res->nb[1], qk*sizeof(float));
+            res = ggml_concat(ctx0, ggml_cont(ctx0, qk_rows), reorder(ggml_cont(ctx0, v_rows), true), 0);
+        }
+        res = ggml_reshape_4d(ctx0, res, b.svh->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1751,9 +1785,25 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * slots) const {
     cur = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
-    ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+    ggml_tensor * res;
+    if (model_weights && model_weights->exl3.count(w)) {
+        const auto & b = model_weights->exl3.at(w);
+        auto * x = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx0, x, GGML_TYPE_F32);
+        }
+        auto * selected = slots ? slots : ids;
+        selected = ggml_is_contiguous(selected) ? selected : ggml_cont(ctx0, selected);
+        res = ggml_mul_mat_exl3(ctx0, slots ? moe_cache->get_experts(w) : w,
+            slots ? moe_cache->get_experts(b.suh) : b.suh,
+            slots ? moe_cache->get_experts(b.svh) : b.svh, x, selected, b.bits_x2);
+        if (!res) {
+            throw std::runtime_error("invalid EXL3 expert graph");
+        }
+    } else {
+        res = slots == nullptr ? ggml_mul_mat_id(ctx0, w, cur, ids) :
+            ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2348,6 +2398,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    if (model_weights && !ggml_is_contiguous(selected_experts)) {
+        for (auto * w : {up_exps, gate_exps, down_exps, gate_up_exps}) {
+            if (model_weights->exl3.count(w)) {
+                selected_experts = ggml_cont(ctx0, selected_experts);
+                break;
+            }
+        }
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented

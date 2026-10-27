@@ -13,6 +13,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-exl3.h"
 #include "common.h"
 #include "tiled/tiled.h"
 
@@ -1870,6 +1871,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_EXL3:
+            {
+                if (params->ith == 0) {
+                    GGML_ASSERT(ggml_exl3_compute_forward(tensor));
+                }
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2499,6 +2506,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+        case GGML_OP_MUL_MAT_EXL3:
             {
                 n_tasks = 1;
             } break;

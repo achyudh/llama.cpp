@@ -207,11 +207,16 @@ struct moe_cache_slru {
 };
 
 // gate, up, down or gate_up, down
-static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer) {
+static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_model & model, const llama_layer & layer) {
     std::vector<ggml_tensor *> res;
     for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
         if (t != nullptr) {
             res.push_back(t);
+            const auto it = model.exl3.find(t);
+            if (it != model.exl3.end()) {
+                res.push_back(it->second.suh);
+                res.push_back(it->second.svh);
+            }
         }
     }
     return res;
@@ -259,6 +264,7 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        int exl3_bits_x2 = 0;
         moe_cache_slru slru;
     };
 
@@ -329,12 +335,29 @@ struct llama_moe_cache::impl {
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
         for (size_t il = 0; il < model.layers.size(); ++il) {
-            auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+            auto experts = llama_moe_cache_layer_experts(model, model.layers[il]);
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
             }
             const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
             if (it_dev == devices.end()) {
+                continue;
+            }
+            bool supported = true;
+            ggml_context_ptr probe_ctx(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
+            for (auto * w : experts) {
+                const auto b = model.exl3.find(w);
+                if (b == model.exl3.end()) {
+                    continue;
+                }
+                auto * x = ggml_new_tensor_3d(probe_ctx.get(), GGML_TYPE_F32, b->second.suh->ne[0], 1, 1);
+                auto * ids = ggml_new_tensor_2d(probe_ctx.get(), GGML_TYPE_I32, n_expert_used, 1);
+                auto * op = ggml_mul_mat_exl3(probe_ctx.get(), w, b->second.suh, b->second.svh, x, ids, b->second.bits_x2);
+                supported = supported && op && ggml_backend_supports_op(it_dev->backend, op);
+                ggml_reset(probe_ctx.get());
+            }
+            if (!supported) {
+                LLAMA_LOG_WARN("%s: layer %zu EXL3 cache disabled: device has no compressed execution kernel\n", __func__, il);
                 continue;
             }
             const int32_t id = (int32_t) (it_dev - devices.begin());
@@ -344,6 +367,10 @@ struct llama_moe_cache::impl {
                 it = groups.end() - 1;
                 it->id  = id;
                 it->ref = experts;
+                const auto b = model.exl3.find(experts.front());
+                if (b != model.exl3.end()) {
+                    it->exl3_bits_x2 = b->second.bits_x2;
+                }
             }
             it->layers.push_back(il);
             for (const ggml_tensor * t : experts) {
@@ -352,7 +379,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (groups.empty()) {
-            LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
+            LLAMA_LOG_WARN("%s: no supported layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
             return;
         }
 
@@ -458,7 +485,7 @@ struct llama_moe_cache::impl {
             for (int32_t il : g.layers) {
                 layer & l = layers[il];
                 l.ig      = (int32_t) ig;
-                l.experts = llama_moe_cache_layer_experts(model.layers[il]);
+                l.experts = llama_moe_cache_layer_experts(model, model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
@@ -533,8 +560,13 @@ struct llama_moe_cache::impl {
                 ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0);
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
-                    LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
-                        g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    if (g.exl3_bits_x2) {
+                        LLAMA_LOG_INFO("%s: %2zu layers, EXL3 %.1f bpw + F16 auxiliaries: %5d slots (%.1f%%)\n", __func__,
+                            g.layers.size(), 0.5*g.exl3_bits_x2, g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    } else {
+                        LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
+                            g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    }
                 }
             }
         }
