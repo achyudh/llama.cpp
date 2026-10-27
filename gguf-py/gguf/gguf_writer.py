@@ -208,6 +208,8 @@ class GGUFWriter:
         total_splits = len(self.fout)
         self.kv_data.extend({} for _ in range(len(self.kv_data), total_splits))
         for i, kv_data in enumerate(self.kv_data):
+            if Keys.General.ALIGNMENT in self.kv_data[0]:
+                kv_data[Keys.General.ALIGNMENT] = self.kv_data[0][Keys.General.ALIGNMENT]
             kv_data[Keys.Split.LLM_KV_SPLIT_NO] = GGUFValue(i, GGUFValueType.UINT16)
             kv_data[Keys.Split.LLM_KV_SPLIT_COUNT] = GGUFValue(total_splits, GGUFValueType.UINT16)
             kv_data[Keys.Split.LLM_KV_SPLIT_TENSORS_COUNT] = GGUFValue(total_tensors, GGUFValueType.INT32)

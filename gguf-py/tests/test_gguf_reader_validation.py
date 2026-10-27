@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from gguf.gguf_reader import GGUFReader
+from gguf.gguf_writer import GGUFWriter
 
 
 def _write_gguf(path, n_dims_field, dims):
@@ -35,3 +36,23 @@ def test_dims_product_no_uint64_wraparound(tmp_path):
     _write_gguf(p, len(dims), dims)
     with pytest.raises(ValueError):
         GGUFReader(p)
+
+
+@pytest.mark.parametrize('alignment', [32, 4096, 8192])
+def test_split_alignment(tmp_path, alignment):
+    path = tmp_path / 'split.gguf'
+    writer = GGUFWriter(path, 'qwen4exp', split_max_tensors=1)
+    writer.add_custom_alignment(alignment)
+    for i in range(3):
+        writer.add_tensor(f'tensor{i}', np.full(37 + i, 17 + i, dtype=np.int16))
+    paths = writer.format_shard_names(path)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    for i, shard in enumerate(paths):
+        reader = GGUFReader(shard)
+        assert reader.alignment == alignment
+        tensor = reader.tensors[0]
+        assert tensor.data_offset % alignment == 0
+        np.testing.assert_array_equal(tensor.data, np.full(37 + i, 17 + i, dtype=np.int16))
