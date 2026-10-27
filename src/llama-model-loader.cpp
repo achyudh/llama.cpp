@@ -1221,7 +1221,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (flags & TENSOR_EXL3) {
-            // Only the CPU reference backend implements EXL3 at present.
+            // Keep source banks host-backed until model-wide ROCm placement is qualified.
             return ggml_backend_cpu_buffer_type();
         }
 

@@ -26,6 +26,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -2496,6 +2497,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_EXL3:
+            ggml_cuda_op_mul_mat_exl3(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -6030,6 +6034,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_MUL_MAT_EXL3:
+            return ggml_cuda_supports_exl3(op, ggml_cuda_info().devices[dev_ctx->device].cc);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -6446,6 +6452,8 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
+        case GGML_OP_MUL_MAT_EXL3:
+            return op->src[4] ? op->ne[2] : op->ne[1];
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:

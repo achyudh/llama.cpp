@@ -243,6 +243,7 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
 }
 
 struct llama_moe_cache::impl {
+    static constexpr int64_t max_batch = 32;
     // a GPU with its own budget and banks, it caches the layers assigned to it
     struct device {
         ggml_backend_t backend;
@@ -265,6 +266,7 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0;
         int32_t n_slots = 0;
         int exl3_bits_x2 = 0;
+        int64_t max_tokens = max_batch;
         moe_cache_slru slru;
     };
 
@@ -287,8 +289,6 @@ struct llama_moe_cache::impl {
         size_t misses = 0;
         size_t bytes  = 0;
     };
-
-    static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
 
@@ -343,20 +343,26 @@ struct llama_moe_cache::impl {
             if (it_dev == devices.end()) {
                 continue;
             }
-            bool supported = true;
+            int64_t supported_tokens = 0;
             ggml_context_ptr probe_ctx(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
-            for (auto * w : experts) {
-                const auto b = model.exl3.find(w);
-                if (b == model.exl3.end()) {
-                    continue;
+            // Cache eligibility must also respect the device kernel's batch limit.
+            for (int64_t tokens = 1; tokens <= max_batch; ++tokens) {
+                bool supported = true;
+                for (auto * w : experts) {
+                    const auto b = model.exl3.find(w);
+                    if (b == model.exl3.end()) {
+                        continue;
+                    }
+                    auto * x = ggml_new_tensor_3d(probe_ctx.get(), GGML_TYPE_F32, b->second.suh->ne[0], 1, tokens);
+                    auto * ids = ggml_new_tensor_2d(probe_ctx.get(), GGML_TYPE_I32, n_expert_used, tokens);
+                    auto * op = ggml_mul_mat_exl3(probe_ctx.get(), w, b->second.suh, b->second.svh, x, ids, b->second.bits_x2);
+                    supported = supported && op && ggml_backend_supports_op(it_dev->backend, op);
+                    ggml_reset(probe_ctx.get());
                 }
-                auto * x = ggml_new_tensor_3d(probe_ctx.get(), GGML_TYPE_F32, b->second.suh->ne[0], 1, 1);
-                auto * ids = ggml_new_tensor_2d(probe_ctx.get(), GGML_TYPE_I32, n_expert_used, 1);
-                auto * op = ggml_mul_mat_exl3(probe_ctx.get(), w, b->second.suh, b->second.svh, x, ids, b->second.bits_x2);
-                supported = supported && op && ggml_backend_supports_op(it_dev->backend, op);
-                ggml_reset(probe_ctx.get());
+                if (!supported) { break; }
+                supported_tokens = tokens;
             }
-            if (!supported) {
+            if (!supported_tokens) {
                 LLAMA_LOG_WARN("%s: layer %zu EXL3 cache disabled: device has no compressed execution kernel\n", __func__, il);
                 continue;
             }
@@ -373,6 +379,7 @@ struct llama_moe_cache::impl {
                 }
             }
             it->layers.push_back(il);
+            it->max_tokens = std::min(it->max_tokens, supported_tokens);
             for (const ggml_tensor * t : experts) {
                 it->host_bytes         += ggml_nbytes(t);
                 devices[id].host_bytes += ggml_nbytes(t);
@@ -609,7 +616,7 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        if (n_tokens == 0 || n_tokens > groups[l.ig].max_tokens || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
             return nullptr;
         }
         return l.slot_map;
