@@ -9,6 +9,7 @@ import gguf
 import numpy as np
 
 from .base import ModelBase
+from .exl3 import Exl3Converter
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
@@ -41,6 +42,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
         self._mtp_fc: dict[str, Tensor] = {}
+        self._exl3: Exl3Converter | None = None
 
     @classmethod
     def filter_tensors(cls, item):
@@ -61,6 +63,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         modify_tensors() sees it (base.py), which would silently round these
         45-bit multipliers. Reading the lazy tensor here bypasses that.
         """
+        if self._exl3 is not None:
+            return self._exl3.constants[suffix]
         for name, gen in self.model_tensors.items():
             if name.endswith(suffix):
                 t = gen()
@@ -128,6 +132,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return int(eos)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if self._exl3 is not None and data_torch.dtype == torch.float16:
+            data_torch = data_torch.float()
+        tensors = list(self._modify_tensors(data_torch, name, bid))
+        if self._exl3 is not None:
+            self._exl3.ordinary_outputs(name, [n for n, _ in tensors])
+        return tensors
+
+    def _modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
         if name.endswith("ple_embedding.layer_multipliers"):
             self._ple_multipliers = [int(x) for x in data_torch.tolist()]
@@ -211,7 +223,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return load
 
     def prepare_tensors(self):
+        if self.hparams.get('quantization_config', {}).get('quant_method') == 'exl3':
+            self._exl3 = Exl3Converter(self)
+            self._exl3.plan()
+            self.model_tensors = {n: self.model_tensors[n] for n in self._exl3.ordinary}
+            self._ple_row_dim = self._exl3.head_dim or None
         super().prepare_tensors()
+        if self._exl3 is not None:
+            self._exl3.add_tensors()
         if self._mtp_fc:
             raise ValueError(f"MTP projection missing its other half: {sorted(self._mtp_fc)}")
         n_parts = self.hparams.get("split_ngram_parts", 0)
@@ -219,6 +238,33 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError(
                 f"got {len(self._ple_shards)} PLE embedding shards, expected {n_parts}"
             )
+
+    def dequant_model(self):
+        if self._exl3 is None:
+            super().dequant_model()
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if self._exl3 is not None:
+            if (name.endswith('norm.weight') and not name.endswith('linear_attn.norm.weight')) or name.endswith((
+                '.ple.norm_key.weight', '.ple.norm_query.weight', '.ple.norm_conv.weight',
+            )):
+                return gguf.GGMLQuantizationType.F32
+            if any(self.match_model_tensor_name(new_name, key, bid) for key in (
+                gguf.MODEL_TENSOR.FFN_GATE_INP, gguf.MODEL_TENSOR.SSM_CONV1D,
+            )):
+                return False
+            source = self._exl3.ordinary[name]
+            return {'F16': gguf.GGMLQuantizationType.F16, 'BF16': gguf.GGMLQuantizationType.BF16,
+                    'F32': gguf.GGMLQuantizationType.F32}[source.dtype]
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def write(self):
+        if self.hparams.get('quantization_config', {}).get('quant_method') != 'exl3':
+            return super().write()
+        self.prepare_tensors()
+        self.prepare_metadata(vocab_only=False)
+        assert self._exl3 is not None
+        self._exl3.write()
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration")

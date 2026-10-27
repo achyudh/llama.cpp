@@ -304,7 +304,7 @@ def main() -> None:
         else:
             logger.info("Exporting model...")
             model_instance.write()
-            out_path = f"{model_instance.fname_out.parent}{os.sep}" if is_split else model_instance.fname_out
+            out_path = f"{model_instance.fname_out.parent}{os.sep}" if len(model_instance.gguf_writer.tensors) > 1 else model_instance.fname_out
             logger.info(f"Model successfully exported to {out_path}")
 
 
