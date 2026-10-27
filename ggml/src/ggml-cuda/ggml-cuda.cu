@@ -3124,7 +3124,12 @@ static int ggml_cuda_gdn_state_rows_plan(
     if (gr_idx < 0 || gr_idx + 1 >= gdn_idx || !ggml_cuda_is_view_or_noop(cgraph->nodes[gr_idx + 1])) {
         return -1;
     }
-    // the gather is read only through no-op views, by this GDN, and as empty views (build_rs's extra states)
+    // the gather is read only through no-op views, by this GDN, and as empty views (build_rs's extra states).
+    // The kernel reads ids when the GDN runs, after the gather it replaces: the allocator frees ids after its last
+    // reader, so unless a node after the GDN reads it (the next layer's gather) its memory may hold another tensor by
+    // then. The last GDN layer has no such reader and keeps its gather.
+    const ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
+    bool ids_live = (ids_base->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
     for (int n = gr_idx + 1; n < cgraph->n_nodes; ++n) {
         const ggml_tensor * t = cgraph->nodes[n];
         for (int k = 0; k < GGML_MAX_SRC && t->src[k]; ++k) {
@@ -3133,7 +3138,13 @@ static int ggml_cuda_gdn_state_rows_plan(
                     !(n == gdn_idx && k == 5)) {
                 return -1;
             }
+            if (n > gdn_idx && (src == ids_base || src->view_src == ids_base)) {
+                ids_live = true;
+            }
         }
+    }
+    if (!ids_live) {
+        return -1;
     }
     // the cache is not written between the gather and the GDN
     for (int n = gr_idx + 1; n < gdn_idx; ++n) {

@@ -196,9 +196,10 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
 
 static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
-    GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
+    GGML_ASSERT(n_kv_max > 0);
 
     const int64_t ne0 = tensor->ne[0];
+    n_kv_max = std::min(n_kv_max, ne0); // a bound above the K/V length (short contexts)
     const int64_t nrows = ggml_nrows(tensor);
     std::vector<float> data_f32(ggml_nelements(tensor), -INFINITY);
     std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
@@ -9334,6 +9335,35 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_ext_broadcast_mask : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",broadcast_mask=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        ggml_get_tensor(ctx, "m")->ne[3] = 1;
+        return out;
+    }
+};
+
+struct test_flash_attn_ext_empty : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",empty_mask=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> data(ggml_nelements(m), ggml_fp32_to_fp16(-INFINITY));
+        ggml_backend_tensor_set(m, data.data(), 0, ggml_nbytes(m));
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13007,6 +13037,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quantized cache, deep enough to take the sparse path
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+    // Q8_0 K / Q4_0 V: decode, verify windows and two sequences
+    for (int nb : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2051));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2051));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 1024, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2051));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {16, 1}, 8192, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1000));
+    // Empty rows take both the direct and split-combine paths.
+    for (int nb : { 1, 5 }) {
+        for (int64_t budget : { 1, 2051 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_empty(256, 256, 2, {12, 1}, 2051, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, budget));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_broadcast_mask(256, 256, 2, {12, 2}, 2051, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 257));
+    // Five-token verification with one selected row and a partial compaction chunk.
+    for (int64_t kv : { 64, 2051 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, kv, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 1));
+    }
     // single head with quantized K (MMQ on Vulkan)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true, false, 512));

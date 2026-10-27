@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 #include "fattn-paged-decode.cuh"
+#include "fattn-sparse.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -790,6 +791,10 @@ static size_t fattn_stock_alloc_size(int device, const ggml_tensor * dst) {
         return ggml_cuda_fattn_paged_decode_alloc_size(device, dst);
     }
 
+    if (ggml_cuda_fattn_sparse_decode_supported(device, dst)) {
+        return ggml_nbytes(dst);
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -826,6 +831,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_flash_attn_ext_paged_decode(ctx, dst);
         return;
     }
+    if (ggml_cuda_fattn_sparse_decode_supported(ctx.device, dst)) {
+        ggml_cuda_fattn_sync_wait(ctx, dst);
+        ggml_cuda_flash_attn_ext_sparse_decode(ctx, dst);
+        ggml_cuda_fattn_sync_release(ctx, dst);
+        return;
+    }
     if (ggml_flash_attn_ext_mask_col0(dst) > 0) {
         GGML_ASSERT(!dst->src[GGML_FA_SRC_PAGES]);
         fattn_widened w(dst);
@@ -853,7 +864,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_writes_lse(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
+    return !ggml_cuda_fattn_sparse_decode_supported(device, dst) &&
+        ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

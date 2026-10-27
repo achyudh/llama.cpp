@@ -928,7 +928,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 }
 
-template<int D> // D == head size
+template<int D, bool zero_empty = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
@@ -972,6 +972,11 @@ static __global__ void flash_attn_combine_results(
     float kqmax = meta[0].x;
     for (int l = 1; l < parallel_blocks; ++l) {
         kqmax = max(kqmax, meta[l].x);
+    }
+
+    if (zero_empty && kqmax == -INFINITY) {
+        dst[tid] = 0.0f;
+        return;
     }
 
     float VKQ_numerator   = 0.0f;

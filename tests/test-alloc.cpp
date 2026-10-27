@@ -1099,6 +1099,40 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+static void test_sched_host_weight(bool producer, bool host_weight, bool weights) {
+    dummy_backend device = dummy_backend_init(SIZE_MAX);
+    dummy_backend host   = dummy_backend_init(SIZE_MAX);
+    auto [ctx_device, unused_device, ptr_device] = make_context();
+    auto [ctx_host, unused_host, ptr_host]       = make_context();
+    auto [ctx, graph, ptr]                      = make_context();
+
+    ggml_tensor * input = ggml_new_tensor_1d(ctx_device, producer ? GGML_TYPE_F32 : GGML_TYPE_I32, 4);
+    ggml_tensor * table = ggml_new_tensor_2d(host_weight ? ctx_host : ctx_device, GGML_TYPE_I32, 1, 4);
+    ggml_backend_buffer_ptr buf_device(ggml_backend_alloc_ctx_tensors_from_buft(ctx_device, &device.buffer_type));
+    ggml_backend_buffer_ptr buf_host(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host, &host.buffer_type));
+    if (weights) {
+        ggml_backend_buffer_set_usage(table->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+
+    ggml_tensor * ids = producer ? ggml_argmax(ctx, input) : input;
+    ggml_tensor * view = ggml_reshape_1d(ctx, ids, ggml_nelements(ids));
+    ggml_tensor * out = ggml_get_rows(ctx, table, view);
+    ggml_build_forward_expand(graph, out);
+
+    ggml_backend_t backends[] = { &device.context->backend, &host.context->backend };
+    ggml_backend_buffer_type_t bufts[] = { &device.buffer_type, &host.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 32, false, false));
+    if (producer) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), ids, backends[0]);
+    }
+    ggml_backend_sched_set_tensor_backend(sched.get(), out, backends[0]);
+    ggml_backend_sched_split_graph(sched.get(), graph);
+
+    // The weight-copy callback must run after the ID producer, even with no earlier split inputs.
+    const int expected = producer && host_weight && weights ? 2 : 1;
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == expected);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1107,6 +1141,10 @@ static void run(const char * name, void (*f)()) {
 }
 
 int main() {
+    run("test_sched_host_weight_producer", []() { test_sched_host_weight(true, true, true); });
+    run("test_sched_host_weight_first", []() { test_sched_host_weight(false, true, true); });
+    run("test_sched_device_weight", []() { test_sched_host_weight(true, false, true); });
+    run("test_sched_host_input", []() { test_sched_host_weight(true, true, false); });
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);

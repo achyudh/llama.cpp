@@ -29,6 +29,11 @@
 
 // compact: the mask may cover only the last cells (llama_kv_cache::get_n_kv_mask); only for masks that only flash
 // attention reads
+// a lightning indexer's top-k mask (ggml_top_k_mask, QSA) reads the mask cell by cell, so it needs all of them
+static bool kq_mask_can_compact(const llama_hparams & hparams) {
+    return hparams.indexer_top_k == 0;
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -621,7 +626,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams, true);
+    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams, kq_mask_can_compact(hparams));
     res &= n_kv == mctx->get_n_kv();
 
     res &= can_reuse_kv_stream(this, mctx);
@@ -1248,7 +1253,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams, true);
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams,
+                             kq_mask_can_compact(inp_attn->hparams));
     res &= inp_attn->n_kv == mctx->get_attn()->get_n_kv();
 
     res &= can_reuse_kv_stream(inp_attn.get(), mctx->get_attn());
@@ -3223,7 +3229,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, true);
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, kq_mask_can_compact(hparams));
         inp->self_kq_mask_cnv = inp->self_kq_mask;
         inp->n_kv = mctx_cur->get_n_kv();
     }
