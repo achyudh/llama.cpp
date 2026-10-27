@@ -174,7 +174,13 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         } else if (GGML_CUDA_CC_IS_CDNA1(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
             return false;
         } else if (src1_ncols > 16) {
-            return false;
+            // RDNA4 runs more columns as tiles of 16. BF16 always: hipBLASLt can hang on gfx1201 BF16 GEMMs (ROCm 7.2.3) and rocBLAS is 2.4-3.3x slower.
+            // F16 only up to GGML_CUDA_MMF_MAX_COLS (default 16, i.e. hipBLAS).
+            static const int max_cols_f16 = getenv("GGML_CUDA_MMF_MAX_COLS") ? atoi(getenv("GGML_CUDA_MMF_MAX_COLS")) : 16;
+            if (!GGML_CUDA_CC_IS_RDNA4(cc) || type == GGML_TYPE_F32 ||
+                    (type == GGML_TYPE_F16 && src1_ncols > max_cols_f16)) {
+                return false;
+            }
         }
     }
 

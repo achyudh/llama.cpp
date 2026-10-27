@@ -93,7 +93,8 @@ static __global__ void mul_mat_f(
     int expert_idx = 0;
     [[maybe_unused]] int col_base = 0;
 
-    const int channel_dst = has_ids ? 0 : blockIdx.y;
+    // without ids, tiles of cols_per_block columns are packed in the y dimension after the channels
+    const int channel_dst = has_ids ? 0 : blockIdx.y % nchannels_dst;
 
     if constexpr (has_ids) {
         // experts + tiles of ncols_dst are packed in the y dimension
@@ -102,6 +103,8 @@ static __global__ void mul_mat_f(
         const int tile_idx = blockIdx.y / nchannels_x;
         expert_idx = blockIdx.y - tile_idx * nchannels_x;
         col_base = tile_idx * cols_per_block;
+    } else {
+        col_base = (blockIdx.y / nchannels_dst) * cols_per_block;
     }
 
     const int channel_x   = has_ids ? expert_idx : (channel_dst / channel_ratio);
@@ -114,12 +117,14 @@ static __global__ void mul_mat_f(
     y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : channel_y  *stride_channel_y);
     dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : channel_dst*stride_channel_dst);
 
-    if constexpr (has_ids) {
+    {
         constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
         const int64_t col_offset = col_base;
         y   += col_offset * stride_col_y * y_stride_scale;
         dst += col_offset * stride_col_dst;
-        ids += col_offset * stride_row_id;
+        if constexpr (has_ids) {
+            ids += col_offset * stride_row_id;
+        }
     }
 
     [[maybe_unused]] const float2 * y2 = (const float2 *) y;
@@ -193,7 +198,8 @@ static __global__ void mul_mat_f(
                     const int j = j0 + itB*tile_B::I;
 
                     if constexpr (!has_ids) {
-                        tile_xy[j0*tile_k_padded + threadIdx.x] = j < cols_per_block ? y[j*stride_col_y + col] : 0.0f;
+                        tile_xy[j0*tile_k_padded + threadIdx.x] = j < cols_per_block && col_base + j < ncols_dst_total ?
+                            y[j*stride_col_y + col] : 0.0f;
                     } else {
                         const bool valid = j < cols_per_block && (col_base + j) < ncols_dst_total && slot_map[j] >= 0;
                         tile_xy[j0*tile_k_padded + threadIdx.x] = valid ? y[slot_map[j]*stride_channel_y + j*stride_col_y + col] : 0.0f;
@@ -205,7 +211,8 @@ static __global__ void mul_mat_f(
                     const int j = j0 + itB*tile_B::I;
 
                     if constexpr (!has_ids) {
-                        const float2 tmp = j < cols_per_block ? y2[j*stride_col_y + col] : make_float2(0.0f, 0.0f);
+                        const float2 tmp = j < cols_per_block && col_base + j < ncols_dst_total ?
+                            y2[j*stride_col_y + col] : make_float2(0.0f, 0.0f);
                         tile_xy[j0*tile_k_padded + threadIdx.x] = ggml_cuda_cast<T>(tmp);
                     } else {
                         const bool valid = j < cols_per_block && (col_base + j) < ncols_dst_total && slot_map[j] >= 0;
@@ -277,9 +284,11 @@ static __global__ void mul_mat_f(
         }
 
         if constexpr (!has_ids) {
+            if (col_base + j < ncols_dst_total) {
 #pragma unroll
-            for (int i0 = 0; i0 < sizeof(sum)/sizeof(sum[0]); ++i0) {
-                dst[j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] = sum[i0];
+                for (int i0 = 0; i0 < sizeof(sum)/sizeof(sum[0]); ++i0) {
+                    dst[j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] = sum[i0];
+                }
             }
         } else {
             const int slot = (j < cols_per_block) ? slot_map[j] : -1;
@@ -628,8 +637,13 @@ static inline void mul_mat_f_switch_ids(
              stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
              sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
     } else {
-        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>
-            (x, y, ids, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
+        // more than cols_per_block columns: one block per tile of cols_per_block columns, after the channels in y
+        const int64_t col_tiles = (ncols_dst + cols_per_block - 1) / cols_per_block;
+        dim3 block_nums_tiles = block_nums;
+        block_nums_tiles.y *= col_tiles;
+
+        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums_tiles, block_dims, nbytes_shared_total, stream>>>
+            (x, y, ids, dst, ncols_x, std::max<int64_t>(ncols_dst, cols_per_block), nchannels_dst, stride_row, stride_col_y, stride_col_dst,
              stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
              sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
     }
@@ -759,9 +773,8 @@ static void mul_mat_f_switch_cols_per_block(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         cudaStream_t stream, const mmf_ids_data * ids_data) {
 
-    const int ncols_case = (ids && ncols_dst > 16) ? 16 : ncols_dst;
-
-    GGML_ASSERT(ids || ncols_dst <= 16);
+    // more than 16 columns: the 16-column kernel over tiles of columns (see mul_mat_f_switch_ids)
+    const int ncols_case = ncols_dst > 16 ? 16 : ncols_dst;
 
     switch (ncols_case) {
         case  1: {
