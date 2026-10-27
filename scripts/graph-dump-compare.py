@@ -4,7 +4,9 @@
 Tensors are matched by name and occurrence. By default the script lists the first tensors, in the order of the
 first file, whose relative RMS difference exceeds --threshold, then a per-layer table of the residual tensor
 (--residual) and of top-k expert-set changes (--routing, --topk), with the k-th/(k+1)-th router probability gap
-(--probs) of the first file. A routing change explains a large difference from that layer on.
+(--probs) of the first file, and of the attention selection (--selection): the share of selected key blocks both files
+pick. A routing change explains a large difference from that layer on. Last, the per-token KL divergence between the
+--logits of the two files and how often their top-1 tokens agree.
 
 With --write-routing FILE, the top-k experts of the first file's --routing tensors are written as a
 llama-graph-dump --dump-routing file and nothing is compared.
@@ -97,6 +99,9 @@ def main():
     parser.add_argument('--routing', default='ffn_moe_argsort', help='per-layer expert order tensor name (I32, [n_expert, n_tokens])')
     parser.add_argument('--probs', default='ffn_moe_probs', help='per-layer router probabilities in the first file')
     parser.add_argument('--topk', type=int, default=10, help='experts used per token')
+    parser.add_argument('--selection', default='indexer_top_k',
+                        help='per-layer selected key blocks (I32, [n_selected, n_tokens], unordered, negative ids ignored)')
+    parser.add_argument('--logits', default='result_output', help='output logits tensor name')
     args = parser.parse_args()
 
     tokens_a, a = load(args.a)
@@ -139,6 +144,7 @@ def main():
     res_a, res_b = by_layer(a, args.residual), by_layer(b, args.residual)
     route_a, route_b = by_layer(a, args.routing), by_layer(b, args.routing)
     probs_a = by_layer(a, args.probs)
+    sel_a, sel_b = by_layer(a, args.selection), by_layer(b, args.selection)
     k = args.topk
     for il in sorted(set(res_a) & set(res_b)):
         line = f'layer {il:3d} {args.residual} rel_rms {rel_rms(res_a[il]["data"], res_b[il]["data"]):.2e}'
@@ -152,7 +158,31 @@ def main():
             if il in probs_a and probs_a[il]['data'].size % n_tok == 0:
                 p = -np.sort(-probs_a[il]['data'].reshape(n_tok, -1), axis=1)
                 line += f'  min gap {np.min(p[:, k - 1] - p[:, k]):.1e}'
+        if il in sel_a and il in sel_b:
+            n_tok = sel_a[il]['ne'][1]
+            sa = sel_a[il]['data'].reshape(n_tok, sel_a[il]['ne'][0])
+            sb = sel_b[il]['data'].reshape(sel_b[il]['ne'][1], sel_b[il]['ne'][0])
+            common = total = rows = 0
+            for t in range(n_tok):
+                ta, tb = set(sa[t][sa[t] >= 0]), set(sb[t][sb[t] >= 0])
+                common += len(ta & tb)
+                total += max(len(ta), len(tb))
+                rows += ta != tb
+            line += f'  {args.selection} shared {common / max(total, 1):.4f}, differs {rows}/{n_tok}'
         print(line)
+
+    log_a = next((r for r in a if r['name'] == args.logits), None)
+    log_b = next((r for r in b if r['name'] == args.logits), None)
+    if log_a is not None and log_b is not None and log_a['ne'] == log_b['ne']:
+        def log_softmax(r):
+            x = r['data'].reshape(r['ne'][1], r['ne'][0]).astype(np.float64)
+            x = x - x.max(axis=1, keepdims=True)
+            return x - np.log(np.exp(x).sum(axis=1, keepdims=True))
+        la, lb = log_softmax(log_a), log_softmax(log_b)
+        kl = (np.exp(la) * (la - lb)).sum(axis=1)
+        top = la.argmax(axis=1) == lb.argmax(axis=1)
+        print(f'{args.logits}: KL(a||b) per token ' + ' '.join(f'{v:.1e}' for v in kl) +
+              f'  mean {kl.mean():.2e}  max {kl.max():.2e}  top-1 same {top.sum()}/{len(top)}')
 
 
 if __name__ == '__main__':

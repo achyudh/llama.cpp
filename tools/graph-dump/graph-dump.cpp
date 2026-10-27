@@ -2,15 +2,18 @@
 // placements or implementations.
 //
 // usage: llama-graph-dump [common options: -m, -p/-f, -ngl, -dev, -t, -c, --moe-cache-mib, ...]
-//            --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-filter REGEX] [--dump-passes N] [--dump-routing FILE]
+//            --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-prefix P] [--dump-filter REGEX] [--dump-passes N]
+//            [--dump-routing FILE]
 //
-// The ubatch (positions from 0, all tokens output) is the first N tokens of the prompt (default: all), or the token ids in
-// --dump-tokens (whitespace separated), used verbatim. Pass p > 1 clears the memory, decodes the same tokens again and writes FILE.pass<p>.
-// --dump-routing replays an expert selection (llama_set_routing_override): whitespace-separated n_layer n_tokens
-// n_used, then n_layer*n_tokens*n_used expert ids ordered by layer, token and slot.
+// The input is the first N tokens of the prompt (default: all), or of the token ids in --dump-tokens (whitespace
+// separated), used verbatim. The first P tokens (default 0) are decoded in -b batches without dumping; the rest is one
+// ubatch at positions P.. with every token an output, and only its tensors are written. Pass p > 1 clears the memory,
+// decodes the same tokens again and writes FILE.pass<p>. --dump-routing replays an expert selection by position
+// (llama_set_routing_override): whitespace-separated n_layer n_pos n_used, then n_layer*n_pos*n_used expert ids
+// ordered by layer, position and slot, with n_pos >= N.
 //
 // File format (little endian), version 1:
-//   char[8] "LGDUMP\0\1", uint32 version, uint32 pass, uint32 n_tokens, int32 tokens[n_tokens]
+//   char[8] "LGDUMP\0\1", uint32 version, uint32 pass, uint32 n_tokens, int32 tokens[n_tokens] (the dumped ubatch)
 //   then one record per contiguous F32 or I32 tensor, in evaluation order:
 //   uint32 name_len, char name[name_len], uint32 ggml_type, uint32 ggml_op, int64 ne[4], uint64 n_bytes, data[n_bytes]
 // Data is row-major with ne[0] contiguous. Names repeat across graphs; readers match by name and occurrence.
@@ -23,6 +26,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +50,7 @@ static bool dump_eligible(const ggml_tensor * t) {
 
 static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * st = (dump_state *) user_data;
-    if (!dump_eligible(t) || (st->filter && !std::regex_search(t->name, st->pattern))) {
+    if (st->out == nullptr || !dump_eligible(t) || (st->filter && !std::regex_search(t->name, st->pattern))) {
         return false;
     }
     if (ask) {
@@ -69,14 +73,14 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 }
 
 // remove the --dump-* options, which the common parser does not know
-static bool take_dump_args(int & argc, char ** argv, std::string & out, std::string & tokens, int & n, std::string & filter, int & passes,
-        std::string & routing) {
+static bool take_dump_args(int & argc, char ** argv, std::string & out, std::string & tokens, int & n, int & prefix, std::string & filter,
+        int & passes, std::string & routing) {
     int kept = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         std::string * dst = arg == "--dump-out" ? &out : arg == "--dump-tokens" ? &tokens : arg == "--dump-filter" ? &filter :
             arg == "--dump-routing" ? &routing : nullptr;
-        if (dst || arg == "--dump-n" || arg == "--dump-passes") {
+        if (dst || arg == "--dump-n" || arg == "--dump-prefix" || arg == "--dump-passes") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s requires a value\n", arg.c_str());
                 return false;
@@ -85,23 +89,24 @@ static bool take_dump_args(int & argc, char ** argv, std::string & out, std::str
             if (dst) {
                 *dst = value;
             } else {
-                (arg == "--dump-n" ? n : passes) = atoi(value);
+                (arg == "--dump-n" ? n : arg == "--dump-prefix" ? prefix : passes) = atoi(value);
             }
             continue;
         }
         argv[kept++] = argv[i];
     }
     argc = kept;
-    return !out.empty() && passes >= 1;
+    return !out.empty() && passes >= 1 && prefix >= 0;
 }
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     std::string out_path, tokens_path, filter, routing_path;
-    int n_dump = 0, passes = 1;
-    if (!take_dump_args(argc, argv, out_path, tokens_path, n_dump, filter, passes, routing_path)) {
-        fprintf(stderr, "usage: %s [common options] --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-filter REGEX] [--dump-passes N] [--dump-routing FILE]\n", argv[0]);
+    int n_dump = 0, n_prefix = 0, passes = 1;
+    if (!take_dump_args(argc, argv, out_path, tokens_path, n_dump, n_prefix, filter, passes, routing_path)) {
+        fprintf(stderr, "usage: %s [common options] --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-prefix P] [--dump-filter REGEX] "
+                "[--dump-passes N] [--dump-routing FILE]\n", argv[0]);
         return 1;
     }
 
@@ -149,25 +154,27 @@ int main(int argc, char ** argv) {
         }
         tokens.resize(n_dump);
     }
-    if (tokens.empty() || tokens.size() > llama_n_ubatch(ctx) || tokens.size() > llama_n_batch(ctx)) {
-        LOG_ERR("%s: %zu tokens must fit one ubatch (n_batch %u, n_ubatch %u)\n", __func__, tokens.size(), llama_n_batch(ctx), llama_n_ubatch(ctx));
+    const size_t n_dumped = tokens.size() > (size_t) n_prefix ? tokens.size() - n_prefix : 0;
+    if (n_dumped == 0 || n_dumped > llama_n_ubatch(ctx) || n_dumped > llama_n_batch(ctx) || tokens.size() > llama_n_ctx(ctx)) {
+        LOG_ERR("%s: %zu tokens after a prefix of %d must fit one ubatch (n_batch %u, n_ubatch %u), all %zu the context (%u)\n", __func__,
+                n_dumped, n_prefix, llama_n_batch(ctx), llama_n_ubatch(ctx), tokens.size(), llama_n_ctx(ctx));
         return 1;
     }
 
     if (!routing_path.empty()) {
         std::ifstream f(routing_path);
-        uint32_t n_layer = 0, n_tokens = 0, n_used = 0;
-        f >> n_layer >> n_tokens >> n_used;
+        uint32_t n_layer = 0, n_pos = 0, n_used = 0;
+        f >> n_layer >> n_pos >> n_used;
         std::vector<int32_t> ids;
         for (long long id; f >> id;) {
             ids.push_back((int32_t) id);
         }
-        if (n_tokens != tokens.size() || ids.size() != (size_t) n_layer * n_tokens * n_used ||
-                !llama_set_routing_override(ctx, ids.data(), n_layer, n_tokens, n_used)) {
-            LOG_ERR("%s: %s does not hold a routing for %zu tokens\n", __func__, routing_path.c_str(), tokens.size());
+        if (n_pos < tokens.size() || ids.size() != (size_t) n_layer * n_pos * n_used ||
+                !llama_set_routing_override(ctx, ids.data(), n_layer, n_pos, n_used)) {
+            LOG_ERR("%s: %s does not hold a routing for %zu positions\n", __func__, routing_path.c_str(), tokens.size());
             return 1;
         }
-        LOG_INF("%s: replaying the routing of %u layers from %s\n", __func__, n_layer, routing_path.c_str());
+        LOG_INF("%s: replaying the routing of %u layers and %u positions from %s\n", __func__, n_layer, n_pos, routing_path.c_str());
     }
 
     int rc = 0;
@@ -176,22 +183,39 @@ int main(int argc, char ** argv) {
         if (pass > 1) {
             llama_memory_clear(llama_get_memory(ctx), true);
         }
+        // the prefix, undumped, in batches whose last token is an output
+        const int64_t t_prefix = ggml_time_us();
+        for (int i0 = 0; i0 < n_prefix && rc == 0; i0 += llama_n_batch(ctx)) {
+            const int i1 = std::min<int>(n_prefix, i0 + llama_n_batch(ctx));
+            common_batch batch(ctx);
+            for (int i = i0; i < i1; ++i) {
+                batch.add(tokens[i], i, 0, i == i1 - 1);
+            }
+            rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        }
+        if (rc != 0) {
+            LOG_ERR("%s: pass %d: prefix decode failed: %d\n", __func__, pass, rc);
+            break;
+        }
+        if (n_prefix > 0) {
+            LOG_INF("%s: pass %d: prefix of %d tokens in %.1f s\n", __func__, pass, n_prefix, (ggml_time_us() - t_prefix) / 1e6);
+        }
         st.out = fopen(path.c_str(), "wb");
         if (!st.out) {
             LOG_ERR("%s: cannot write %s\n", __func__, path.c_str());
             return 1;
         }
-        const uint32_t version = 1, upass = pass, n = tokens.size();
+        const uint32_t version = 1, upass = pass, n = n_dumped;
         fwrite("LGDUMP\0\1", 1, 8, st.out);
         fwrite(&version, 4, 1, st.out);
         fwrite(&upass, 4, 1, st.out);
         fwrite(&n, 4, 1, st.out);
-        fwrite(tokens.data(), sizeof(llama_token), n, st.out);
+        fwrite(tokens.data() + n_prefix, sizeof(llama_token), n, st.out);
         st.records = 0;
         // every token is an output, so all layers see the whole ubatch and every row's logits are dumped
         common_batch batch(ctx);
         for (uint32_t i = 0; i < n; ++i) {
-            batch.add(tokens[i], i, 0, true);
+            batch.add(tokens[n_prefix + i], n_prefix + i, 0, true);
         }
         rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         const bool ok = fclose(st.out) == 0;
