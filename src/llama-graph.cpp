@@ -311,14 +311,33 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_routing::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(routing && ubatch->n_tokens == routing->n_tokens && (uint32_t) il < routing->n_layer);
-    const size_t n = (size_t) routing->n_tokens * routing->n_used;
-    ggml_backend_tensor_set(selected, routing->ids.data() + il * n, 0, n * sizeof(int32_t));
+    GGML_ASSERT(routing && (uint32_t) il < routing->n_layer && ubatch->n_seqs_unq <= 1);
+    // a layer after the output pruning only processes the output rows
+    const int64_t n_rows = selected->ne[1];
+    const bool    pruned = n_rows < (int64_t) ubatch->n_tokens;
+    GGML_ASSERT(!pruned || ubatch->output);
+    const size_t n_used = routing->n_used;
+    std::vector<int32_t> data(n_rows * n_used);
+    int64_t row = 0;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (pruned && !ubatch->output[i]) {
+            continue;
+        }
+        const llama_pos pos = ubatch->pos[i];
+        if (pos < 0 || (uint32_t) pos >= routing->n_pos || row >= n_rows) {
+            GGML_ABORT("the routing override covers positions [0, %u), the ubatch holds position %d", routing->n_pos, pos);
+        }
+        const int32_t * src = routing->ids.data() + ((size_t) il * routing->n_pos + pos) * n_used;
+        std::copy(src, src + n_used, data.data() + row * n_used);
+        row++;
+    }
+    GGML_ASSERT(row == n_rows);
+    ggml_backend_tensor_set(selected, data.data(), 0, data.size() * sizeof(int32_t));
 }
 
 bool llm_graph_input_routing::can_reuse(const llm_graph_params & params) {
-    return params.routing && params.routing->n_tokens == routing->n_tokens && (uint32_t) il < params.routing->n_layer &&
-        params.routing->n_used == routing->n_used;
+    // the row count follows the ubatch and output sizes, which the other inputs check
+    return params.routing == routing && routing->n_layer == n_layer;
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
@@ -2412,7 +2431,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
-    if (selected_experts == nullptr && routing && routing->n_tokens == n_tokens && il >= 0 && (uint32_t) il < routing->n_layer) {
+    if (selected_experts == nullptr && routing && il >= 0 && (uint32_t) il < routing->n_layer) {
         GGML_ASSERT(routing->n_used == n_expert_used);
         // the router's own order stays in the graph so that its disagreements with the replayed selection are visible
         ggml_tensor * own = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);

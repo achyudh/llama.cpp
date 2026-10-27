@@ -2884,27 +2884,27 @@ llm_graph_params llama_context::graph_params(
     return params;
 }
 
-bool llama_context::set_routing_override(const int32_t * ids, uint32_t n_layer, uint32_t n_tokens, uint32_t n_used) {
+bool llama_context::set_routing_override(const int32_t * ids, uint32_t n_layer, uint32_t n_pos, uint32_t n_used) {
     if (ids == nullptr) {
         routing_active = false;
         routing_override = {};
         return true;
     }
     const auto & hparams = model.hparams;
-    if (n_layer == 0 || n_layer > hparams.n_layer_all || n_tokens == 0 || n_used != hparams.n_expert_used_max()) {
-        LLAMA_LOG_ERROR("%s: invalid routing override: %u layers, %u tokens, %u experts per token\n", __func__, n_layer, n_tokens, n_used);
+    if (n_layer == 0 || n_layer > hparams.n_layer_all || n_pos == 0 || n_used != hparams.n_expert_used_max()) {
+        LLAMA_LOG_ERROR("%s: invalid routing override: %u layers, %u positions, %u experts per token\n", __func__, n_layer, n_pos, n_used);
         return false;
     }
-    const size_t n = (size_t) n_layer * n_tokens * n_used;
+    const size_t n = (size_t) n_layer * n_pos * n_used;
     for (size_t i = 0; i < n; ++i) {
         if (ids[i] < 0 || (uint32_t) ids[i] >= hparams.n_expert) {
             LLAMA_LOG_ERROR("%s: expert id %d at %zu is out of range\n", __func__, ids[i], i);
             return false;
         }
     }
-    routing_override.n_layer  = n_layer;
-    routing_override.n_tokens = n_tokens;
-    routing_override.n_used   = n_used;
+    routing_override.n_layer = n_layer;
+    routing_override.n_pos   = n_pos;
+    routing_override.n_used  = n_used;
     routing_override.ids.assign(ids, ids + n);
     routing_active = true;
     return true;
@@ -3952,8 +3952,8 @@ void llama_context::perf_moe_flush(bool final) {
     moe_perf_last = now;
 }
 
-bool llama_set_routing_override(llama_context * ctx, const int32_t * ids, uint32_t n_layer, uint32_t n_tokens, uint32_t n_used) {
-    return ctx && ctx->set_routing_override(ids, n_layer, n_tokens, n_used);
+bool llama_set_routing_override(llama_context * ctx, const int32_t * ids, uint32_t n_layer, uint32_t n_pos, uint32_t n_used) {
+    return ctx && ctx->set_routing_override(ids, n_layer, n_pos, n_used);
 }
 
 void llama_perf_moe_scope(llama_context * ctx, int64_t task, int32_t slot, int32_t phase) {

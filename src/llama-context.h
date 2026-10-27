@@ -198,7 +198,7 @@ struct llama_context {
     void perf_moe_scope(int64_t task, int slot, int phase);
     void perf_moe_flush(bool final);
 
-    bool set_routing_override(const int32_t * ids, uint32_t n_layer, uint32_t n_tokens, uint32_t n_used);
+    bool set_routing_override(const int32_t * ids, uint32_t n_layer, uint32_t n_pos, uint32_t n_used);
 
     llama_memory_breakdown memory_breakdown() const;
 

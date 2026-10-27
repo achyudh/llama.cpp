@@ -254,27 +254,28 @@ public:
     const uint32_t n_outputs;
 };
 
-// expert ids that replace the router's top-k selection, for replaying the routing of another run
+// expert ids that replace the router's top-k selection, for replaying the routing of another run of one sequence
 struct llama_routing_override {
-    uint32_t n_layer  = 0;
-    uint32_t n_tokens = 0;
-    uint32_t n_used   = 0;
-    std::vector<int32_t> ids; // [n_layer][n_tokens][n_used]
+    uint32_t n_layer = 0;
+    uint32_t n_pos   = 0;
+    uint32_t n_used  = 0;
+    std::vector<int32_t> ids; // [n_layer][n_pos][n_used]
 };
 
 class llm_graph_input_routing : public llm_graph_input_i {
 public:
-    llm_graph_input_routing(const llama_routing_override * routing, int il) : routing(routing), il(il) {}
+    llm_graph_input_routing(const llama_routing_override * routing, int il) : routing(routing), il(il), n_layer(routing->n_layer) {}
     virtual ~llm_graph_input_routing() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * selected = nullptr; // I32 [n_used, n_tokens]
+    ggml_tensor * selected = nullptr; // I32 [n_used, n_rows], n_rows: the ubatch tokens or only its outputs
 
     const llama_routing_override * routing;
     const int il;
+    const uint32_t n_layer; // the override's layer count when the graph was built
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {

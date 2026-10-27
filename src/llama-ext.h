@@ -14,11 +14,12 @@
 LLAMA_API void llama_perf_moe_scope(struct llama_context * ctx, int64_t task, int32_t slot, int32_t phase);
 LLAMA_API void llama_perf_moe_flush(struct llama_context * ctx, bool final);
 
-// Replace the routers' top-k expert selection for ubatches of exactly n_tokens tokens, to replay the routing of
-// another run: ids[(il*n_tokens + t)*n_used + k] is the k-th expert of token t in MoE layer il < n_layer. The routers'
-// probabilities still weight the selected experts. n_used must equal the model's experts per token; ids == nullptr
-// clears the override. Returns false for invalid ids or shapes.
-LLAMA_API bool llama_set_routing_override(struct llama_context * ctx, const int32_t * ids, uint32_t n_layer, uint32_t n_tokens, uint32_t n_used);
+// Replace the routers' top-k expert selection of one sequence by position, to replay the routing of another run:
+// ids[(il*n_pos + p)*n_used + k] is the k-th expert of the token at position p in MoE layer il < n_layer. The routers'
+// probabilities still weight the selected experts. Every decoded position must be below n_pos (the decode aborts
+// otherwise), and n_used must equal the model's experts per token; ids == nullptr clears the override. Returns false
+// for invalid ids or shapes.
+LLAMA_API bool llama_set_routing_override(struct llama_context * ctx, const int32_t * ids, uint32_t n_layer, uint32_t n_pos, uint32_t n_used);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
