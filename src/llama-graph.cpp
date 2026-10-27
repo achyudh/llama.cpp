@@ -1798,7 +1798,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             slots ? moe_cache->get_experts(b.suh) : b.suh,
             slots ? moe_cache->get_experts(b.svh) : b.svh, x, selected, b.bits_x2);
         if (!res) {
-            throw std::runtime_error("invalid EXL3 expert graph");
+            auto * packed = slots ? moe_cache->get_experts(w) : w;
+            auto shape = [](const ggml_tensor * t) {
+                return std::string(ggml_type_name(t->type)) + " [" + std::to_string(t->ne[0]) + "," +
+                    std::to_string(t->ne[1]) + "," + std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+            };
+            throw std::runtime_error("invalid EXL3 expert graph: " + std::string(w->name) + " packed " + shape(packed) +
+                " suh " + shape(b.suh) + " svh " + shape(b.svh) + " x " + shape(x) + " ids " + shape(selected) +
+                " bits_x2 " + std::to_string(b.bits_x2));
         }
     } else {
         res = slots == nullptr ? ggml_mul_mat_id(ctx0, w, cur, ids) :

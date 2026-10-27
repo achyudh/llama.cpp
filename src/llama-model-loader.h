@@ -69,6 +69,7 @@ struct llama_model_loader {
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
     static const int TENSOR_EXL3            = 1 << 6; // canonical packed weights and their auxiliary vectors
+    static const int TENSOR_EXL3_DEVICE     = 1 << 7; // EXL3 bank placed in the qualified device buffer type at the front of the layer list
 
     int n_kv      = 0;
     int n_tensors = 0;

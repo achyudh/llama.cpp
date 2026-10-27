@@ -1220,8 +1220,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return lazy_read::buft();
         }
 
-        if (flags & TENSOR_EXL3) {
-            // Keep source banks host-backed until model-wide ROCm placement is qualified.
+        if ((flags & TENSOR_EXL3) && !(flags & TENSOR_EXL3_DEVICE)) {
+            // Expert banks stay host-backed behind the expert cache.
             return ggml_backend_cpu_buffer_type();
         }
 
@@ -1244,8 +1244,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = nullptr;
 
+        // the model probed MUL_MAT_EXL3 for this buffer type; the generic MUL_MAT probe does not apply to packed banks
+        if (flags & TENSOR_EXL3_DEVICE) {
+            buft = buft_list->front().second;
+        }
+
         // check overrides
-        if (tensor_buft_overrides) {
+        if (!buft && tensor_buft_overrides) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
