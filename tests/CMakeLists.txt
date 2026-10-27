@@ -396,3 +396,5 @@ endif()
 
 llama_build(test-exl3-model.cpp LINK llama)
 target_include_directories(test-exl3-model PRIVATE ../ggml/src)
+llama_build(test-exl3-ngram.cpp LINK llama)
+target_include_directories(test-exl3-ngram PRIVATE ../ggml/src)

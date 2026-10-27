@@ -29,6 +29,7 @@ static ggml_backend_dev_t cpu_device;
 static bool allow_exl3 = true;
 static ggml_backend_dev_t cache_device;
 static bool rocm = false;
+static bool ngram_inputs = false;
 static std::string output_directory;
 static const char * device_name(ggml_backend_dev_t) { return "EXL3-test-device"; }
 static const char * buffer_name(ggml_backend_buffer_type_t) { return "EXL3-test-buffer"; }
@@ -92,6 +93,7 @@ static llama_model * load(const char * file, bool device) {
     p.load_mtp = true;
     p.load_mode = LLAMA_LOAD_MODE_MMAP;
     p.check_tensors = true;
+    if (ngram_inputs) { p.lazy_mode = LLAMA_LAZY_MODE_ON; }
     auto * m = llama_model_load_from_file(file, p);
     if (!m) { throw std::runtime_error("model load failed"); }
     return m;
@@ -116,7 +118,8 @@ static std::vector<float> run(llama_model * model, int rows, bool mtp, size_t ca
         llama_batch_ext_clear(batch);
         const int count = std::min(widths.empty() ? rows : widths[step % widths.size()], 10-start);
         for (int j = 0; j < count; ++j) {
-            const int id = llama_batch_ext_add_token(batch, 0, (start+j)*7 % 128);
+            const int32_t tokens[] = {0,7,0,14,0,0,21,28,0,35};
+            const int id = llama_batch_ext_add_token(batch, 0, ngram_inputs ? tokens[start+j] : (start+j)*7 % 128);
             const llama_pos pos[] = { start+j, start+j, start+j, 0 };
             assert(id >= 0 && llama_batch_ext_set_pos(batch, id, pos));
             if (mtp) { assert(llama_batch_ext_set_embd_state(batch, id, {h.data(), 1, h.size()})); }
@@ -514,9 +517,10 @@ static int test_main(int argc, char ** argv) {
     if (argc == 5 && !strcmp(argv[1], "--rocm-banks")) { return test_actual_cache(argv[2], argv[3], argv[4]); }
 #endif
     rocm = argc == 5 && !strcmp(argv[1], "--rocm");
-    const int first = rocm ? 2 : 1;
-    if (argc != (rocm ? 5 : 3)) { fprintf(stderr, "usage: %s [--rocm] compressed.gguf reconstructed.gguf [output-directory]\n", argv[0]); return 1; }
-    if (rocm) { output_directory = argv[4]; }
+    ngram_inputs = argc == 5 && !strcmp(argv[1], "--ngram");
+    const int first = rocm || ngram_inputs ? 2 : 1;
+    if (argc != (rocm || ngram_inputs ? 5 : 3)) { fprintf(stderr, "usage: %s [--rocm|--ngram] compressed.gguf reconstructed.gguf [output-directory]\n", argv[0]); return 1; }
+    if (rocm || ngram_inputs) { output_directory = argv[4]; }
     llama_backend_init();
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
         if (rocm || level >= GGML_LOG_LEVEL_WARN) { fputs(text, stderr); }
@@ -526,6 +530,7 @@ static int test_main(int argc, char ** argv) {
     assert(cache_device);
     auto * quant = load(argv[first], false);
     auto * ref = load(argv[first+1], false);
+    ngram_inputs = ngram_inputs || quant->exl3_ngram_bits != 0;
     auto load_params = llama_model_default_params();
     ggml_backend_dev_t cpu_devices[] = {nullptr};
     load_params.devices = cpu_devices;
@@ -565,6 +570,11 @@ static int test_main(int argc, char ** argv) {
     params.n_gpu_layers = 0; params.load_mtp = true; params.load_mode = LLAMA_LOAD_MODE_NONE;
     auto * roundtrip = llama_model_load_from_file_ptr(file, params);
     assert(roundtrip && roundtrip->exl3.size() == quant->exl3.size());
+    assert(roundtrip->exl3_ngram_bits == quant->exl3_ngram_bits);
+    if (quant->exl3_ngram_bits) {
+        compare_tensors(quant->per_layer_tok_embd, roundtrip->per_layer_tok_embd);
+        compare_tensors(quant->per_layer_tok_embd_bias, roundtrip->per_layer_tok_embd_bias);
+    }
     for (const auto & entry : quant->exl3) {
         const auto found = std::find_if(roundtrip->exl3.begin(), roundtrip->exl3.end(), [&](const auto & other) {
             return !strcmp(entry.first->name, other.first->name);
@@ -586,11 +596,12 @@ static int test_main(int argc, char ** argv) {
             if (rocm) { compare(run(cached, rows, mtp, 0), values, true); }
         }
     }
-    if (rocm) {
+    if (rocm || ngram_inputs) {
         for (bool mtp : {false, true}) {
             compare(run(cached, 5, mtp, 0, {1,1,4,1,3}), run(cached, 5, mtp, 1280*1024, {1,1,4,1,3}), true);
         }
-    } else {
+    }
+    if (!rocm) {
         allow_exl3 = false;
         auto * backend = device_init(&test_device, nullptr);
         { llama_moe_cache cache(*cached, {backend}, {&test_buft}, 1280*1024); assert(!cache.get_experts(cached->layers[0].ffn_gate_exps)); }

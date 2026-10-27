@@ -2496,6 +2496,69 @@ std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }
 
+size_t llama_model::get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp16_t * out, size_t out_elements) const {
+    const auto * table = per_layer_tok_embd;
+    const auto * bias = per_layer_tok_embd_bias;
+    const int dim = hparams.ple_head_dim;
+    const size_t row_bytes = ggml_exl3_ngram_row_size(exl3_ngram_bits, dim);
+    const size_t heads = hparams.ple_n_heads;
+    if (!row_bytes || !heads || heads > LLAMA_MAX_PLE_HEADS || !table || !bias ||
+        table->type != GGML_TYPE_I16 || bias->type != GGML_TYPE_F16 ||
+        !ggml_is_matrix(table) || !ggml_is_matrix(bias) || !ggml_is_contiguous(table) || !ggml_is_contiguous(bias) ||
+        table->ne[0] != int64_t(row_bytes/2) || bias->ne[0] != dim || bias->ne[1] != int64_t(heads) ||
+        !table->data || !bias->data || !table->buffer || !bias->buffer ||
+        !ggml_backend_buffer_is_host(table->buffer) || !ggml_backend_buffer_is_host(bias->buffer) ||
+        n_rows > SIZE_MAX/(size_t(dim)*sizeof(ggml_fp16_t)) || out_elements != n_rows*size_t(dim) ||
+        (n_rows && (!rows || !out))) {
+        throw std::runtime_error("invalid EXL3 n-gram gather descriptor");
+    }
+    for (size_t h = 0; h < heads; ++h) {
+        const uint64_t start = hparams.ple_head_offsets[h], size = hparams.ple_head_vocab_sizes[h];
+        if (!size || start + size > uint64_t(table->ne[1]) ||
+            (h && start < uint64_t(hparams.ple_head_offsets[h-1]) + hparams.ple_head_vocab_sizes[h-1])) {
+            throw std::runtime_error("invalid EXL3 n-gram hash head ranges");
+        }
+    }
+    std::vector<size_t> order(n_rows);
+    for (size_t i = 0; i < n_rows; ++i) {
+        if (rows[i] < 0 || rows[i] >= table->ne[1]) {
+            throw std::runtime_error("EXL3 n-gram row is out of range");
+        }
+        order[i] = i;
+    }
+    const auto begin = hparams.ple_head_offsets.begin();
+    auto head_of = [&](int32_t row) {
+        const auto it = std::upper_bound(begin, begin + heads, uint32_t(row));
+        if (it == begin) { throw std::runtime_error("EXL3 n-gram row has no hash head"); }
+        const size_t head = it - begin - 1;
+        if (uint64_t(row) >= uint64_t(hparams.ple_head_offsets[head]) + hparams.ple_head_vocab_sizes[head]) {
+            throw std::runtime_error("EXL3 n-gram row is outside its hash head");
+        }
+        return head;
+    };
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return rows[a] < rows[b]; });
+    std::vector<int32_t> unique;
+    unique.reserve(n_rows);
+    for (size_t i : order) {
+        if (unique.empty() || unique.back() != rows[i]) { head_of(rows[i]); unique.push_back(rows[i]); }
+    }
+    if (can_prefetch.count(table)) { llama_prefetch_rows(table, unique.data(), unique.size()); }
+    ggml_fp16_t decoded[256];
+    for (size_t i = 0; i < order.size();) {
+        const int32_t row = rows[order[i]];
+        const size_t head = head_of(row);
+        if (!ggml_exl3_decode_ngram_row((const uint8_t *) table->data + size_t(row)*table->nb[1], row_bytes,
+                exl3_ngram_bits, dim, (const ggml_fp16_t *) bias->data + head*dim, dim, decoded, dim)) {
+            throw std::runtime_error("EXL3 n-gram row decode failed");
+        }
+        do {
+            std::memcpy(out + order[i]*dim, decoded, dim*sizeof(ggml_fp16_t));
+            ++i;
+        } while (i < order.size() && rows[order[i]] == row);
+    }
+    return unique.size();
+}
+
 std::string llama_model::type_name() const {
     return llm_type_name(type);
 }

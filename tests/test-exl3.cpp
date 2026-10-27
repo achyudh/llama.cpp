@@ -1,6 +1,7 @@
 #include "ggml-exl3.h"
 #include "test-exl3-fixtures.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "gguf.h"
 
 #undef NDEBUG
@@ -49,6 +50,59 @@ static void test_golden() {
     assert(std::memcmp(actual, exl3_expected_7, sizeof(actual)) == 0);
     assert(ggml_exl3_decode_tile(exl3_packed_8, sizeof(exl3_packed_8), 8, actual));
     assert(std::memcmp(actual, exl3_expected_8, sizeof(actual)) == 0);
+}
+
+static void test_ngram() {
+    ggml_fp16_t bias[160], out[162];
+    for (int i = 0; i < 160; ++i) { bias[i] = ggml_fp32_to_fp16((i % 7 - 3)*0.0625f); }
+    for (int bits = 1; bits <= 8; ++bits) {
+        std::vector<uint8_t> row(ggml_exl3_ngram_row_size(bits, 160) + 1, 0);
+        row[1] = 0x00; row[2] = 0x38; // FP16 scale 0.5, unaligned source
+        out[0] = out[161] = 0x5a5a;
+        assert(ggml_exl3_decode_ngram_row(row.data()+1, row.size()-1, bits, 160, bias, 160, out+1, 160));
+        for (int i = 0; i < 160; ++i) {
+            assert(out[i+1] == ggml_fp32_to_fp16(fmaf(ggml_fp16_to_fp32(ggml_exl3_mul1(0)), 0.5f, ggml_fp16_to_fp32(bias[i]))));
+        }
+        assert(out[0] == 0x5a5a && out[161] == 0x5a5a);
+    }
+    uint8_t row[162] = {};
+    for (auto & v : out) { v = 0x5a5a; }
+    for (int bits : {-1, 0, 9, 100}) { assert(!ggml_exl3_decode_ngram_row(row, 162, bits, 160, bias, 160, out+1, 160)); }
+    for (int dim : {-1, 0, 15, 159, 257, 1000000000}) { assert(!ggml_exl3_ngram_row_size(8, dim)); }
+    assert(!ggml_exl3_decode_ngram_row(nullptr, 162, 8, 160, bias, 160, out+1, 160));
+    assert(!ggml_exl3_decode_ngram_row(row, 162, 8, 160, nullptr, 160, out+1, 160));
+    assert(!ggml_exl3_decode_ngram_row(row, 162, 8, 160, bias, 159, out+1, 160));
+    assert(!ggml_exl3_decode_ngram_row(row, 161, 8, 160, bias, 160, out+1, 160));
+    assert(!ggml_exl3_decode_ngram_row(row, 163, 8, 160, bias, 160, out+1, 160));
+    assert(!ggml_exl3_decode_ngram_row(row, 162, 8, 160, bias, 160, out+1, 159));
+    assert(!ggml_exl3_decode_ngram_row(row, 162, 8, 160, bias, 160, nullptr, 160));
+    for (auto v : out) { assert(v == 0x5a5a); }
+}
+
+static void test_ngram_native(const char * path, const char * output) {
+    ggml_context * raw = nullptr;
+    gguf_context_ptr meta(gguf_init_from_file(path, {false, &raw}));
+    ggml_context_ptr ctx(raw);
+    assert(meta && ctx);
+    const auto n = gguf_get_val_u32(meta.get(), gguf_find_key(meta.get(), "cases"));
+    std::ofstream file(output, std::ios::binary);
+    for (uint32_t c = 0; c < n; ++c) {
+        const std::string key = "case." + std::to_string(c);
+        const int bits = gguf_get_val_u32(meta.get(), gguf_find_key(meta.get(), (key+".bits").c_str()));
+        auto * packed = ggml_get_tensor(ctx.get(), (key+".packed").c_str());
+        auto * bias = ggml_get_tensor(ctx.get(), (key+".bias").c_str());
+        auto * reference = ggml_get_tensor(ctx.get(), (key+".reference").c_str());
+        assert(packed && bias && reference && packed->type == GGML_TYPE_I16 && bias->type == GGML_TYPE_F16 && reference->type == GGML_TYPE_F16);
+        std::vector<ggml_fp16_t> result(ggml_nelements(reference));
+        assert(ggml_exl3_decode_ngram_row(packed->data, ggml_nbytes(packed), bits, result.size(),
+            (const ggml_fp16_t *) bias->data, ggml_nelements(bias), result.data(), result.size()));
+        if (memcmp(result.data(), reference->data, result.size()*2)) {
+            fprintf(stderr, "EXL3 n-gram mismatch: case=%u bits=%d dim=%zu\n", c, bits, result.size());
+            assert(false);
+        }
+        assert(file.write((const char *) result.data(), result.size()*2));
+    }
+    printf("EXL3 native n-gram rows: %u exact cases\n", n);
 }
 
 static void test_projection() {
@@ -302,6 +356,11 @@ static void test_native(const char * path) {
 
 int main(int argc, char ** argv) {
     auto backend = cpu_backend();
+    if (argc == 4 && !strcmp(argv[1], "--ngram")) {
+        test_ngram_native(argv[2], argv[3]);
+        ggml_backend_free(backend);
+        return 0;
+    }
     if (argc == 5 && std::strcmp(argv[1], "--bundle") == 0) {
         if (!backend) { return 1; }
         int status = run_bundle(argv[2], argv[3], argv[4], backend);
@@ -311,6 +370,7 @@ int main(int argc, char ** argv) {
     test_bounds();
     test_tiles();
     test_golden();
+    test_ngram();
     test_projection();
     test_projection_bounds();
     test_bundle();

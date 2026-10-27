@@ -782,6 +782,8 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+    struct ggml_tensor * per_layer_tok_embd_bias = nullptr;
+    int exl3_ngram_bits = 0;
 
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;
@@ -903,6 +905,9 @@ struct llama_model {
     void register_host_weights(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors, size_t budget) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    // Decode each unique requested row once; storage stays in the existing lazy host mapping.
+    size_t get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp16_t * out, size_t out_elements) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

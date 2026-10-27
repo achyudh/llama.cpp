@@ -12,6 +12,12 @@ GGML_API ggml_fp16_t ggml_exl3_mul1(uint16_t state);
 // Output is one row-major 16 x 16 tile in the rotated basis, without suh/svh scales.
 GGML_API bool ggml_exl3_decode_tile(const void * packed, size_t packed_bytes, int bits_x2, ggml_fp16_t dst[256]);
 
+// LSB-first embedding ring, FP16 scale then packed symbols; no Hadamard or projection scales.
+GGML_API size_t ggml_exl3_ngram_row_size(int bits, int dim);
+GGML_API bool ggml_exl3_decode_ngram_row(const void * packed, size_t packed_bytes, int bits, int dim,
+                                       const ggml_fp16_t * bias, size_t bias_elements,
+                                       ggml_fp16_t * dst, size_t dst_elements);
+
 struct ggml_exl3_matrix {
     int64_t ne0;
     int64_t ne1;

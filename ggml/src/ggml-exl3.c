@@ -42,6 +42,37 @@ ggml_fp16_t ggml_exl3_mul1(uint16_t state) {
     return ggml_fp32_to_fp16(fmaf(1024.0f + sum, scale, bias));
 }
 
+size_t ggml_exl3_ngram_row_size(int bits, int dim) {
+    return bits >= 1 && bits <= 8 && dim >= 16 && dim <= 256 && dim % 16 == 0 ? 2 + dim * bits / 8 : 0;
+}
+
+bool ggml_exl3_decode_ngram_row(const void * packed, size_t packed_bytes, int bits, int dim,
+                               const ggml_fp16_t * bias, size_t bias_elements,
+                               ggml_fp16_t * dst, size_t dst_elements) {
+    const size_t bytes = ggml_exl3_ngram_row_size(bits, dim);
+    if (!packed || !dst || !bytes || packed_bytes != bytes || dst_elements != (size_t) dim ||
+        !bias || bias_elements != (size_t) dim) {
+        return false;
+    }
+    const uint8_t * src = packed;
+    const float scale = ggml_fp16_to_fp32((ggml_fp16_t) (src[0] | (src[1] << 8)));
+    for (int i = 0; i < dim; ++i) {
+        uint16_t state = 0;
+        if (bits == 8) {
+            state = src[2+i] | (src[2+(i+dim-1)%dim] << 8);
+        } else {
+            for (int m = 0; m < 16; ++m) {
+                const int pos = (i - m / bits + dim) % dim;
+                const int bit = pos * bits + m % bits;
+                state |= ((src[2 + bit / 8] >> (bit & 7)) & 1) << m;
+            }
+        }
+        const float value = ggml_fp16_to_fp32(ggml_exl3_mul1(state));
+        dst[i] = ggml_fp32_to_fp16(fmaf(value, scale, ggml_fp16_to_fp32(bias[i])));
+    }
+    return true;
+}
+
 static uint32_t ggml_exl3_load_u32(const uint8_t * p) {
     return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
 }

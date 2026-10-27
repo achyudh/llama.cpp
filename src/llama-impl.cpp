@@ -19,6 +19,20 @@ struct llama_logger_state {
 
 static llama_logger_state g_logger_state;
 
+int32_t llama_ngram_hash(const int32_t * tokens, const uint64_t * multipliers, size_t n,
+                         int32_t eos, uint32_t size, uint32_t offset) {
+    GGML_ASSERT(tokens && multipliers && n > 0 && size > 0 && uint64_t(offset) + size <= INT32_MAX);
+    uint64_t mixed = uint64_t(tokens[0]) * multipliers[0];
+    bool cut = false;
+    for (size_t i = 1; i < n; ++i) {
+        cut = cut || tokens[i] < 0 || tokens[i] == eos;
+        mixed ^= uint64_t(cut ? eos : tokens[i]) * multipliers[i];
+    }
+    const int64_t signed_mixed = mixed <= INT64_MAX ? int64_t(mixed) : -1 - int64_t(UINT64_MAX - mixed);
+    const int64_t remainder = signed_mixed % int64_t(size);
+    return int32_t(offset + (remainder < 0 ? remainder + size : remainder));
+}
+
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
     if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || n_rows == 0) {
         return;

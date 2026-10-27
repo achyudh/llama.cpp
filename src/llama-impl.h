@@ -77,6 +77,10 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 // Prefetch the host pages needed to gather these rows.
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
+// Tokens are newest first; missing predecessors are negative and EOS cuts only older context.
+int32_t llama_ngram_hash(const int32_t * tokens, const uint64_t * multipliers, size_t n,
+                         int32_t eos, uint32_t size, uint32_t offset);
+
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
     ~time_meas();

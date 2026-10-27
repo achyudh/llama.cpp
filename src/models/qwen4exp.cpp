@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "ggml-exl3.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -210,8 +211,40 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = ple_w->tensor->ne[1];
         }
 
+        int64_t width = hparams.ple_head_dim;
+        const int64_t bits_id = gguf_find_key(ml.metadata, "exl3.ngram.bits");
+        if (bits_id >= 0) {
+            auto require = [&](const char * key, gguf_type type) {
+                const int64_t id = gguf_find_key(ml.metadata, key);
+                if (id < 0 || gguf_get_kv_type(ml.metadata, id) != type) {
+                    throw std::runtime_error(format("invalid EXL3 n-gram metadata: %s", key));
+                }
+                return id;
+            };
+            const uint32_t bits = gguf_get_val_u32(ml.metadata, require("exl3.ngram.bits", GGUF_TYPE_UINT32));
+            if (gguf_get_val_u32(ml.metadata, require("exl3.ngram.version", GGUF_TYPE_UINT32)) != 1 ||
+                strcmp(gguf_get_val_str(ml.metadata, require("exl3.ngram.codebook", GGUF_TYPE_STRING)), "mul1") ||
+                bits > 8 || !ggml_exl3_ngram_row_size(bits, hparams.ple_head_dim)) {
+                throw std::runtime_error("unsupported EXL3 n-gram codec");
+            }
+            for (uint32_t h = 1; h < hparams.ple_n_heads; ++h) {
+                if (hparams.ple_head_offsets[h] < uint64_t(hparams.ple_head_offsets[h-1]) + hparams.ple_head_vocab_sizes[h-1]) {
+                    throw std::runtime_error("EXL3 n-gram hash head ranges must be sorted and disjoint");
+                }
+            }
+            exl3_ngram_bits = bits;
+            width = ggml_exl3_ngram_row_size(bits, hparams.ple_head_dim)/2;
+            per_layer_tok_embd_bias = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "bias"),
+                {hparams.ple_head_dim, hparams.ple_n_heads}, llama_model_loader::TENSOR_EXL3);
+            if (per_layer_tok_embd_bias->type != GGML_TYPE_F16) {
+                throw std::runtime_error("EXL3 n-gram head bias must be F16");
+            }
+        }
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+            {width, ple_rows}, TENSOR_READ_LAZY | (exl3_ngram_bits ? llama_model_loader::TENSOR_EXL3 : 0));
+        if (exl3_ngram_bits && per_layer_tok_embd->type != GGML_TYPE_I16) {
+            throw std::runtime_error("EXL3 n-gram packed table must be I16");
+        }
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1226,10 +1259,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return emb ? emb->ne[1] == params.ubatch.n_tokens :
+            rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb = nullptr;    // decoded F16 [ple_head_dim * ple_n_heads, n_tokens]
 
     const llama_model & model;
 
@@ -1238,6 +1273,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<ggml_fp16_t> decoded;
 };
 
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
@@ -1274,31 +1310,27 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an EOS in the window resets everything at or before it
-        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
-        // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
+        std::vector<int32_t> ctx(n_gram);
         ctx[0] = tok_of(i);
-        bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
-            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
-            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
-            cut = cut || t < 0 || t == eos;
-            ctx[s] = cut ? eos : t;
+            ctx[s] = prev[i*n_prev + (n_prev - s)];
         }
 
         for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
-            }
             const int64_t base = (n - 2) * per_gram;
             for (int64_t g = 0; g < per_gram; ++g) {
                 const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+                idx[i * n_heads + h_i] = llama_ngram_hash(ctx.data(), hparams.ple_layer_multipliers.data(), n,
+                    eos, hparams.ple_head_vocab_sizes[h_i], hparams.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    if (emb) {
+        decoded.resize(idx.size()*hparams.ple_head_dim);
+        model.get_ngram_rows(idx.data(), idx.size(), decoded.data(), decoded.size());
+        ggml_backend_tensor_set(emb, decoded.data(), 0, decoded.size()*sizeof(ggml_fp16_t));
+        return;
     }
 
     {
@@ -1375,6 +1407,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+
+    if (model.exl3_ngram_bits) {
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, hparams.ple_head_dim*n_heads, n_tokens);
+        ggml_set_input(ple_inp->emb);
+        ggml_tensor * emb = ggml_cast(ctx0, ple_inp->emb, GGML_TYPE_F32);
+        res->add_input(std::move(ple_inp));
+        cb(emb, "ple_embd", -1);
+        return emb;
+    }
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);

@@ -77,7 +77,7 @@ void llama_model_saver::add_kv(const enum llm_kv key, const char value) {
 template <typename Container>
 void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, const bool per_layer) {
     GGML_ASSERT(model != nullptr || !per_layer);
-    const size_t n_values = per_layer ? size_t(model->exl3.empty() ? model->hparams.n_layer() : model->hparams.n_layer_all) : value.size();
+    const size_t n_values = per_layer ? size_t(model->exl3.empty() && !model->exl3_ngram_bits ? model->hparams.n_layer() : model->hparams.n_layer_all) : value.size();
     GGML_ASSERT(n_values <= value.size());
 
     if (n_values == 0) {
@@ -156,6 +156,11 @@ void llama_model_saver::add_kv_from_model() {
             const std::string key = std::string("exl3.") + entry.first->name + ".bits_x2";
             gguf_set_val_u32(gguf_ctx, key.c_str(), entry.second.bits_x2);
         }
+    }
+    if (model->exl3_ngram_bits) {
+        gguf_set_val_u32(gguf_ctx, "exl3.ngram.version", 1);
+        gguf_set_val_str(gguf_ctx, "exl3.ngram.codebook", "mul1");
+        gguf_set_val_u32(gguf_ctx, "exl3.ngram.bits", model->exl3_ngram_bits);
     }
 
     const int32_t n_vocab = vocab.n_tokens();
@@ -513,6 +518,7 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
     add_tensor(model->per_layer_tok_embd);
+    add_tensor(model->per_layer_tok_embd_bias);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
     add_tensor(model->hc_head_up);
