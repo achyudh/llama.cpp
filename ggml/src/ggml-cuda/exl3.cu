@@ -9,9 +9,10 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
     const int bits = ggml_get_op_params_i32(op, 0);
     const int64_t rows = op->src[4] ? op->ne[2] : op->ne[1];
     const int64_t assignments = op->ne[1] * op->ne[2];
-    // Bound the initial decode workspace and grid. Larger batches stay on the reference backend.
+    // Bound the decode workspace and grid. Larger batches stay on the reference backend. Widths cover the
+    // 248320-column vocabulary head with int column indices.
     return (bits == 7 || bits == 8 || bits == 10 || bits == 12 || bits == 14) && rows <= 8 &&
-        op->src[2]->ne[0] <= 131072 && op->ne[0] <= 131072 && op->src[0]->ne[2] <= INT_MAX &&
+        op->src[2]->ne[0] <= 262144 && op->ne[0] <= 262144 && op->src[0]->ne[2] <= INT_MAX &&
         assignments <= 512 && assignments * (op->src[2]->ne[0] + op->ne[0]) <= 16 * 1024 * 1024;
 #else
     GGML_UNUSED(op); GGML_UNUSED(cc);
@@ -152,11 +153,66 @@ static __global__ void exl3_matrix_fragment(ggml_cuda_exl3_args a) {
     }
 }
 
+// A dense bank is shared by every row, so decode each fragment once and apply it to all rows. Per-row accumulation
+// and reduction follow exl3_matrix_fragment<bits_x2, false> exactly, so each row's result is bit-identical to it.
+template<int bits_x2, int rows>
+static __global__ void exl3_matrix_rows(ggml_cuda_exl3_args a) {
+    __shared__ float partial[4][rows][16];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const float * xh = (const float *) a.xh;
+    float lo[rows], hi[rows];
+#pragma unroll
+    for (int r = 0; r < rows; ++r) { lo[r] = 0; hi[r] = 0; }
+    for (int kt = warp; kt < a.k / 16; kt += 4) {
+        const uint32_t * tile = a.packed + (size_t(kt) * (a.n / 16) + blockIdx.x) * (4 * bits_x2);
+        half w[8];
+        ggml_cuda_exl3_fragment<bits_x2>(tile, lane, w);
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float v = xh[size_t(r) * a.k + kt * 16 + (lane & 3) * 2 + (j & 1) + (j / 2) * 8];
+                lo[r] = fmaf(v, __half2float(w[j]), lo[r]);
+                hi[r] = fmaf(v, __half2float(w[j + 4]), hi[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        lo[r] += __shfl_xor(lo[r], 1, 32); lo[r] += __shfl_xor(lo[r], 2, 32);
+        hi[r] += __shfl_xor(hi[r], 1, 32); hi[r] += __shfl_xor(hi[r], 2, 32);
+        const float vlo = __shfl(lo[r], (lane & 7) * 4, 32), vhi = __shfl(hi[r], (lane & 7) * 4, 32);
+        if (lane < 16) { partial[warp][r][lane] = (lane & 8) ? vhi : vlo; }
+    }
+    __syncthreads();
+    if (warp == 0 && lane < 16) {
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            float sum = partial[0][r][lane];
+            for (int w = 1; w < 4; ++w) { sum += partial[w][r][lane]; }
+            a.yh[size_t(r) * a.n + blockIdx.x * 16 + lane] = sum;
+        }
+    }
+}
+
 template<int bits_x2>
 static void exl3_matrix_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mode mode, cudaStream_t stream) {
+    if (mode == GGML_EXL3_F32_ROWS && !a.ids && a.experts >= 1 && a.assignments <= 8) {
+        switch (a.assignments) {
+            case 1: exl3_matrix_rows<bits_x2, 1><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 2: exl3_matrix_rows<bits_x2, 2><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 3: exl3_matrix_rows<bits_x2, 3><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 4: exl3_matrix_rows<bits_x2, 4><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 5: exl3_matrix_rows<bits_x2, 5><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 6: exl3_matrix_rows<bits_x2, 6><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 7: exl3_matrix_rows<bits_x2, 7><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 8: exl3_matrix_rows<bits_x2, 8><<<a.n / 16, 128, 0, stream>>>(a); return;
+            default: break;
+        }
+    }
     const dim3 grid(a.n / 16, a.assignments);
     if (mode == GGML_EXL3_F16_DOT) { exl3_matrix_fragment<bits_x2, true><<<grid, 128, 0, stream>>>(a); }
-    else if (mode == GGML_EXL3_F32_FRAGMENT) { exl3_matrix_fragment<bits_x2, false><<<grid, 128, 0, stream>>>(a); }
+    else if (mode == GGML_EXL3_F32_FRAGMENT || mode == GGML_EXL3_F32_ROWS) { exl3_matrix_fragment<bits_x2, false><<<grid, 128, 0, stream>>>(a); }
     else { exl3_matrix_f32<bits_x2><<<grid, 128, 0, stream>>>(a); }
 }
 
@@ -195,7 +251,7 @@ void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         (const float *) dst->src[1]->data, dst->src[4] ? (const int32_t *) dst->src[4]->data : nullptr,
         (float *) dst->data, xh.get(), yh.get(), k, n, int(dst->src[0]->ne[2]), assignments,
         dst->src[4] ? int(dst->ne[1]) : 1, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0)};
-    ggml_cuda_exl3_launch(args, GGML_EXL3_F32_FRAGMENT, GGML_EXL3_ALL, ctx.stream());
+    ggml_cuda_exl3_launch(args, args.ids ? GGML_EXL3_F32_FRAGMENT : GGML_EXL3_F32_ROWS, GGML_EXL3_ALL, ctx.stream());
 #else
     GGML_UNUSED(ctx); GGML_UNUSED(dst);
     GGML_ABORT("EXL3 projections require the ROCm backend");

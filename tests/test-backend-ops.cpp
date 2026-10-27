@@ -6237,18 +6237,19 @@ struct test_mul_mat_exl3 : public test_case {
     const int bits_x2;
     const int rows;
     const bool routed;
+    const int n;
 
-    test_mul_mat_exl3(int bits_x2, int rows, bool routed) : bits_x2(bits_x2), rows(rows), routed(routed) {}
+    test_mul_mat_exl3(int bits_x2, int rows, bool routed, int n = 256) : bits_x2(bits_x2), rows(rows), routed(routed), n(n) {}
 
     std::string vars() override {
-        return VARS_TO_STR3(bits_x2, rows, routed);
+        return VARS_TO_STR4(bits_x2, rows, routed, n);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int experts = routed ? 2 : 1;
-        auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 128 / 16 * (256 / 16) * 8 * bits_x2, 1, experts);
+        auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 128 / 16 * (n / 16) * 8 * bits_x2, 1, experts);
         auto * su = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 128, experts);
-        auto * sv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, experts);
+        auto * sv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, experts);
         auto * x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 1, rows) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, rows);
         auto * ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, rows) : nullptr;
         if (ids) { ggml_set_name(ids, "exl3_test_ids"); }
@@ -10800,6 +10801,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, routed));
             }
         }
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 8, false));
+    }
+    // the vocabulary head is wider than any layer projection
+    for (int rows : {1, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat_exl3(12, rows, false, 248320));
     }
 
     // Decode shapes of the RDNA4 Q8_0/Q4_0 paged decode kernel (4 KV heads x GQA 6, head 256, 1-8 query tokens).

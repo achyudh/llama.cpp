@@ -145,8 +145,9 @@ static void projection(const char * bank, const char * input, const char * prefi
         (const float *) x->data, ids ? (const int32_t *) ids->data : nullptr, (float *) out->data, xh, yh,
         k, n, int(p->ne[2]), assignments, ids ? int(ids->ne[0]) : 1, int(x->ne[1]), b.bits_x2};
     std::printf("{\"k\":%d,\"n\":%d,\"assignments\":%d,\"timing_us\":{", k, n, assignments);
-    for (auto mode : {GGML_EXL3_F32, GGML_EXL3_F16_DOT, GGML_EXL3_F32_FRAGMENT}) {
-        const char * name = mode == GGML_EXL3_F32 ? "f32" : mode == GGML_EXL3_F16_DOT ? "dot" : "fragment";
+    for (auto mode : {GGML_EXL3_F32, GGML_EXL3_F16_DOT, GGML_EXL3_F32_FRAGMENT, GGML_EXL3_F32_ROWS}) {
+        const char * name = mode == GGML_EXL3_F32 ? "f32" : mode == GGML_EXL3_F16_DOT ? "dot" :
+            mode == GGML_EXL3_F32_FRAGMENT ? "fragment" : "rows";
         ggml_cuda_exl3_launch(a, mode, GGML_EXL3_ALL, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         save_output(std::string(prefix) + "." + name + ".bin", out);
