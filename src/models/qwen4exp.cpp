@@ -1517,5 +1517,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
-    return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
+    ggml_tensor * out = ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
+    cb(out, "ple_out", il);
+    return out;
 }

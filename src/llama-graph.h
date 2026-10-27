@@ -254,6 +254,29 @@ public:
     const uint32_t n_outputs;
 };
 
+// expert ids that replace the router's top-k selection, for replaying the routing of another run
+struct llama_routing_override {
+    uint32_t n_layer  = 0;
+    uint32_t n_tokens = 0;
+    uint32_t n_used   = 0;
+    std::vector<int32_t> ids; // [n_layer][n_tokens][n_used]
+};
+
+class llm_graph_input_routing : public llm_graph_input_i {
+public:
+    llm_graph_input_routing(const llama_routing_override * routing, int il) : routing(routing), il(il) {}
+    virtual ~llm_graph_input_routing() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * selected = nullptr; // I32 [n_used, n_tokens]
+
+    const llama_routing_override * routing;
+    const int il;
+};
+
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
@@ -857,6 +880,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // expert selection to replay, nullptr to use the router
+    const llama_routing_override * routing = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -913,6 +939,10 @@ struct llm_graph_params {
                     return false;
                 }
             }
+        }
+
+        if ((routing == nullptr) != (other.routing == nullptr)) {
+            return false;
         }
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
@@ -1092,6 +1122,7 @@ struct llm_graph_context {
 
     const llama_hadamard * hdmd;
     const llama_model * model_weights;
+    const llama_routing_override * routing;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

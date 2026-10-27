@@ -310,6 +310,17 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_routing::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(routing && ubatch->n_tokens == routing->n_tokens && (uint32_t) il < routing->n_layer);
+    const size_t n = (size_t) routing->n_tokens * routing->n_used;
+    ggml_backend_tensor_set(selected, routing->ids.data() + il * n, 0, n * sizeof(int32_t));
+}
+
+bool llm_graph_input_routing::can_reuse(const llm_graph_params & params) {
+    return params.routing && params.routing->n_tokens == routing->n_tokens && (uint32_t) il < params.routing->n_layer &&
+        params.routing->n_used == routing->n_used;
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -1614,6 +1625,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     model_weights    (params.model),
+    routing          (params.routing),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2400,6 +2412,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
+    if (selected_experts == nullptr && routing && routing->n_tokens == n_tokens && il >= 0 && (uint32_t) il < routing->n_layer) {
+        GGML_ASSERT(routing->n_used == n_expert_used);
+        // the router's own order stays in the graph so that its disagreements with the replayed selection are visible
+        ggml_tensor * own = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);
+        cb(own->src[0], "ffn_moe_argsort", il);
+        ggml_build_forward_expand(gf, own);
+        auto inp = std::make_unique<llm_graph_input_routing>(routing, il);
+        inp->selected = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+        ggml_set_input(inp->selected);
+        ggml_set_name(inp->selected, ("ffn_moe_replayed-" + std::to_string(il)).c_str());
+        selected_experts = inp->selected;
+        res->add_input(std::move(inp));
+    }
     if (selected_experts == nullptr) {
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);

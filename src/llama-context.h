@@ -198,6 +198,8 @@ struct llama_context {
     void perf_moe_scope(int64_t task, int slot, int phase);
     void perf_moe_flush(bool final);
 
+    bool set_routing_override(const int32_t * ids, uint32_t n_layer, uint32_t n_tokens, uint32_t n_used);
+
     llama_memory_breakdown memory_breakdown() const;
 
     //
@@ -310,6 +312,8 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    llama_routing_override routing_override;
+    bool routing_active = false;
     int64_t moe_perf_task = -1;
     int moe_perf_slot = -1;
     int moe_perf_phase = 0;
