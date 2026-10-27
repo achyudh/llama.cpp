@@ -242,6 +242,44 @@ static void test_dispatch(ggml_backend_t backend) {
     }
 }
 
+// Any thread split must reproduce the single-thread reference byte for byte; empty batches build and do nothing.
+static void test_threads() {
+    const int k = 256, n = 1280, rate = 8, experts = 6;
+    auto * ctx = ggml_init({16 * 1024 * 1024, nullptr, false});
+    auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, k / 16 * (n / 16) * ggml_exl3_tile_size(rate) / 2, 1, experts);
+    auto * su = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, experts);
+    auto * sv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, experts);
+    for (size_t i = 0; i < ggml_nbytes(p); ++i) { ((uint8_t *) p->data)[i] = uint8_t(i * 29 + i / 211); }
+    for (int i = 0; i < k * experts; ++i) { ((ggml_fp16_t *) su->data)[i] = ggml_fp32_to_fp16(float(i % 5 - 2) / 4); }
+    for (int i = 0; i < n * experts; ++i) { ((ggml_fp16_t *) sv->data)[i] = ggml_fp32_to_fp16(float(i % 13 - 6) / 8); }
+    auto * dense_p = ggml_view_3d(ctx, p, p->ne[0], 1, 1, p->nb[1], p->nb[2], 0);
+    auto * dense_su = ggml_view_2d(ctx, su, k, 1, su->nb[1], 0);
+    auto * dense_sv = ggml_view_2d(ctx, sv, n, 1, sv->nb[1], 0);
+    for (bool routed : {false, true}) {
+        const int rows = 5, slots = routed ? 3 : 0;
+        auto * x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, rows) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, rows);
+        auto * ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, slots, rows) : nullptr;
+        for (int64_t i = 0; i < ggml_nelements(x); ++i) { ((float *) x->data)[i] = float(i % 23 - 11) / 16; }
+        for (int i = 0; ids && i < slots * rows; ++i) { ((int32_t *) ids->data)[i] = (i * 5 + i / 3) % (experts - 1); }
+        auto * out = routed ? ggml_mul_mat_exl3(ctx, p, su, sv, x, ids, rate) : ggml_mul_mat_exl3(ctx, dense_p, dense_su, dense_sv, x, nullptr, rate);
+        assert(out);
+        assert(ggml_exl3_compute_forward_part(out, 0, 1));
+        std::vector<uint8_t> expected((uint8_t *) out->data, (uint8_t *) out->data + ggml_nbytes(out));
+        for (int nth : {2, 3, 7, 16, 64}) {
+            std::memset(out->data, 0x5a, ggml_nbytes(out));
+            for (int ith = 0; ith < nth; ++ith) { assert(ggml_exl3_compute_forward_part(out, ith, nth)); }
+            assert(std::memcmp(out->data, expected.data(), expected.size()) == 0);
+        }
+        assert(!ggml_exl3_compute_forward_part(out, 1, 1));
+        auto * empty_x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, 0) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 0);
+        auto * empty_ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, slots, 0) : nullptr;
+        auto * empty = routed ? ggml_mul_mat_exl3(ctx, p, su, sv, empty_x, empty_ids, rate) :
+            ggml_mul_mat_exl3(ctx, dense_p, dense_su, dense_sv, empty_x, nullptr, rate);
+        assert(empty && ggml_is_empty(empty) && ggml_exl3_compute_forward_part(empty, 0, 4));
+    }
+    ggml_free(ctx);
+}
+
 static gguf_context * metadata(const ggml_exl3_bundle & b) {
     auto * meta = gguf_init_empty();
     gguf_set_val_str(meta, "general.architecture", "exl3_projection");
@@ -374,6 +412,7 @@ int main(int argc, char ** argv) {
     test_projection();
     test_projection_bounds();
     test_bundle();
+    test_threads();
     if (backend) {
         test_dispatch(backend);
         ggml_backend_free(backend);

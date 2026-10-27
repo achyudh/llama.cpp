@@ -243,6 +243,9 @@ void ggml_cuda_exl3_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mode mo
 void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #ifdef GGML_USE_HIP
     GGML_ASSERT(ggml_cuda_supports_exl3(dst, ggml_cuda_info().devices[ctx.device].cc));
+    if (ggml_is_empty(dst)) {
+        return;
+    }
     const int k = dst->src[2]->ne[0], n = dst->ne[0], assignments = dst->ne[1] * dst->ne[2];
     ggml_cuda_pool_alloc<float> xh(ctx.pool(), size_t(assignments) * k);
     ggml_cuda_pool_alloc<float> yh(ctx.pool(), size_t(assignments) * n);

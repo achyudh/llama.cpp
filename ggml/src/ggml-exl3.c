@@ -128,16 +128,21 @@ static void ggml_exl3_had_128(double * x) {
     }
 }
 
-bool ggml_exl3_mul_mat_ref(const struct ggml_exl3_matrix * matrix, int64_t rows,
-                          const float * x, size_t x_elements, float * dst, size_t dst_elements) {
+// Output columns [c0, c1) of the reference product, in 128-column Hadamard blocks. Every output element accumulates in
+// the same order as the full product, so any column partition reproduces it bit for bit.
+static bool ggml_exl3_mul_mat_cols(const struct ggml_exl3_matrix * matrix, int64_t rows,
+                                   const float * x, size_t x_elements, float * dst, size_t dst_elements,
+                                   size_t c0, size_t c1) {
     if (!matrix || !x || !dst || !matrix->packed || !matrix->suh || !matrix->svh ||
         matrix->ne0 <= 0 || matrix->ne1 <= 0 || rows <= 0 || matrix->ne0 % 128 || matrix->ne1 % 128 ||
-        (uint64_t) matrix->ne0 > SIZE_MAX || (uint64_t) matrix->ne1 > SIZE_MAX || (uint64_t) rows > SIZE_MAX) {
+        (uint64_t) matrix->ne0 > SIZE_MAX || (uint64_t) matrix->ne1 > SIZE_MAX || (uint64_t) rows > SIZE_MAX ||
+        c0 % 128 || c1 % 128 || c0 >= c1 || c1 > (uint64_t) matrix->ne1) {
         return false;
     }
     const size_t k = (size_t) matrix->ne0;
     const size_t n = (size_t) matrix->ne1;
     const size_t m = (size_t) rows;
+    const size_t width = c1 - c0;
     const size_t tile_size = ggml_exl3_tile_size(matrix->bits_x2);
     size_t tiles, packed_bytes, nx, ny, x_bytes, y_bytes;
     if (!tile_size || !ggml_exl3_mul_size(k / 16, n / 16, &tiles) ||
@@ -145,7 +150,8 @@ bool ggml_exl3_mul_mat_ref(const struct ggml_exl3_matrix * matrix, int64_t rows,
         matrix->suh_elements != k || matrix->svh_elements != n ||
         !ggml_exl3_mul_size(m, k, &nx) || !ggml_exl3_mul_size(m, n, &ny) ||
         x_elements != nx || dst_elements != ny ||
-        !ggml_exl3_mul_size(nx, sizeof(double), &x_bytes) || !ggml_exl3_mul_size(ny, sizeof(double), &y_bytes)) {
+        !ggml_exl3_mul_size(nx, sizeof(double), &x_bytes) || !ggml_exl3_mul_size(m, width, &ny) ||
+        !ggml_exl3_mul_size(ny, sizeof(double), &y_bytes)) {
         return false;
     }
     double * xh = malloc(x_bytes);
@@ -165,7 +171,7 @@ bool ggml_exl3_mul_mat_ref(const struct ggml_exl3_matrix * matrix, int64_t rows,
     }
     ggml_fp16_t tile[256];
     for (size_t ki = 0; ki < k; ki += 16) {
-        for (size_t ni = 0; ni < n; ni += 16) {
+        for (size_t ni = c0; ni < c1; ni += 16) {
             const size_t offset = (ki / 16 * (n / 16) + ni / 16) * tile_size;
             if (!ggml_exl3_decode_tile((const uint8_t *) matrix->packed + offset, tile_size, matrix->bits_x2, tile)) {
                 free(xh);
@@ -176,23 +182,29 @@ bool ggml_exl3_mul_mat_ref(const struct ggml_exl3_matrix * matrix, int64_t rows,
                 for (size_t j = 0; j < 16; ++j) {
                     const double w = ggml_fp16_to_fp32(tile[i * 16 + j]);
                     for (size_t r = 0; r < m; ++r) {
-                        yh[r * n + ni + j] += xh[r * k + ki + i] * w;
+                        yh[r * width + ni - c0 + j] += xh[r * k + ki + i] * w;
                     }
                 }
             }
         }
     }
     for (size_t r = 0; r < m; ++r) {
-        for (size_t j = 0; j < n; j += 128) {
-            ggml_exl3_had_128(yh + r * n + j);
+        for (size_t j = 0; j < width; j += 128) {
+            ggml_exl3_had_128(yh + r * width + j);
         }
-        for (size_t j = 0; j < n; ++j) {
-            dst[r * n + j] = (float) (yh[r * n + j] * (double) ggml_fp16_to_fp32(matrix->svh[j]));
+        for (size_t j = 0; j < width; ++j) {
+            dst[r * n + c0 + j] = (float) (yh[r * width + j] * (double) ggml_fp16_to_fp32(matrix->svh[c0 + j]));
         }
     }
     free(xh);
     free(yh);
     return true;
+}
+
+bool ggml_exl3_mul_mat_ref(const struct ggml_exl3_matrix * matrix, int64_t rows,
+                          const float * x, size_t x_elements, float * dst, size_t dst_elements) {
+    return matrix && matrix->ne1 > 0 &&
+        ggml_exl3_mul_mat_cols(matrix, rows, x, x_elements, dst, dst_elements, 0, (size_t) matrix->ne1);
 }
 
 static bool ggml_exl3_bank_valid(const struct ggml_tensor * packed, const struct ggml_tensor * suh,
@@ -224,15 +236,16 @@ static bool ggml_exl3_inputs_valid(const struct ggml_tensor * packed, const stru
         !ggml_is_contiguous(x) || x->ne[0] != suh->ne[0] || x->ne[3] != 1) {
         return false;
     }
+    // Empty batches are valid, as for other matrix operations: a layer may have no output rows.
     size_t rows, elements, bytes, input_rows;
-    if (x->ne[1] <= 0 || x->ne[2] <= 0 ||
+    if (x->ne[1] < 0 || x->ne[2] < 0 ||
         !ggml_exl3_mul_size(x->ne[1], x->ne[2], &input_rows) ||
         !ggml_exl3_mul_size(input_rows, x->ne[0], &elements) ||
         !ggml_exl3_mul_size(elements, sizeof(float), &bytes) || bytes > INT64_MAX) {
         return false;
     }
     if (ids) {
-        if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->ne[0] <= 0 || ids->ne[1] < 0 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
             ids->ne[1] != x->ne[2] || x->ne[1] <= 0 || ids->ne[0] % x->ne[1] ||
             !ggml_exl3_mul_size(ids->ne[0], ids->ne[1], &rows)) {
             return false;
@@ -243,7 +256,7 @@ static bool ggml_exl3_inputs_valid(const struct ggml_tensor * packed, const stru
         }
         rows = x->ne[1];
     }
-    return rows > 0 && ggml_exl3_mul_size(rows, svh->ne[0], &elements) &&
+    return ggml_exl3_mul_size(rows, svh->ne[0], &elements) &&
         ggml_exl3_mul_size(elements, sizeof(float), &bytes) && bytes <= INT64_MAX;
 }
 
@@ -272,8 +285,14 @@ bool ggml_exl3_op_supported(const struct ggml_tensor * op) {
         op->ne[2] == (op->src[4] ? op->src[4]->ne[1] : 1) && op->ne[3] == 1;
 }
 
-bool ggml_exl3_compute_forward(struct ggml_tensor * op) {
-    if (!ggml_exl3_op_supported(op) || !op->data) {
+bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth) {
+    if (!ggml_exl3_op_supported(op) || ith < 0 || nth <= 0 || ith >= nth) {
+        return false;
+    }
+    if (ggml_is_empty(op)) {
+        return true;
+    }
+    if (!op->data) {
         return false;
     }
     for (int i = 0; i < 5; ++i) {
@@ -284,8 +303,12 @@ bool ggml_exl3_compute_forward(struct ggml_tensor * op) {
     const struct ggml_tensor * p = op->src[0], * x = op->src[1], * su = op->src[2], * sv = op->src[3], * ids = op->src[4];
     struct ggml_exl3_matrix matrix = {su->ne[0], sv->ne[0], ggml_get_op_params_i32(op, 0),
         p->data, p->nb[2], su->data, su->ne[0], sv->data, sv->ne[0]};
+    // Threads take contiguous ranges of 128-column blocks (dense) or of (expert, block) items (routed).
+    const size_t blocks = (size_t) matrix.ne1 / 128;
     if (!ids) {
-        return ggml_exl3_mul_mat_ref(&matrix, x->ne[1], x->data, ggml_nelements(x), op->data, ggml_nelements(op));
+        const size_t b0 = blocks * ith / nth, b1 = blocks * (ith + 1) / nth;
+        return b0 == b1 || ggml_exl3_mul_mat_cols(&matrix, x->ne[1], x->data, ggml_nelements(x), op->data,
+            ggml_nelements(op), b0 * 128, b1 * 128);
     }
     const int32_t * selected = ids->data;
     const size_t slots = ids->ne[0], total = (size_t) ids->ne[0] * ids->ne[1];
@@ -294,16 +317,30 @@ bool ggml_exl3_compute_forward(struct ggml_tensor * op) {
             return false;
         }
     }
-    for (int64_t expert = 0; expert < p->ne[2]; ++expert) {
-        size_t count = 0, nx, ny, bx, by;
-        for (size_t i = 0; i < total; ++i) { count += selected[i] == expert; }
+    size_t * counts = calloc((size_t) p->ne[2], sizeof(size_t));
+    if (!counts) { return false; }
+    size_t active = 0;
+    for (size_t i = 0; i < total; ++i) { active += counts[selected[i]]++ == 0; }
+    const size_t items = active * blocks, t0 = items * ith / nth, t1 = items * (ith + 1) / nth;
+    if (t0 == t1) { free(counts); return true; }
+    bool ok = true;
+    size_t item = 0;
+    for (int64_t expert = 0; ok && expert < p->ne[2] && item < t1; ++expert) {
+        const size_t count = counts[expert];
         if (!count) { continue; }
+        const size_t first = item;
+        item += blocks;
+        if (item <= t0) { continue; }
+        const size_t b0 = (t0 > first ? t0 - first : 0), b1 = (t1 < item ? t1 - first : blocks);
+        if (b0 == b1) { continue; }
+        size_t nx, ny, bx, by;
         if (!ggml_exl3_mul_size(count, matrix.ne0, &nx) || !ggml_exl3_mul_size(count, matrix.ne1, &ny) ||
             !ggml_exl3_mul_size(nx, sizeof(float), &bx) || !ggml_exl3_mul_size(ny, sizeof(float), &by)) {
-            return false;
+            ok = false;
+            break;
         }
         float * gathered = malloc(bx), * result = malloc(by);
-        if (!gathered || !result) { free(gathered); free(result); return false; }
+        if (!gathered || !result) { free(gathered); free(result); ok = false; break; }
         size_t row = 0;
         for (size_t i = 0; i < total; ++i) {
             if (selected[i] != expert) { continue; }
@@ -313,20 +350,25 @@ bool ggml_exl3_compute_forward(struct ggml_tensor * op) {
         matrix.packed = (const uint8_t *) p->data + expert * p->nb[2];
         matrix.suh = (const ggml_fp16_t *) su->data + expert * matrix.ne0;
         matrix.svh = (const ggml_fp16_t *) sv->data + expert * matrix.ne1;
-        const bool ok = ggml_exl3_mul_mat_ref(&matrix, count, gathered, nx, result, ny);
+        ok = ggml_exl3_mul_mat_cols(&matrix, count, gathered, nx, result, ny, b0 * 128, b1 * 128);
         if (ok) {
             row = 0;
             for (size_t i = 0; i < total; ++i) {
                 if (selected[i] == expert) {
-                    memcpy((float *) op->data + i * matrix.ne1, result + row++ * matrix.ne1, matrix.ne1 * sizeof(float));
+                    memcpy((float *) op->data + i * matrix.ne1 + b0 * 128, result + row++ * matrix.ne1 + b0 * 128,
+                           (b1 - b0) * 128 * sizeof(float));
                 }
             }
         }
         free(gathered);
         free(result);
-        if (!ok) { return false; }
     }
-    return true;
+    free(counts);
+    return ok;
+}
+
+bool ggml_exl3_compute_forward(struct ggml_tensor * op) {
+    return ggml_exl3_compute_forward_part(op, 0, 1);
 }
 
 static int64_t ggml_exl3_key(const struct gguf_context * ctx, const char * key, enum gguf_type type) {
