@@ -5,6 +5,9 @@ Tensors are matched by name and occurrence. By default the script lists the firs
 first file, whose relative RMS difference exceeds --threshold, then a per-layer table of the residual tensor
 (--residual) and of top-k expert-set changes (--routing, --topk), with the k-th/(k+1)-th router probability gap
 (--probs) of the first file. A routing change explains a large difference from that layer on.
+
+With --write-routing FILE, the top-k experts of the first file's --routing tensors are written as a
+llama-graph-dump --dump-routing file and nothing is compared.
 """
 
 import argparse
@@ -65,13 +68,31 @@ def by_layer(records, name):
     return out
 
 
+def write_routing(records, name, k, n_tokens, path):
+    layers = by_layer(records, name)
+    if not layers or sorted(layers) != list(range(len(layers))):
+        sys.exit(f'{name}: expected layers 0..n-1, found {sorted(layers)}')
+    with open(path, 'w') as f:
+        f.write(f'{len(layers)} {n_tokens} {k}\n')
+        for il in range(len(layers)):
+            n_expert, n_tok = layers[il]['ne'][:2]
+            if n_tok != n_tokens:
+                sys.exit(f'{name}-{il}: {n_tok} tokens, expected {n_tokens}')
+            ids = layers[il]['data'].reshape(n_tok, n_expert)[:, :k]
+            f.write('\n'.join(' '.join(map(str, row)) for row in ids) + '\n')
+    print(f'wrote the top-{k} routing of {len(layers)} layers and {n_tokens} tokens to {path}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('a')
-    parser.add_argument('b')
+    parser.add_argument('b', nargs='?')
+    parser.add_argument('--write-routing', metavar='FILE', help='write the top-k routing of the first file and exit')
     parser.add_argument('--threshold', type=float, default=1e-4, help='relative RMS listed as a difference')
     parser.add_argument('--limit', type=int, default=20, help='differences to list (0: none)')
     parser.add_argument('--include', help='only list tensors whose name matches this regex')
+    parser.add_argument('--unnamed', action='store_true',
+                        help='also match auto-named node_<n> tensors, whose numbers shift when the graph changes')
     parser.add_argument('--residual', default='l_last', help='per-layer residual tensor name')
     parser.add_argument('--routing', default='ffn_moe_argsort', help='per-layer expert order tensor name (I32, [n_expert, n_tokens])')
     parser.add_argument('--probs', default='ffn_moe_probs', help='per-layer router probabilities in the first file')
@@ -79,12 +100,21 @@ def main():
     args = parser.parse_args()
 
     tokens_a, a = load(args.a)
+    if args.write_routing:
+        write_routing(a, args.routing, args.topk, len(tokens_a), args.write_routing)
+        return
+    if args.b is None:
+        parser.error('two dumps are needed for a comparison')
     tokens_b, b = load(args.b)
     if not np.array_equal(tokens_a, tokens_b):
         print('warning: the dumps decode different tokens')
+    unnamed = re.compile(r'node_\d+')
     index_b = {r['key']: r for r in b}
-    matched = [(r, index_b[r['key']]) for r in a if r['key'] in index_b and index_b[r['key']]['data'].shape == r['data'].shape]
-    print(f'{len(a)} and {len(b)} tensors, {len(matched)} matched by name and occurrence')
+    candidates = [r for r in a if args.unnamed or not unnamed.fullmatch(r['name'])]
+    matched = [(r, index_b[r['key']]) for r in candidates if r['key'] in index_b and index_b[r['key']]['data'].shape == r['data'].shape]
+    skipped = len(a) - len(candidates)
+    print(f'{len(a)} and {len(b)} tensors, {len(matched)} matched by name and occurrence' +
+          (f' ({skipped} auto-named tensors skipped, see --unnamed)' if skipped else ''))
 
     include = re.compile(args.include) if args.include else None
     listed = differing = identical = 0
@@ -113,13 +143,14 @@ def main():
     for il in sorted(set(res_a) & set(res_b)):
         line = f'layer {il:3d} {args.residual} rel_rms {rel_rms(res_a[il]["data"], res_b[il]["data"]):.2e}'
         if il in route_a and il in route_b:
-            n_expert, n_tok = route_a[il]['ne'][:2]
-            ia = route_a[il]['data'].reshape(n_tok, n_expert)
-            ib = route_b[il]['data'].reshape(n_tok, n_expert)
+            # either file may hold the full expert order or only its top k
+            n_tok = route_a[il]['ne'][1]
+            ia = route_a[il]['data'].reshape(n_tok, route_a[il]['ne'][0])
+            ib = route_b[il]['data'].reshape(route_b[il]['ne'][1], route_b[il]['ne'][0])
             changed = sum(set(ia[t, :k]) != set(ib[t, :k]) for t in range(n_tok))
             line += f'  top-{k} set differs {changed}/{n_tok}'
-            if il in probs_a and probs_a[il]['data'].size == n_expert * n_tok:
-                p = -np.sort(-probs_a[il]['data'].reshape(n_tok, n_expert), axis=1)
+            if il in probs_a and probs_a[il]['data'].size % n_tok == 0:
+                p = -np.sort(-probs_a[il]['data'].reshape(n_tok, -1), axis=1)
                 line += f'  min gap {np.min(p[:, k - 1] - p[:, k]):.1e}'
         print(line)
 

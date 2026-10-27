@@ -2,10 +2,12 @@
 // placements or implementations.
 //
 // usage: llama-graph-dump [common options: -m, -p/-f, -ngl, -dev, -t, -c, --moe-cache-mib, ...]
-//            --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-filter REGEX] [--dump-passes N]
+//            --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-filter REGEX] [--dump-passes N] [--dump-routing FILE]
 //
-// The ubatch is the first N tokens of the prompt (default: all), or the whitespace-separated token ids in
-// --dump-tokens, used verbatim. Pass p > 1 clears the memory, decodes the same tokens again and writes FILE.pass<p>.
+// The ubatch (positions from 0, all tokens output) is the first N tokens of the prompt (default: all), or the token ids in
+// --dump-tokens (whitespace separated), used verbatim. Pass p > 1 clears the memory, decodes the same tokens again and writes FILE.pass<p>.
+// --dump-routing replays an expert selection (llama_set_routing_override): whitespace-separated n_layer n_tokens
+// n_used, then n_layer*n_tokens*n_used expert ids ordered by layer, token and slot.
 //
 // File format (little endian), version 1:
 //   char[8] "LGDUMP\0\1", uint32 version, uint32 pass, uint32 n_tokens, int32 tokens[n_tokens]
@@ -17,6 +19,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -66,11 +69,13 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 }
 
 // remove the --dump-* options, which the common parser does not know
-static bool take_dump_args(int & argc, char ** argv, std::string & out, std::string & tokens, int & n, std::string & filter, int & passes) {
+static bool take_dump_args(int & argc, char ** argv, std::string & out, std::string & tokens, int & n, std::string & filter, int & passes,
+        std::string & routing) {
     int kept = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        std::string * dst = arg == "--dump-out" ? &out : arg == "--dump-tokens" ? &tokens : arg == "--dump-filter" ? &filter : nullptr;
+        std::string * dst = arg == "--dump-out" ? &out : arg == "--dump-tokens" ? &tokens : arg == "--dump-filter" ? &filter :
+            arg == "--dump-routing" ? &routing : nullptr;
         if (dst || arg == "--dump-n" || arg == "--dump-passes") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s requires a value\n", arg.c_str());
@@ -93,10 +98,10 @@ static bool take_dump_args(int & argc, char ** argv, std::string & out, std::str
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    std::string out_path, tokens_path, filter;
+    std::string out_path, tokens_path, filter, routing_path;
     int n_dump = 0, passes = 1;
-    if (!take_dump_args(argc, argv, out_path, tokens_path, n_dump, filter, passes)) {
-        fprintf(stderr, "usage: %s [common options] --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-filter REGEX] [--dump-passes N]\n", argv[0]);
+    if (!take_dump_args(argc, argv, out_path, tokens_path, n_dump, filter, passes, routing_path)) {
+        fprintf(stderr, "usage: %s [common options] --dump-out FILE [--dump-tokens FILE] [--dump-n N] [--dump-filter REGEX] [--dump-passes N] [--dump-routing FILE]\n", argv[0]);
         return 1;
     }
 
@@ -149,6 +154,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (!routing_path.empty()) {
+        std::ifstream f(routing_path);
+        uint32_t n_layer = 0, n_tokens = 0, n_used = 0;
+        f >> n_layer >> n_tokens >> n_used;
+        std::vector<int32_t> ids;
+        for (long long id; f >> id;) {
+            ids.push_back((int32_t) id);
+        }
+        if (n_tokens != tokens.size() || ids.size() != (size_t) n_layer * n_tokens * n_used ||
+                !llama_set_routing_override(ctx, ids.data(), n_layer, n_tokens, n_used)) {
+            LOG_ERR("%s: %s does not hold a routing for %zu tokens\n", __func__, routing_path.c_str(), tokens.size());
+            return 1;
+        }
+        LOG_INF("%s: replaying the routing of %u layers from %s\n", __func__, n_layer, routing_path.c_str());
+    }
+
     int rc = 0;
     for (int pass = 1; pass <= passes && rc == 0; ++pass) {
         const std::string path = pass == 1 ? out_path : out_path + ".pass" + std::to_string(pass);
@@ -167,7 +188,12 @@ int main(int argc, char ** argv) {
         fwrite(&n, 4, 1, st.out);
         fwrite(tokens.data(), sizeof(llama_token), n, st.out);
         st.records = 0;
-        rc = llama_decode(ctx, llama_batch_get_one(tokens.data(), n));
+        // every token is an output, so all layers see the whole ubatch and every row's logits are dumped
+        common_batch batch(ctx);
+        for (uint32_t i = 0; i < n; ++i) {
+            batch.add(tokens[i], i, 0, true);
+        }
+        rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         const bool ok = fclose(st.out) == 0;
         st.out = nullptr;
         LOG_INF("%s: pass %d: decode %d, %u tokens, %zu tensors -> %s\n", __func__, pass, rc, n, st.records, path.c_str());
