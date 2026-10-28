@@ -606,6 +606,7 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    size_t moe_pin_size   = 0; // with the MoE cache: host experts in bytes to pin for the GPU, SIZE_MAX = all
 
     bool   kv_stream        = false; // KV streaming [EXPERIMENTAL]: keep the context in host memory, kv_resident_size of it on the GPU
     size_t kv_resident_size = 0;     // device bytes for resident K/V pages

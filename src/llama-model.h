@@ -902,7 +902,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
-    void register_host_weights(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors, size_t budget) const;
+    // registers (pins) host weights with the device of backend, whole tensors up to budget bytes in all; returns the bytes
+    // registered so far by the model
+    size_t register_host_weights(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors, size_t budget) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

@@ -59,6 +59,7 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    size_t moe_pin_size;     // host experts to pin, SIZE_MAX = all
     size_t kv_resident_size; // KV streaming, 0 = disabled
     size_t kv_resident_size_decode; // KV streaming: the pool between prefills, with decode-sized compute buffers; 0 = disabled
     uint32_t n_tokens_decode;       // the largest batch that runs with the decode-sized compute buffers

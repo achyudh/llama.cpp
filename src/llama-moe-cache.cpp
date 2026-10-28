@@ -313,7 +313,7 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -577,28 +577,30 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        register_host_experts(model);
+        pin_host_experts(model, pin);
     }
 
-    void register_host_experts(const llama_model & model) {
-        const char * value = std::getenv("LLAMA_MOE_HOST_REGISTER_MIB");
-        if (!value) {
+    // pinned (registered) host experts: their uploads are DMA from host memory, and their pages cannot be evicted
+    void pin_host_experts(const llama_model & model, size_t pin) {
+        if (pin == 0) {
             return;
         }
-        errno = 0;
-        char * end = nullptr;
-        const unsigned long long mib = std::strtoull(value, &end, 10);
-        if (errno || end == value || *end || value[0] == '-' || mib > SIZE_MAX/(1024*1024)) {
-            throw std::runtime_error("invalid LLAMA_MOE_HOST_REGISTER_MIB");
-        }
-        if (mib && devices.size() != 1) {
-            throw std::runtime_error("host registration experiment requires one GPU backend");
+        if (devices.size() != 1) {
+            throw std::runtime_error("pinning the host experts requires one GPU backend");
         }
         std::vector<ggml_tensor *> tensors;
+        size_t total = 0;
         for (const layer & l : layers) {
-            tensors.insert(tensors.end(), l.experts.begin(), l.experts.end());
+            for (ggml_tensor * t : l.experts) {
+                tensors.push_back(t);
+                total += ggml_nbytes(t);
+            }
         }
-        model.register_host_weights(devices[0].backend, tensors, size_t(mib)*1024*1024);
+        const size_t pinned = model.register_host_weights(devices[0].backend, tensors, pin);
+        LLAMA_LOG_INFO("%s: pinned %.2f of %.2f MiB of host experts\n", __func__, pinned/1024.0/1024.0, total/1024.0/1024.0);
+        if (pin == SIZE_MAX && pinned < total) {
+            LLAMA_LOG_WARN("%s: %.2f MiB of host experts could not be pinned\n", __func__, (total - pinned)/1024.0/1024.0);
+        }
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -804,8 +806,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin) :
+    pimpl(new impl(model, backends, bufts, size, pin)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

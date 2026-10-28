@@ -106,6 +106,10 @@ static std::vector<float> run(llama_model * model, int rows, bool mtp, size_t ca
     p.ctx_type = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
     p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     p.moe_cache_size = cache;
+    // the host experts to pin, as --moe-pin takes it (all or MiB)
+    if (const char * pin = getenv("LLAMA_ARG_MOE_PIN")) {
+        p.moe_pin_size = std::string(pin) == "all" ? SIZE_MAX : size_t(std::stoull(pin)) * 1024 * 1024;
+    }
     auto * ctx = llama_init_from_model(model, p);
     if (!ctx) { throw std::runtime_error("context init failed"); }
     static int task = 0;

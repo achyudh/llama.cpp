@@ -1364,10 +1364,10 @@ llama_model::~llama_model() {
     }
 }
 
-void llama_model::register_host_weights(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors, size_t budget) const {
+size_t llama_model::register_host_weights(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors, size_t budget) const {
     std::lock_guard<std::mutex> lock(pimpl->host_registration_mutex);
     const int64_t begin = ggml_time_us();
-    size_t attempted = 0, failed = 0, skipped = 0;
+    size_t failed = 0, skipped = 0;
     if (budget) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         auto acquire = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
@@ -1384,7 +1384,6 @@ void llama_model::register_host_weights(ggml_backend_t backend, const std::vecto
                 skipped++;
                 continue;
             }
-            attempted++;
             if (!acquire(w->data, size)) {
                 failed++;
                 continue;
@@ -1395,8 +1394,9 @@ void llama_model::register_host_weights(ggml_backend_t backend, const std::vecto
             pimpl->host_registration_backend = reg;
         }
     }
-    LLAMA_LOG_INFO("moe_host_registration: schema=1 budget=%zu registered_bytes=%zu attempted=%zu completed=%zu failed=%zu skipped=%zu us=%" PRId64 "\n",
-        budget, pimpl->host_registration_bytes, attempted, pimpl->host_registrations.size(), failed, skipped, ggml_time_us() - begin);
+    LLAMA_LOG_INFO("%s: %.2f MiB in %zu tensors (%zu failed, %zu over the budget) in %.1f ms\n", __func__,
+        pimpl->host_registration_bytes/1024.0/1024.0, pimpl->host_registrations.size(), failed, skipped, (ggml_time_us() - begin)/1000.0);
+    return pimpl->host_registration_bytes;
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {

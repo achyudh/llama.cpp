@@ -373,6 +373,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_pin_size   = params.moe_pin_size;
     cparams.kv_resident_size = params.kv_resident_size;
     cparams.kv_resident_size_decode = params.kv_resident_size_decode;
     cparams.n_tokens_decode         = std::min(params.n_tokens_decode > 0 ? params.n_tokens_decode : 4u, cparams.n_ubatch);
@@ -571,7 +572,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_pin_size);
         }
 
         // experimental: stream the host experts of large batches a layer at a time to the first GPU
@@ -4336,6 +4337,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_pin_size                =*/ 0,
         /*.kv_resident_size            =*/ 0,
         /*.kv_resident_size_decode     =*/ 0,
         /*.n_tokens_decode             =*/ 0,

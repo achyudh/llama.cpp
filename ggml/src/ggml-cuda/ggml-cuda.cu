@@ -169,11 +169,6 @@ static bool ggml_cuda_pinned_memory_disabled() {
     return disabled;
 }
 
-static bool ggml_cuda_register_host_enabled() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_REGISTER_HOST");
-    return enabled;
-}
-
 static bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     return disabled;
@@ -5746,11 +5741,8 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     *total /= share_count;
 }
 
+// the caller asks for the registration (llama: pinned host experts)
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (!ggml_cuda_register_host_enabled()) {
-        return false;
-    }
-
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
     if (err != cudaSuccess) {
@@ -5770,10 +5762,6 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 }
 
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (!ggml_cuda_register_host_enabled()) {
-        return;
-    }
-
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {
         // clear the error

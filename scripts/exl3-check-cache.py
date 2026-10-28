@@ -60,7 +60,7 @@ def execute(mode, folder, registered):
         env.pop(key, None)
     env.update(ROCR_VISIBLE_DEVICES='GPU-06370343B04276BF', LLAMA_MOE_PERF='1', GGML_CUDA_GRAPH_DEBUG='1',
                GGML_OP_OFFLOAD_MIN_BATCH='1', GPU_PINNED_MIN_XFER_SIZE='0',
-               GGML_CUDA_REGISTER_HOST='1' if registered else '0', LLAMA_MOE_HOST_REGISTER_MIB='4096' if registered else '0')
+               LLAMA_ARG_MOE_PIN='4096' if registered else '0')
     executable = args.build/'bin/test-exl3-model'
     if mode == 'synthetic':
         command = [executable, '--rocm', args.fixture/'compressed.gguf', args.fixture/'reconstructed.gguf', folder]
@@ -72,7 +72,7 @@ def execute(mode, folder, registered):
     (folder/'run.log').write_text(log)
     item = dict(mode=mode, registered=registered, command=[str(a) for a in command],
                 environment={k: env[k] for k in ['ROCR_VISIBLE_DEVICES', 'LLAMA_MOE_PERF', 'GGML_CUDA_GRAPH_DEBUG',
-                  'GGML_OP_OFFLOAD_MIN_BATCH', 'GPU_PINNED_MIN_XFER_SIZE', 'GGML_CUDA_REGISTER_HOST', 'LLAMA_MOE_HOST_REGISTER_MIB']},
+                  'GGML_OP_OFFLOAD_MIN_BATCH', 'GPU_PINNED_MIN_XFER_SIZE', 'LLAMA_ARG_MOE_PIN']},
                 returncode=run.returncode, elapsed_seconds=time.monotonic()-started)
     state['runs'].append(item)
     save()
@@ -105,14 +105,16 @@ def execute(mode, folder, registered):
         assert sum(c['evictions'] for c in cases) > 0
         assert any(c['layer'] == 0 and c['misses'] == 0 and c['hits'] > 0 for c in cases)
         assert any(c['misses'] and c['hits'] for c in cases)
-        registrations = [fields(line) for line in log.splitlines() if line.startswith('moe_host_registration:')]
-        assert len(registrations) == 1
-        reg = registrations[0]
+        registrations = [dict(zip(('mib', 'tensors', 'failed', 'skipped'), (float(m[0]), *map(int, m[1:])))) for m in
+                         re.findall(r'register_host_weights: ([\d.]+) MiB in (\d+) tensors \((\d+) failed, (\d+) over the budget\)', log)]
         if registered:
-            assert reg['completed'] == reg['attempted'] == 27 and reg['failed'] == reg['skipped'] == 0
-            assert reg['registered_bytes'] == sum(b['bytes'] for b in manifest)
+            assert len(registrations) == 1
+            reg = registrations[0]
+            assert reg['tensors'] == 27 and reg['failed'] == reg['skipped'] == 0
+            assert abs(reg['mib'] - sum(b['bytes'] for b in manifest) / 2**20) < 0.01
         else:
-            assert reg['registered_bytes'] == reg['completed'] == 0
+            assert not registrations
+            reg = None
         item.update(cases=cases, telemetry=actual, d2d=copies, registration=reg)
     item['output_sha256'] = {p.name: sha(p) for p in sorted(folder.glob('*.bin'))}
     assert len(item['output_sha256']) == (44 if mode == 'synthetic' else 432), 'Missing full numerical output files'

@@ -2803,6 +2803,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-pin"}, "all|N",
+        "with --moe-cache-mib: pin the MoE experts kept in the CPU, all of them or N MiB, so that their uploads are DMA "
+        "transfers and their pages stay in memory; pinned memory is not available to the rest of the system (default: 0, none)",
+        [](common_params & params, const std::string & value) {
+            if (value == "all") {
+                params.moe_pin_size = SIZE_MAX;
+                return;
+            }
+            const int mib = std::stoi(value);
+            if (mib < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_pin_size = (size_t) mib*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_PIN"));
+    add_opt(common_arg(
         {"--kv-stream"},
         "[EXPERIMENTAL] keep the KV cache in host memory and only --kv-resident-mib of it on the GPU (requires -fa on, "
         "a q8_0 K cache and a q4_0 V cache)",
