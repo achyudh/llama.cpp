@@ -140,6 +140,7 @@ struct llama_model_loader {
     size_t size_data = 0;
     size_t size_released = 0; // weights copied out of the mappings whose pages were released
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+    std::unordered_map<const llama_tensor_weight *, size_t> mapping_consumers;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {

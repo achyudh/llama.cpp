@@ -1462,9 +1462,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
     }
 
-    // compute the total size of all tensors for progress reporting
-    for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+    // Count each consumer, including weights duplicated across contexts, for progress and final cleanup.
+    for (const auto & it : ctx_map) {
+        for (auto * t = ggml_get_first_tensor(it.second.get()); t; t = ggml_get_next_tensor(it.second.get(), t)) {
+            if (const auto * weight = get_weight(ggml_get_name(t))) {
+                ++mapping_consumers[weight];
+                size_data += ggml_nbytes(t);
+            }
+        }
     }
 }
 
@@ -1766,8 +1771,11 @@ bool llama_model_loader::load_all_data(
                 // host experts in 64 GB of RAM, the cached pages of these weights would push experts and lazily read
                 // rows out of the page cache
                 if (use_mmap && !check_tensors && !lmlocks && !lazy.has(cur)) {
-                    release_weight_pages(*weight);
-                    size_released += n_size;
+                    // Mapped aliases keep their reference; copied aliases release only after the last copy.
+                    if (--mapping_consumers.at(weight) == 0) {
+                        release_weight_pages(*weight);
+                        size_released += n_size;
+                    }
                 }
             }
         } else {
