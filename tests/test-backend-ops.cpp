@@ -10910,6 +10910,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 320, n, 640, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 200, n, 320, {1, 1}, {1, 1}));
     }
+    // narrow outputs of long K: the Flash-Next hyper-connection and gate projections
+    for (int64_t n : {129, 300}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,   4, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  48, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,   1, n,  2560, {1, 1}, {1, 1}));
+    }
 
     // Decode shapes of the RDNA4 Q8_0/Q4_0 paged decode kernel (4 KV heads x GQA 6, head 256, 1-8 query tokens).
     for (int kv : { 256, 1000, 8192, 32768, }) {

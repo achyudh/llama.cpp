@@ -195,7 +195,7 @@ static __device__ __forceinline__ void gemm_f16_wmma_tile(char * smem, const TX 
     gemm_wmma_float8 raf[A_PIECES]; // FP32 X, converted when stored
     const int kstart = (vb % 32) * 128 % k;
 
-// staggered K: tile vb runs k from (vb % 32) * 128 and wraps, so blocks sharing operands do not read the same
+// staggered K: tile vb runs k from (vb % 32) * 128 and wraps, so blocks with different vb do not read the same
 // addresses (and memory channels) in lockstep; only the accumulation order changes
 #define GW_KP(K0) ((K0) + kstart < k ? (K0) + kstart : (K0) + kstart - k)
 #define GW_LOAD(K0)                                                                                      \
@@ -272,7 +272,9 @@ static __global__ void gemm_f16_wmma(const TX * __restrict__ x, const half * __r
     const int n_rb = (m + BM - 1) / BM, n_cb = gridDim.x / n_rb;
     const int group = blockIdx.x / (GROUP_M * n_cb), first = group * GROUP_M, size = min(n_rb - first, GROUP_M);
     const int row_block = first + (blockIdx.x % (GROUP_M * n_cb)) % size, col_block = (blockIdx.x % (GROUP_M * n_cb)) / size;
-    gemm_f16_wmma_tile<BM, rotate, TX>(smem, x, w, svh, dst, m, n, k, n0, row_block * BM, col_block * BN, n_cb, blockIdx.x);
+    // staggered by row block: the column blocks of a row block read its X rows in step and share them in the caches,
+    // which matters for narrow outputs of long K (hyper-connection 10240 -> 320 of 4096 rows: 656 -> 458 us)
+    gemm_f16_wmma_tile<BM, rotate, TX>(smem, x, w, svh, dst, m, n, k, n0, row_block * BM, col_block * BN, n_cb, row_block);
 #else
     GGML_UNUSED_VARS(x, w, svh, dst, m, n, k, n0);
     NO_DEVICE_CODE;
