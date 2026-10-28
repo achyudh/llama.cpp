@@ -774,6 +774,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(mmvq_q8_1.buf));
     }
+    if (exl3_host != nullptr) {
+        CUDA_CHECK(cudaFreeHost(exl3_host));
+    }
     if (mm_siblings.fork_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(mm_siblings.fork_event));
         CUDA_CHECK(cudaEventDestroy(mm_siblings.join_event));

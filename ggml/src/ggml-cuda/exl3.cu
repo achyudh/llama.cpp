@@ -2,6 +2,8 @@
 #include "gemm-wmma.cuh"
 #include "ggml-exl3.h"
 
+#include <cstring>
+
 bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
 #ifdef GGML_USE_HIP
     if (cc < GGML_CUDA_CC_RDNA4 || cc >= GGML_CUDA_CC_OFFSET_AMD + 0x1300 || !ggml_exl3_op_supported(op)) {
@@ -321,15 +323,21 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         if (ids[i] >= 0 && ids[i] < experts) { host[fill[ids[i]]++] = i; }
     }
     std::copy(experts_used.begin(), experts_used.end(), host.begin() + used_offset);
-    std::vector<int> chunk_tiles = {0};
+    // a chunk's rows are contiguous in sorted order; its tiles count rows from the chunk's first row
+    std::vector<int> chunk_tiles = {0}, chunk_rows = {0};
+    int max_chunk_rows = 0;
     for (size_t s0 = 0; s0 < experts_used.size(); s0 += chunk_experts) {
-        for (size_t s = s0; s < std::min(experts_used.size(), s0 + chunk_experts); ++s) {
+        const size_t s1 = std::min(experts_used.size(), s0 + chunk_experts);
+        const int row0 = start[experts_used[s0]];
+        for (size_t s = s0; s < s1; ++s) {
             const int e = experts_used[s];
             for (int r0 = start[e]; r0 < start[e + 1]; r0 += BM) {
-                host.insert(host.end(), {r0, std::min(BM, start[e + 1] - r0), int(s - s0), e});
+                host.insert(host.end(), {r0 - row0, std::min(BM, start[e + 1] - r0), int(s - s0), e});
             }
         }
         chunk_tiles.push_back((host.size() - tiles_offset) / 4);
+        chunk_rows.push_back(start[experts_used[s1 - 1] + 1]);
+        max_chunk_rows = std::max(max_chunk_rows, chunk_rows.back() - row0);
     }
     for (int i = 0; i < assignments; ++i) {
         if (ids[i] < 0 || ids[i] >= experts) {
@@ -340,24 +348,34 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         return;
     }
     ggml_cuda_pool_alloc<int32_t> dev(ctx.pool(), host.size());
-    CUDA_CHECK(cudaMemcpyAsync(dev.get(), host.data(), host.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    // the host copy is released on return
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // the previous op's upload from the pinned buffer is done: this op synchronized on its routing after it
+    const size_t bytes = host.size() * sizeof(int32_t);
+    if (ctx.exl3_host_size < bytes) {
+        if (ctx.exl3_host) {
+            CUDA_CHECK(cudaFreeHost(ctx.exl3_host));
+        }
+        ctx.exl3_host_size = std::max(bytes, size_t(4) << 20);
+        CUDA_CHECK(cudaMallocHost(&ctx.exl3_host, ctx.exl3_host_size));
+    }
+    std::memcpy(ctx.exl3_host, host.data(), bytes);
+    CUDA_CHECK(cudaMemcpyAsync(dev.get(), ctx.exl3_host, bytes, cudaMemcpyHostToDevice, stream));
 
-    ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(valid) * k);
+    // the rows are rotated per chunk, so the FP16 copy holds one chunk's rows instead of all of them
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(max_chunk_rows) * k);
     ggml_cuda_pool_alloc<half> w(ctx.pool(), size_t(std::min<size_t>(chunk_experts, experts_used.size())) * n * k);
-    const ggml_cuda_exl3_args args = {
-        (const uint32_t *) dst->src[0]->data, (const half *) dst->src[2]->data, (const half *) dst->src[3]->data,
-        (const float *) dst->src[1]->data, (const int32_t *) dst->src[4]->data, (float *) dst->data, xh.get(), nullptr,
-        k, n, experts, valid, used, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0), dev.get()};
-    ggml_cuda_exl3_launch(args, GGML_EXL3_F16_DOT, GGML_EXL3_INPUT, stream);
     const int4 * tiles = (const int4 *) (dev.get() + tiles_offset);
     for (size_t c = 0; c + 1 < chunk_tiles.size(); ++c) {
         const int s0 = c * chunk_experts, n_experts = std::min<int>(chunk_experts, experts_used.size() - s0);
+        const ggml_cuda_exl3_args args = {
+            (const uint32_t *) dst->src[0]->data, (const half *) dst->src[2]->data, (const half *) dst->src[3]->data,
+            (const float *) dst->src[1]->data, (const int32_t *) dst->src[4]->data, (float *) dst->data, xh.get(), nullptr,
+            k, n, experts, chunk_rows[c + 1] - chunk_rows[c], used, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0),
+            dev.get() + chunk_rows[c]};
+        ggml_cuda_exl3_launch(args, GGML_EXL3_F16_DOT, GGML_EXL3_INPUT, stream);
         exl3_decode_f16_launch(args, dev.get() + used_offset + s0, n_experts, w.get(), 0, n, stream);
         const int blocks = n / BN * (chunk_tiles[c + 1] - chunk_tiles[c]);
         gemm_f16_wmma<BM, true, true><<<blocks, gemm_wmma::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst, 0, n, k, 0,
-                                                                           tiles + chunk_tiles[c], dev.get());
+                                                                           tiles + chunk_tiles[c], dev.get() + chunk_rows[c]);
     }
     CUDA_CHECK(cudaGetLastError());
 }
