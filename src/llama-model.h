@@ -727,6 +727,7 @@ struct llama_model {
         int bits_x2;
         llm_tensor tensor;
         bool gdn;
+        bool tiled = false; // a GDN bank whose value heads were put in tiled order at load
     };
     std::unordered_map<const ggml_tensor *, exl3_weight> exl3;
 
@@ -985,6 +986,9 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: put the value heads of the device EXL3 GDN banks in tiled order
+    void load_tensors_exl3_gdn();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

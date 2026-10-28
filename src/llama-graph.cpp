@@ -1715,7 +1715,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             t = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
             return ggml_reshape_2d(ctx0, t, hd*nv, rows);
         };
-        if (b.gdn && nk != nv && b.tensor == LLM_TENSOR_SSM_OUT) {
+        if (b.gdn && !b.tiled && nk != nv && b.tensor == LLM_TENSOR_SSM_OUT) {
             x = reorder(x, false);
         }
         if (x->type != GGML_TYPE_F32) {
@@ -1725,9 +1725,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         if (!res) {
             throw std::runtime_error("invalid EXL3 projection graph");
         }
-        if (b.gdn && nk != nv && b.tensor == LLM_TENSOR_ATTN_GATE) {
+        if (b.gdn && !b.tiled && nk != nv && b.tensor == LLM_TENSOR_ATTN_GATE) {
             res = reorder(res, true);
-        } else if (b.gdn && nk != nv && b.tensor == LLM_TENSOR_ATTN_QKV) {
+        } else if (b.gdn && !b.tiled && nk != nv && b.tensor == LLM_TENSOR_ATTN_QKV) {
             const int64_t qk = 2*nk*hd;
             auto * qk_rows = ggml_view_2d(ctx0, res, qk, rows, res->nb[1], 0);
             auto * v_rows = ggml_view_2d(ctx0, res, nv*hd, rows, res->nb[1], qk*sizeof(float));

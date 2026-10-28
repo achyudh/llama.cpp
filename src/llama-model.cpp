@@ -2090,8 +2090,77 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_exl3_gdn();
 
     return true;
+}
+
+// The EXL3 GDN projections of a checkpoint have their value heads in grouped order (the heads of one key head next to
+// each other), while the GDN ops take them tiled (value head j uses key head j % n_k), so the graph reorders the
+// activations around them: the value part of the QKV outputs, the z outputs and the output projection's inputs. A
+// head is 128 columns, a whole Hadamard group of a bank, so moving whole heads (their 16 x 16 tiles and scales) is
+// exact: the device banks get their heads in tiled order once here, and the graph leaves their activations as they
+// are. Host-backed banks (their data can be a read-only mapping) keep the reorder.
+void llama_model_base::load_tensors_exl3_gdn() {
+    const int64_t nk = hparams.ssm_n_group, nv = hparams.ssm_dt_rank, hd = hparams.ssm_d_state;
+    if (nk <= 0 || nv <= nk || nv % nk || hd % 128) {
+        return;
+    }
+    // the grouped head of tiled head j
+    auto grouped = [&](int64_t j) { return j / nk + (j % nk) * (nv / nk); };
+    const int64_t t_start = ggml_time_us();
+    size_t n_banks = 0, bytes = 0;
+    for (auto & [packed, b] : exl3) {
+        if (!b.gdn || (b.tensor != LLM_TENSOR_ATTN_QKV && b.tensor != LLM_TENSOR_ATTN_GATE && b.tensor != LLM_TENSOR_SSM_OUT)) {
+            continue;
+        }
+        bool device = true;
+        for (const ggml_tensor * t : {packed, (const ggml_tensor *) b.suh, (const ggml_tensor *) b.svh}) {
+            device = device && t->buffer && !ggml_backend_buffer_is_host(t->buffer);
+        }
+        if (!device) {
+            continue;
+        }
+        const bool outputs = b.tensor != LLM_TENSOR_SSM_OUT; // permute output columns, else input rows
+        const int64_t k = b.suh->ne[0], n = b.svh->ne[0];
+        // the first permuted column of the outputs: the QKV projection's values follow its queries and keys
+        const int64_t first = b.tensor == LLM_TENSOR_ATTN_QKV ? 2*nk*hd : 0;
+        if (packed->ne[2] != 1 || (outputs ? n != first + nv*hd : k != nv*hd)) {
+            throw std::runtime_error(format("unexpected EXL3 GDN bank shape: %s", packed->name));
+        }
+        const size_t tile = ggml_exl3_tile_size(b.bits_x2), row = size_t(n/16) * tile, head_tiles = hd/16;
+        std::vector<uint8_t> src(ggml_nbytes(packed)), dst;
+        ggml_tensor * scale = outputs ? b.svh : b.suh;
+        std::vector<ggml_fp16_t> s_src(ggml_nelements(scale)), s_dst;
+        ggml_backend_tensor_get(packed, src.data(), 0, src.size());
+        ggml_backend_tensor_get(scale, s_src.data(), 0, ggml_nbytes(scale));
+        dst = src;
+        s_dst = s_src;
+        const int64_t s0 = outputs ? first : 0;
+        for (int64_t j = 0; j < nv; ++j) {
+            const int64_t g = grouped(j);
+            if (outputs) {
+                // in each K tile row, the head's N tiles are contiguous
+                for (int64_t kt = 0; kt < k/16; ++kt) {
+                    memcpy(dst.data() + kt*row + (first/16 + j*head_tiles)*tile, src.data() + kt*row + (first/16 + g*head_tiles)*tile,
+                           head_tiles*tile);
+                }
+            } else {
+                // the head's K tile rows are contiguous
+                memcpy(dst.data() + j*head_tiles*row, src.data() + g*head_tiles*row, head_tiles*row);
+            }
+            memcpy(s_dst.data() + s0 + j*hd, s_src.data() + s0 + g*hd, hd*sizeof(ggml_fp16_t));
+        }
+        ggml_backend_tensor_set(const_cast<ggml_tensor *>(packed), dst.data(), 0, dst.size());
+        ggml_backend_tensor_set(scale, s_dst.data(), 0, ggml_nbytes(scale));
+        b.tiled = true;
+        n_banks++;
+        bytes += src.size();
+    }
+    if (n_banks > 0) {
+        LLAMA_LOG_INFO("%s: value heads of %zu EXL3 GDN banks (%.2f MiB) put in tiled order in %.1f ms\n", __func__, n_banks,
+            bytes / 1024.0 / 1024.0, (ggml_time_us() - t_start) / 1000.0);
+    }
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

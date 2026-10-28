@@ -10,6 +10,7 @@
 #include "llama-vocab.h"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -153,6 +154,11 @@ void llama_model_saver::add_kv_from_model() {
         gguf_set_val_u32(gguf_ctx, "exl3.version", 1);
         gguf_set_val_str(gguf_ctx, "exl3.codebook", "mul1");
         for (const auto & entry : model->exl3) {
+            if (entry.second.tiled) {
+                // the file format has the checkpoint's grouped head order
+                throw std::runtime_error(std::string("cannot save the EXL3 GDN bank ") + entry.first->name +
+                    ", reordered on its device at load: load the model on the CPU to save it");
+            }
             const std::string key = std::string("exl3.") + entry.first->name + ".bits_x2";
             gguf_set_val_u32(gguf_ctx, key.c_str(), entry.second.bits_x2);
         }
