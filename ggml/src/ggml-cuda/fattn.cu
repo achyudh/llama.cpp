@@ -791,7 +791,7 @@ static size_t fattn_stock_alloc_size(int device, const ggml_tensor * dst) {
         return ggml_cuda_fattn_paged_decode_alloc_size(device, dst);
     }
 
-    if (ggml_cuda_fattn_sparse_decode_supported(device, dst)) {
+    if (ggml_cuda_fattn_sparse_supported(device, dst)) {
         return ggml_nbytes(dst);
     }
 
@@ -831,9 +831,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_flash_attn_ext_paged_decode(ctx, dst);
         return;
     }
-    if (ggml_cuda_fattn_sparse_decode_supported(ctx.device, dst)) {
+    if (ggml_cuda_fattn_sparse_supported(ctx.device, dst)) {
         ggml_cuda_fattn_sync_wait(ctx, dst);
-        ggml_cuda_flash_attn_ext_sparse_decode(ctx, dst);
+        ggml_cuda_flash_attn_ext_sparse(ctx, dst);
         ggml_cuda_fattn_sync_release(ctx, dst);
         return;
     }
@@ -864,7 +864,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_writes_lse(int device, const ggml_tensor * dst) {
-    return !ggml_cuda_fattn_sparse_decode_supported(device, dst) &&
+    return !ggml_cuda_fattn_sparse_supported(device, dst) &&
         ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
 }
 

@@ -13210,6 +13210,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2051));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 1024, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2051));
+    // QSA prefill: more than 8 rows over K/V long enough for the sparse kernel (GGML_CUDA_FATTN_SPARSE_MIN_KV)
+    for (int nb : { 9, 67, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 32768,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    // a GQA that is not a multiple of 4 heads per wave takes the decode kernel with one split
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 6, 1}, 32768,  67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {16, 1}, 8192, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1000));
     // Empty rows take both the direct and split-combine paths.
     for (int nb : { 1, 5 }) {
@@ -13855,6 +13863,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // QSA prefill, sparse vs dense crossover (GGML_CUDA_FATTN_SPARSE=0 for dense, GGML_CUDA_FATTN_SPARSE_MIN_KV=0 for sparse)
+    for (int64_t kv : {4096, 8192, 16384, 32768, 65536}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 4096, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    }
 
     // sparse decode at long context
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
