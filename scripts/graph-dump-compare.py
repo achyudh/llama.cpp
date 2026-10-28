@@ -13,6 +13,8 @@ llama-graph-dump --dump-routing file and nothing is compared.
 """
 
 import argparse
+import atexit
+import os
 import re
 import struct
 import sys
@@ -21,6 +23,20 @@ from collections import defaultdict
 import numpy as np
 
 GGML_TYPE_F32, GGML_TYPE_I32 = 0, 26
+
+
+class Record(dict):
+    """A dumped tensor whose data is read each time it is asked for. Dumps are several GB: reading them whole would push
+    the model out of the page cache, so the data is read with pread and its pages dropped."""
+
+    def __missing__(self, key):
+        if key != 'data':
+            raise KeyError(key)
+        fd = self['fd']
+        raw = os.pread(fd, self['n_bytes'], self['offset'])
+        if hasattr(os, 'posix_fadvise'):
+            os.posix_fadvise(fd, self['offset'], self['n_bytes'], os.POSIX_FADV_DONTNEED)
+        return np.frombuffer(raw, dtype='<f4' if self['type'] == GGML_TYPE_F32 else '<i4')
 
 
 def load(path):
@@ -40,9 +56,17 @@ def load(path):
             n_bytes, = struct.unpack('<Q', f.read(8))
             if typ not in (GGML_TYPE_F32, GGML_TYPE_I32):
                 sys.exit(f'{path}: unsupported type {typ} for {name}')
-            data = np.frombuffer(f.read(n_bytes), dtype='<f4' if typ == GGML_TYPE_F32 else '<i4')
-            records.append(dict(key=(name, seen[name]), name=name, type=typ, op=op, ne=ne, data=data))
+            records.append(Record(key=(name, seen[name]), name=name, type=typ, op=op, ne=ne, n_bytes=n_bytes,
+                                  offset=f.tell()))
+            f.seek(n_bytes, os.SEEK_CUR)
             seen[name] += 1
+    fd = os.open(path, os.O_RDONLY)  # kept open for the lazy reads until the script exits
+    if hasattr(os, 'posix_fadvise'):
+        # the headers just read, and at exit the pages that tensor boundaries share
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        atexit.register(os.posix_fadvise, fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    for r in records:
+        r['fd'] = fd
     return tokens, records
 
 
@@ -116,7 +140,7 @@ def main():
     unnamed = re.compile(r'node_\d+')
     index_b = {r['key']: r for r in b}
     candidates = [r for r in a if args.unnamed or not unnamed.fullmatch(r['name'])]
-    matched = [(r, index_b[r['key']]) for r in candidates if r['key'] in index_b and index_b[r['key']]['data'].shape == r['data'].shape]
+    matched = [(r, index_b[r['key']]) for r in candidates if r['key'] in index_b and index_b[r['key']]['n_bytes'] == r['n_bytes']]
     skipped = len(a) - len(candidates)
     print(f'{len(a)} and {len(b)} tensors, {len(matched)} matched by name and occurrence' +
           (f' ({skipped} auto-named tensors skipped, see --unnamed)' if skipped else ''))
@@ -124,14 +148,15 @@ def main():
     include = re.compile(args.include) if args.include else None
     listed = differing = identical = 0
     for ra, rb in matched:
-        if np.array_equal(ra['data'], rb['data']):
+        da, db = ra['data'], rb['data']
+        if np.array_equal(da, db):
             identical += 1
             continue
         if ra['type'] == GGML_TYPE_I32:
             differing += 1
-            text = f'{np.sum(ra["data"] != rb["data"])}/{ra["data"].size} values differ'
+            text = f'{np.sum(da != db)}/{da.size} values differ'
         else:
-            err = rel_rms(ra['data'], rb['data'])
+            err = rel_rms(da, db)
             if err <= args.threshold:
                 continue
             differing += 1

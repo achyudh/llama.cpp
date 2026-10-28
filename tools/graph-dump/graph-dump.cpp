@@ -36,6 +36,11 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 struct dump_state {
     FILE * out = nullptr;
     bool filter = false;
@@ -218,6 +223,12 @@ int main(int argc, char ** argv) {
             batch.add(tokens[n_prefix + i], n_prefix + i, 0, true);
         }
         rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+#ifndef _WIN32
+        // a dump is several GB: written through the page cache it would push the model's mmap'd weights out of it
+        fflush(st.out);
+        fdatasync(fileno(st.out));
+        posix_fadvise(fileno(st.out), 0, 0, POSIX_FADV_DONTNEED);
+#endif
         const bool ok = fclose(st.out) == 0;
         st.out = nullptr;
         LOG_INF("%s: pass %d: decode %d, %u tokens, %zu tensors -> %s\n", __func__, pass, rc, n, st.records, path.c_str());
