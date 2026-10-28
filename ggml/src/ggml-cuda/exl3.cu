@@ -15,10 +15,9 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
             op->src[0]->ne[2] > INT_MAX) {
         return false;
     }
-    // Dense banks above 8 rows go through an FP16 GEMM whose input copy is bounded; larger routed batches stay on
-    // the reference backend.
-    if (!op->src[4] && rows > 8) {
-        return rows <= 65536 && rows * k <= 256 * 1024 * 1024;
+    // Banks above 8 rows go through an FP16 GEMM whose input copy is bounded (a transform block row per 4 rows).
+    if (rows > 8) {
+        return assignments <= 4 * 65535 && assignments * k <= 256 * 1024 * 1024;
     }
     // Bound the decode workspace and grid.
     return rows <= 8 && assignments <= 512 && assignments * (k + n) <= 16 * 1024 * 1024;
@@ -26,6 +25,10 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
     GGML_UNUSED(op); GGML_UNUSED(cc);
     return false;
 #endif
+}
+
+bool ggml_cuda_exl3_needs_sync(const ggml_tensor * op) {
+    return op->op == GGML_OP_MUL_MAT_EXL3 && op->src[4] && op->ne[2] > 8;
 }
 
 #ifdef GGML_USE_HIP
@@ -57,14 +60,20 @@ static __device__ __forceinline__ void exl3_hadamard128(float v[4], int lane) {
     }
 }
 
+#define EXL3_TRANSFORM_ROWS 4 // the supports check bounds the grid rows
+
 template<typename T, bool input>
 static __global__ void exl3_transform(ggml_cuda_exl3_args a) {
-    // The format uses groups of 32 lanes. Dispatch is restricted to RDNA4 wave32 devices.
-    const int assignment = blockIdx.y;
+    // The format uses groups of 32 lanes. Dispatch is restricted to RDNA4 wave32 devices. A wave rotates one row.
+    const int row = blockIdx.y * EXL3_TRANSFORM_ROWS + threadIdx.x / 32;
+    if (row >= a.assignments) {
+        return;
+    }
+    const int assignment = input && a.perm ? a.perm[row] : row;
     const int expert = exl3_expert(a, assignment);
     const bool valid = expert >= 0 && expert < a.experts;
     const int width = input ? a.k : a.n;
-    const int lane = threadIdx.x;
+    const int lane = threadIdx.x % 32;
     const int base = blockIdx.x * 128;
     const int xrow = a.ids ? (assignment / a.used) * a.input_slots + (assignment % a.used) % a.input_slots : assignment;
     float v[4];
@@ -80,7 +89,7 @@ static __global__ void exl3_transform(ggml_cuda_exl3_args a) {
         const int col = base + j * 32 + lane;
         const float value = v[j] * 0.08838834764831844f;
         if (input) {
-            ((T *) a.xh)[size_t(assignment) * width + col] = (T) value;
+            ((T *) a.xh)[size_t(row) * width + col] = (T) value;
         } else {
             a.dst[size_t(assignment) * width + col] = valid ? value * __half2float(a.svh[size_t(expert) * width + col]) : NAN;
         }
@@ -208,13 +217,18 @@ static __global__ void exl3_matrix_rows(ggml_cuda_exl3_args a) {
     }
 }
 
-// Decode columns [n0, n0 + gridDim.x * 16) of a dense bank into FP16 w[col - n0][k], k contiguous, for a GEMM.
+// Decode columns [n0, n0 + gridDim.x * 16) of a bank into FP16 w[col - n0][k], k contiguous, for a GEMM: the dense
+// bank, or the bank of expert experts[blockIdx.z] into slot blockIdx.z of w.
 // A block decodes eight 16 x 16 tiles of one column strip and writes each column's 128 values contiguously.
 template<int bits_x2>
-static __global__ void exl3_decode_f16(const uint32_t * packed, half * w, int k, int n, int n0) {
+static __global__ void exl3_decode_f16(const uint32_t * packed, const int32_t * experts, half * w, int k, int n, int n0) {
     __shared__ half strip[16][128 + 8];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int nt = n0 / 16 + blockIdx.x;
+    if (experts) {
+        packed += size_t(experts[blockIdx.z]) * (k / 16) * (n / 16) * (4 * bits_x2);
+        w += size_t(blockIdx.z) * gridDim.x * 16 * k;
+    }
 #pragma unroll
     for (int t = 0; t < 2; ++t) {
         const int kt = blockIdx.y * 8 + warp * 2 + t;
@@ -236,24 +250,28 @@ static __global__ void exl3_decode_f16(const uint32_t * packed, half * w, int k,
     dst[1] = src[1];
 }
 
-static void exl3_decode_f16_launch(const ggml_cuda_exl3_args & a, half * w, int n0, int n_cols, cudaStream_t stream) {
-    const dim3 grid(n_cols / 16, a.k / 128);
+static void exl3_decode_f16_launch(const ggml_cuda_exl3_args & a, const int32_t * experts, int n_experts, half * w,
+                                   int n0, int n_cols, cudaStream_t stream) {
+    const dim3 grid(n_cols / 16, a.k / 128, n_experts);
     switch (a.bits_x2) {
-        case 7:  exl3_decode_f16<7 ><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
-        case 8:  exl3_decode_f16<8 ><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
-        case 10: exl3_decode_f16<10><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
-        case 12: exl3_decode_f16<12><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
-        case 14: exl3_decode_f16<14><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
+        case 7:  exl3_decode_f16<7 ><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
+        case 8:  exl3_decode_f16<8 ><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
+        case 10: exl3_decode_f16<10><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
+        case 12: exl3_decode_f16<12><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
+        case 14: exl3_decode_f16<14><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
         default: GGML_ABORT("Unsupported EXL3 rate");
     }
 }
 
 // Y = X W^T for FP16 X [m][k] (rotated rows) and FP16 W [n_cols][k] (a decoded column chunk), FP32 accumulation on
 // RDNA4 WMMA, then the output rotation and svh scale of each 128-column group: dst[row][n0 + col]. A block computes
-// 128 x 128 in 4 waves of 64 x 64; both operands go through double-buffered LDS, the next K step loaded into
+// BM x 128 in 4 waves of BM / 2 x 64; both operands go through double-buffered LDS, the next K step loaded into
 // registers during the current step's math, one barrier per step of 32.
 // On gfx1201 this runs at about 100 TFLOPS for 4096 x 12288 x 2560, hipBLASLt's FP16 GEMM at about 145. Thread traces
 // put the difference in instruction scheduling (LDS fragment and global load waits), not in tiling or occupancy.
+// Routed: x holds the rows sorted by expert and w the decoded experts of one chunk, all n columns each. Block b
+// computes column block b % (n / BN) of tile b / (n / BN) = {first sorted row, rows (at most BM), w slot, expert},
+// and writes sorted row i to dst row perm[i].
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1200__) || defined(__gfx1201__))
 #define EXL3_GEMM_WMMA 1
 #endif
@@ -276,23 +294,28 @@ static __device__ __forceinline__ exl3_half8 exl3_load16(__amdgpu_buffer_rsrc_t 
 }
 #endif
 
+// BM is 128 rows, or 64 for routed tiles, which mostly hold fewer rows than that.
 namespace exl3_gemm {
-constexpr int BM = 128, BN = 128, BK = 32, LDK = BK + 8, LDY = BN + 4, THREADS = 128;
-constexpr int WM = 64, WN = 64, WAVES_N = BN / WN;
-constexpr int A_PIECES = BM * BK / 8 / THREADS; // 8-half pieces of X per thread and K step
-constexpr int B_PIECES = BN * BK / 8 / THREADS; // and of W
-constexpr int STAGE = (BM + BN) * LDK;          // halves per LDS stage
+constexpr int BN = 128, BK = 32, LDK = BK + 8, LDY = BN + 4, THREADS = 128;
+constexpr int WN = 64, WAVES_N = BN / WN;
+constexpr int B_PIECES = BN * BK / 8 / THREADS; // 8-half pieces of W per thread and K step
 constexpr int YROWS = 32; // output rows rotated per epilogue phase
 constexpr int GROUP_M = 8; // row blocks per launch-order group
-constexpr int SMEM = std::max(2 * STAGE * 2, YROWS * LDY * 4);
 static_assert(BN == 128, "the epilogue rotates one 128-column group per block");
 }
 
+template<int BM, bool routed>
 __launch_bounds__(exl3_gemm::THREADS)
 static __global__ void exl3_gemm_f16(const half * __restrict__ x, const half * __restrict__ w, const half * __restrict__ svh,
-                                     float * __restrict__ dst, int m, int n, int k, int n0) {
+                                     float * __restrict__ dst, int m, int n, int k, int n0,
+                                     const int4 * __restrict__ tiles, const int32_t * __restrict__ perm) {
 #ifdef EXL3_GEMM_WMMA
     using namespace exl3_gemm;
+    constexpr int WM = BM / (THREADS / 32 / WAVES_N);
+    constexpr int A_PIECES = BM * BK / 8 / THREADS; // and of X
+    constexpr int STAGE = (BM + BN) * LDK;          // halves per LDS stage
+    constexpr int SMEM = std::max(2 * STAGE * 2, YROWS * LDY * 4);
+    static_assert(WM % YROWS == 0, "an epilogue phase covers part of one wave row");
     // two X stages during the K loop, then one wave row of the output tile at a time for the rotation
     __shared__ __attribute__((aligned(16))) char smem[SMEM];
     _Float16 * stages = (_Float16 *) smem;
@@ -302,10 +325,26 @@ static __global__ void exl3_gemm_f16(const half * __restrict__ x, const half * _
     const int wm = warp / WAVES_N, wn = warp % WAVES_N;
     // grouped order: consecutive blocks walk GROUP_M row blocks down one column strip, so the blocks in flight share
     // a few W strips and X row blocks in L2 instead of sweeping every W strip for each row block
-    const int n_rb = (m + BM - 1) / BM, n_cb = gridDim.x / n_rb;
-    const int group = blockIdx.x / (GROUP_M * n_cb), first = group * GROUP_M, size = min(n_rb - first, GROUP_M);
-    const int row_block = first + (blockIdx.x % (GROUP_M * n_cb)) % size, col_block = (blockIdx.x % (GROUP_M * n_cb)) / size;
-    const int row0 = row_block * BM, col0 = col_block * BN;
+    int n_cb, row0, col0;
+    if constexpr (routed) {
+        // the blocks in flight cover all column blocks of a few tiles, so a few experts' weights
+        n_cb = n / BN;
+        const int4 tile = tiles[blockIdx.x / n_cb];
+        x += size_t(tile.x) * k;
+        m = tile.y;
+        w += size_t(tile.z) * n * k;
+        svh += size_t(tile.w) * n;
+        perm += tile.x;
+        row0 = 0;
+        col0 = (blockIdx.x % n_cb) * BN;
+    } else {
+        const int n_rb = (m + BM - 1) / BM;
+        n_cb = gridDim.x / n_rb;
+        const int group = blockIdx.x / (GROUP_M * n_cb), first = group * GROUP_M, size = min(n_rb - first, GROUP_M);
+        const int row_block = first + (blockIdx.x % (GROUP_M * n_cb)) % size, col_block = (blockIdx.x % (GROUP_M * n_cb)) / size;
+        row0 = row_block * BM;
+        col0 = col_block * BN;
+    }
 
     exl3_float8 acc[WM / 16][WN / 16];
 #pragma unroll
@@ -413,17 +452,18 @@ static __global__ void exl3_gemm_f16(const half * __restrict__ x, const half * _
             for (int j = 0; j < 4; ++j) { v[j] = ys[r * LDY + j * 32 + lane]; }
             exl3_hadamard128(v, lane);
             if (row < m) {
+                const size_t out = routed ? perm[row] : row;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const int col = n0 + col0 + j * 32 + lane;
-                    dst[size_t(row) * n + col] = v[j] * 0.08838834764831844f * __half2float(svh[col]);
+                    dst[out * n + col] = v[j] * 0.08838834764831844f * __half2float(svh[col]);
                 }
             }
         }
         exl3_lds_barrier();
     }
 #else
-    GGML_UNUSED_VARS(x, w, svh, dst, m, n, k, n0);
+    GGML_UNUSED_VARS(x, w, svh, dst, m, n, k, n0, tiles, perm);
     NO_DEVICE_CODE;
 #endif
 }
@@ -452,9 +492,9 @@ static void exl3_matrix_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mod
 void ggml_cuda_exl3_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mode mode,
                           ggml_cuda_exl3_stage stage, cudaStream_t stream) {
     if (stage == GGML_EXL3_INPUT || stage == GGML_EXL3_ALL) {
-        const dim3 grid(a.k / 128, a.assignments);
-        if (mode == GGML_EXL3_F16_DOT) { exl3_transform<half, true><<<grid, 32, 0, stream>>>(a); }
-        else { exl3_transform<float, true><<<grid, 32, 0, stream>>>(a); }
+        const dim3 grid(a.k / 128, (a.assignments + EXL3_TRANSFORM_ROWS - 1) / EXL3_TRANSFORM_ROWS);
+        if (mode == GGML_EXL3_F16_DOT) { exl3_transform<half, true><<<grid, 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(a); }
+        else { exl3_transform<float, true><<<grid, 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(a); }
     }
     if (stage == GGML_EXL3_MATRIX || stage == GGML_EXL3_ALL) {
         switch (a.bits_x2) {
@@ -467,7 +507,85 @@ void ggml_cuda_exl3_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mode mo
         }
     }
     if (stage == GGML_EXL3_OUTPUT || stage == GGML_EXL3_ALL) {
-        exl3_transform<float, false><<<dim3(a.n / 128, a.assignments), 32, 0, stream>>>(a);
+        const dim3 grid(a.n / 128, (a.assignments + EXL3_TRANSFORM_ROWS - 1) / EXL3_TRANSFORM_ROWS);
+        exl3_transform<float, false><<<grid, 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(a);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Routed banks above 8 rows: sort the assignments by expert on the host, rotate the rows to FP16 in that order, then
+// per chunk of experts decode their banks to FP16 and run the GEMM over the chunk's tiles of up to BM rows each.
+static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    using exl3_gemm::BN;
+    // a used expert gets a median of 38 rows of a 4096-token batch (10 of 512 experts per token)
+    constexpr int BM = 64;
+    const int k = dst->src[2]->ne[0], n = dst->ne[0], used = dst->ne[1], assignments = dst->ne[1] * dst->ne[2];
+    const int experts = dst->src[0]->ne[2];
+    cudaStream_t stream = ctx.stream();
+
+    std::vector<int32_t> ids(assignments);
+    CUDA_CHECK(cudaMemcpyAsync(ids.data(), dst->src[4]->data, ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // counting sort by expert; rows of out-of-range experts are not computed and read NaN, like the other paths
+    std::vector<int> start(experts + 1, 0);
+    for (const int32_t e : ids) {
+        if (e >= 0 && e < experts) { ++start[e + 1]; }
+    }
+    std::vector<int32_t> experts_used;
+    for (int e = 0; e < experts; ++e) {
+        if (start[e + 1]) { experts_used.push_back(e); }
+        start[e + 1] += start[e];
+    }
+    const int valid = start[experts];
+    // device copy: the sorted assignments, the experts used, then 16-byte aligned tiles grouped by expert chunk
+    // decoded chunks of 32 MiB stay in the 64 MiB Infinity Cache until the GEMM reads them: at 4096 tokens 16 and
+    // 64 MiB are 30% slower, 128 MiB and more 45-60%
+    const int chunk_experts = std::max<int>(1, (32ll << 20) / (2ll * n * k));
+    const size_t used_offset = valid, tiles_offset = (used_offset + experts_used.size() + 3) / 4 * 4;
+    std::vector<int32_t> host(tiles_offset);
+    std::vector<int> fill(start.begin(), start.end() - 1);
+    for (int i = 0; i < assignments; ++i) {
+        if (ids[i] >= 0 && ids[i] < experts) { host[fill[ids[i]]++] = i; }
+    }
+    std::copy(experts_used.begin(), experts_used.end(), host.begin() + used_offset);
+    std::vector<int> chunk_tiles = {0};
+    for (size_t s0 = 0; s0 < experts_used.size(); s0 += chunk_experts) {
+        for (size_t s = s0; s < std::min(experts_used.size(), s0 + chunk_experts); ++s) {
+            const int e = experts_used[s];
+            for (int r0 = start[e]; r0 < start[e + 1]; r0 += BM) {
+                host.insert(host.end(), {r0, std::min(BM, start[e + 1] - r0), int(s - s0), e});
+            }
+        }
+        chunk_tiles.push_back((host.size() - tiles_offset) / 4);
+    }
+    for (int i = 0; i < assignments; ++i) {
+        if (ids[i] < 0 || ids[i] >= experts) {
+            CUDA_CHECK(cudaMemsetAsync((float *) dst->data + size_t(i) * n, 0xff, n * sizeof(float), stream));
+        }
+    }
+    if (valid == 0) {
+        return;
+    }
+    ggml_cuda_pool_alloc<int32_t> dev(ctx.pool(), host.size());
+    CUDA_CHECK(cudaMemcpyAsync(dev.get(), host.data(), host.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // the host copy is released on return
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(valid) * k);
+    ggml_cuda_pool_alloc<half> w(ctx.pool(), size_t(std::min<size_t>(chunk_experts, experts_used.size())) * n * k);
+    const ggml_cuda_exl3_args args = {
+        (const uint32_t *) dst->src[0]->data, (const half *) dst->src[2]->data, (const half *) dst->src[3]->data,
+        (const float *) dst->src[1]->data, (const int32_t *) dst->src[4]->data, (float *) dst->data, xh.get(), nullptr,
+        k, n, experts, valid, used, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0), dev.get()};
+    ggml_cuda_exl3_launch(args, GGML_EXL3_F16_DOT, GGML_EXL3_INPUT, stream);
+    const int4 * tiles = (const int4 *) (dev.get() + tiles_offset);
+    for (size_t c = 0; c + 1 < chunk_tiles.size(); ++c) {
+        const int s0 = c * chunk_experts, n_experts = std::min<int>(chunk_experts, experts_used.size() - s0);
+        exl3_decode_f16_launch(args, dev.get() + used_offset + s0, n_experts, w.get(), 0, n, stream);
+        const int blocks = n / BN * (chunk_tiles[c + 1] - chunk_tiles[c]);
+        exl3_gemm_f16<BM, true><<<blocks, exl3_gemm::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst, 0, n, k, 0,
+                                                                           tiles + chunk_tiles[c], dev.get());
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -480,6 +598,10 @@ void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         return;
     }
     const int k = dst->src[2]->ne[0], n = dst->ne[0], assignments = dst->ne[1] * dst->ne[2];
+    if (dst->src[4] && dst->ne[2] > 8) {
+        exl3_routed_gemm(ctx, dst);
+        return;
+    }
     if (!dst->src[4] && assignments > 8) {
         // Rotate the rows to FP16, decode the bank to FP16 in column chunks and multiply with FP32 accumulation; the
         // GEMM applies the output rotation and scale.
@@ -494,9 +616,10 @@ void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         ggml_cuda_exl3_launch(args, GGML_EXL3_F16_DOT, GGML_EXL3_INPUT, stream);
         for (int n0 = 0; n0 < n; n0 += chunk) {
             const int n_cols = std::min(chunk, n - n0);
-            exl3_decode_f16_launch(args, w.get(), n0, n_cols, stream);
-            const int blocks = n_cols / exl3_gemm::BN * ((assignments + exl3_gemm::BM - 1) / exl3_gemm::BM);
-            exl3_gemm_f16<<<blocks, exl3_gemm::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst, assignments, n, k, n0);
+            exl3_decode_f16_launch(args, nullptr, 1, w.get(), n0, n_cols, stream);
+            const int blocks = n_cols / exl3_gemm::BN * ((assignments + 127) / 128);
+            exl3_gemm_f16<128, false><<<blocks, exl3_gemm::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst,
+                                                                            assignments, n, k, n0, nullptr, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
         return;

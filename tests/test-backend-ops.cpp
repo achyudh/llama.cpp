@@ -6239,25 +6239,28 @@ struct test_mul_mat_exl3 : public test_case {
     const bool routed;
     const int n;
     const int k;
+    const int experts; // routed only
+    const int used;
+    const int slots;   // input rows per token: 1 (gate/up) or used (down)
 
-    test_mul_mat_exl3(int bits_x2, int rows, bool routed, int n = 256, int k = 128) : bits_x2(bits_x2), rows(rows), routed(routed), n(n), k(k) {}
+    test_mul_mat_exl3(int bits_x2, int rows, bool routed, int n = 256, int k = 128, int experts = 2, int used = 4, int slots = 1)
+        : bits_x2(bits_x2), rows(rows), routed(routed), n(n), k(k), experts(routed ? experts : 1), used(used), slots(slots) {}
 
     std::string vars() override {
-        return VARS_TO_STR5(bits_x2, rows, routed, n, k);
+        return VARS_TO_STR8(bits_x2, rows, routed, n, k, experts, used, slots);
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return 2ull * k * n * rows * (routed ? 4 : 1);
+        return 2ull * k * n * rows * (routed ? used : 1);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int experts = routed ? 2 : 1;
         auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, (int64_t) (k / 16) * (n / 16) * 8 * bits_x2, 1, experts);
         auto * su = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, experts);
         auto * sv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, experts);
-        auto * x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, rows) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, rows);
-        auto * ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, rows) : nullptr;
+        auto * x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, slots, rows) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, rows);
+        auto * ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, rows) : nullptr;
         if (ids) { ggml_set_name(ids, "exl3_test_ids"); }
         return ggml_mul_mat_exl3(ctx, p, su, sv, x, ids, bits_x2);
     }
@@ -6267,7 +6270,19 @@ struct test_mul_mat_exl3 : public test_case {
         auto * ids = ggml_get_tensor(ctx, "exl3_test_ids");
         if (ids) {
             std::vector<int32_t> data(ggml_nelements(ids));
-            for (size_t i = 0; i < data.size(); ++i) { data[i] = i % 2; }
+            if (experts == 2) {
+                for (size_t i = 0; i < data.size(); ++i) { data[i] = i % 2; }
+            } else {
+                // distinct experts per token; expert 0 takes most tokens, so its rows span several GEMM tiles
+                std::mt19937 rng(1234);
+                std::vector<int32_t> order(experts);
+                for (int t = 0; t < rows; ++t) {
+                    std::iota(order.begin(), order.end(), 0);
+                    std::shuffle(order.begin(), order.end(), rng);
+                    if (rng() % 4 != 0) { std::swap(order[0], *std::find(order.begin(), order.end(), 0)); }
+                    std::copy(order.begin(), order.begin() + used, data.begin() + size_t(t) * used);
+                }
+            }
             ggml_backend_tensor_set(ids, data.data(), 0, ggml_nbytes(ids));
         }
     }
@@ -10822,6 +10837,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, false, 2560, 640));
     }
     test_cases.emplace_back(new test_mul_mat_exl3(7, 17, false, 16384, 2560));
+    // routed banks above 8 rows: grouped FP16 GEMM over tiles of one expert's rows; expert 0 spans several tiles, the
+    // 640 x 2560 shapes decode 32 experts in two chunks, and down projections read one input row per slot
+    for (int bits_x2 : {7, 8, 12}) {
+        for (int rows : {9, 300}) {
+            test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, true, 256, 128, 16, 4, 1));
+            test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, true, 256, 128, 16, 4, 4));
+        }
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, true, 640, 2560, 32, 10, 1));
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, true, 2560, 640, 32, 10, 10));
+    }
+    test_cases.emplace_back(new test_mul_mat_exl3(8, 64, true));
 
     // Decode shapes of the RDNA4 Q8_0/Q4_0 paged decode kernel (4 KV heads x GQA 6, head 256, 1-8 query tokens).
     for (int kv : { 256, 1000, 8192, 32768, }) {
@@ -13454,6 +13480,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 12288, 2560));
         test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 10240, 2560));
         test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 2560, 6144));
+    }
+    // prefill: routed gate/up and down over 512 experts, 10 per token
+    for (int rows : {512, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_exl3(8, rows, true, 640, 2560, 512, 10, 1));
+        test_cases.emplace_back(new test_mul_mat_exl3(8, rows, true, 2560, 640, 512, 10, 10));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
