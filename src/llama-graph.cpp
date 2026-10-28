@@ -2450,15 +2450,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
-    if (model_weights && !ggml_is_contiguous(selected_experts)) {
-        for (auto * w : {up_exps, gate_exps, down_exps, gate_up_exps}) {
-            if (model_weights->exl3.count(w)) {
-                selected_experts = ggml_cont(ctx0, selected_experts);
-                break;
-            }
-        }
-    }
-
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2501,6 +2492,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // the EXL3 expert ops take contiguous ids; copied after the weights are gathered, which keeps the topk-moe pattern
+    if (model_weights && !ggml_is_contiguous(selected_experts)) {
+        for (auto * w : {up_exps, gate_exps, down_exps, gate_up_exps}) {
+            if (model_weights->exl3.count(w)) {
+                selected_experts = ggml_cont(ctx0, selected_experts);
+                break;
+            }
+        }
+    }
 
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
