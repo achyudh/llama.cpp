@@ -36,9 +36,10 @@ static __device__ __forceinline__ void ggml_cuda_hadamard128(float v[4], int lan
 // registers during the current step's math, one barrier per step of 32.
 // On gfx1201 this runs at about 100 TFLOPS for 4096 x 12288 x 2560, hipBLASLt's FP16 GEMM at about 145. Thread traces
 // put the difference in instruction scheduling (LDS fragment and global load waits), not in tiling or occupancy.
-// Routed: x holds the rows sorted by expert and w the decoded experts of one chunk, all n columns each. Block b
-// computes column block b % (n / BN) of tile b / (n / BN) = {first sorted row, rows (at most BM), w slot, expert},
-// and writes sorted row i to dst row perm[i].
+// Routed: x holds the rows of one chunk of experts, sorted by expert, and w the chunk's decoded experts, all n columns
+// each. The chunk (on the device) lists its tiles = {first row in x, rows (at most BM), w slot, expert}; block b
+// computes column block b % (n / BN) of tiles b / (n / BN), b / (n / BN) + gridDim.x / (n / BN), ... and writes row i
+// of x to dst row perm[chunk.row0 + i].
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1200__) || defined(__gfx1201__))
 #define GGML_CUDA_GEMM_WMMA 1
 #endif
@@ -77,48 +78,35 @@ constexpr int GROUP_M = 8; // row blocks per launch-order group
 static_assert(BN == 128, "the epilogue rotates one 128-column group per block");
 }
 
-// X is FP16, or FP32 (TX = float) converted to FP16 on its way to LDS.
-template<int BM, bool routed, bool rotate, typename TX = half>
-__launch_bounds__(gemm_wmma::THREADS)
-static __global__ void gemm_f16_wmma(const TX * __restrict__ x, const half * __restrict__ w, const half * __restrict__ svh,
-                                     float * __restrict__ dst, int m, int n, int k, int n0,
-                                     const int4 * __restrict__ tiles, const int32_t * __restrict__ perm) {
+// a chunk of the routed GEMM: its rows in the expert-sorted order, its tiles in the tile list and its experts
+struct ggml_cuda_routed_chunk {
+    int32_t row0, rows, tile0, tiles, expert0, experts, pad[2];
+};
+
 #ifdef GGML_CUDA_GEMM_WMMA
+// two X stages during the K loop, then one wave row of the output tile at a time for the rotation
+template<int BM>
+constexpr int gemm_wmma_smem() {
+    using namespace gemm_wmma;
+    return std::max(2 * (BM + BN) * LDK * 2, YROWS * LDY * 4);
+}
+
+// One output tile, rows row0.. (of m) and columns col0.. (of n_cb blocks); vb staggers its K order.
+template<int BM, bool routed, bool rotate, typename TX>
+static __device__ __forceinline__ void gemm_f16_wmma_tile(char * smem, const TX * __restrict__ x, const half * __restrict__ w,
+                                                          const half * __restrict__ svh, float * __restrict__ dst,
+                                                          const int32_t * __restrict__ perm, int m, int n, int k, int n0,
+                                                          int row0, int col0, int n_cb, int vb) {
     using namespace gemm_wmma;
     constexpr int WM = BM / (THREADS / 32 / WAVES_N);
     constexpr int A_PIECES = BM * BK / 8 / THREADS; // and of X
     constexpr int STAGE = (BM + BN) * LDK;          // halves per LDS stage
-    constexpr int SMEM = std::max(2 * STAGE * 2, YROWS * LDY * 4);
     static_assert(WM % YROWS == 0, "an epilogue phase covers part of one wave row");
-    // two X stages during the K loop, then one wave row of the output tile at a time for the rotation
-    __shared__ __attribute__((aligned(16))) char smem[SMEM];
     _Float16 * stages = (_Float16 *) smem;
     float * ys = (float *) smem;
 
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     const int wm = warp / WAVES_N, wn = warp % WAVES_N;
-    // grouped order: consecutive blocks walk GROUP_M row blocks down one column strip, so the blocks in flight share
-    // a few W strips and X row blocks in L2 instead of sweeping every W strip for each row block
-    int n_cb, row0, col0;
-    if constexpr (routed) {
-        // the blocks in flight cover all column blocks of a few tiles, so a few experts' weights
-        n_cb = n / BN;
-        const int4 tile = tiles[blockIdx.x / n_cb];
-        x += size_t(tile.x) * k;
-        m = tile.y;
-        w += size_t(tile.z) * n * k;
-        if constexpr (rotate) { svh += size_t(tile.w) * n; }
-        perm += tile.x;
-        row0 = 0;
-        col0 = (blockIdx.x % n_cb) * BN;
-    } else {
-        const int n_rb = (m + BM - 1) / BM;
-        n_cb = gridDim.x / n_rb;
-        const int group = blockIdx.x / (GROUP_M * n_cb), first = group * GROUP_M, size = min(n_rb - first, GROUP_M);
-        const int row_block = first + (blockIdx.x % (GROUP_M * n_cb)) % size, col_block = (blockIdx.x % (GROUP_M * n_cb)) / size;
-        row0 = row_block * BM;
-        col0 = col_block * BN;
-    }
 
     gemm_wmma_float8 acc[WM / 16][WN / 16];
 #pragma unroll
@@ -147,9 +135,9 @@ static __global__ void gemm_f16_wmma(const TX * __restrict__ x, const half * __r
 
     gemm_wmma_half8 ra[A_PIECES], rb[B_PIECES];
     gemm_wmma_float8 raf[A_PIECES]; // FP32 X, converted when stored
-    const int kstart = (blockIdx.x % 32) * 128 % k;
+    const int kstart = (vb % 32) * 128 % k;
 
-// staggered K: block b runs k from (b % 32) * 128 and wraps, so blocks sharing operands do not read the same
+// staggered K: tile vb runs k from (vb % 32) * 128 and wraps, so blocks sharing operands do not read the same
 // addresses (and memory channels) in lockstep; only the accumulation order changes
 #define GW_KP(K0) ((K0) + kstart < k ? (K0) + kstart : (K0) + kstart - k)
 #define GW_LOAD(K0)                                                                                      \
@@ -261,8 +249,41 @@ static __global__ void gemm_f16_wmma(const TX * __restrict__ x, const half * __r
         }
         gemm_wmma_lds_barrier();
     }
+}
+#endif // GGML_CUDA_GEMM_WMMA
+
+// X is FP16, or FP32 (TX = float) converted to FP16 on its way to LDS.
+template<int BM, bool routed, bool rotate, typename TX = half>
+__launch_bounds__(gemm_wmma::THREADS)
+static __global__ void gemm_f16_wmma(const TX * __restrict__ x, const half * __restrict__ w, const half * __restrict__ svh,
+                                     float * __restrict__ dst, int m, int n, int k, int n0, const int4 * __restrict__ tiles,
+                                     const int32_t * __restrict__ perm, const ggml_cuda_routed_chunk * __restrict__ chunk) {
+#ifdef GGML_CUDA_GEMM_WMMA
+    using namespace gemm_wmma;
+    __shared__ __attribute__((aligned(16))) char smem[gemm_wmma_smem<BM>()];
+    if constexpr (routed) {
+        // the blocks in flight cover all column blocks of a few tiles, so a few experts' weights
+        const int n_cb = n / BN, cb = blockIdx.x % n_cb;
+        const int tile0 = chunk->tile0, n_tiles = chunk->tiles;
+        perm += chunk->row0;
+        for (int t = blockIdx.x / n_cb; t < n_tiles; t += gridDim.x / n_cb) {
+            const int4 tile = tiles[tile0 + t];
+            gemm_f16_wmma_tile<BM, true, rotate, TX>(smem, x + size_t(tile.x) * k, w + size_t(tile.z) * n * k,
+                                                     rotate ? svh + size_t(tile.w) * n : svh, dst, perm + tile.x, tile.y,
+                                                     n, k, n0, 0, cb * BN, n_cb, t * n_cb + cb);
+            gemm_wmma_lds_barrier();
+        }
+    } else {
+        // grouped order: consecutive blocks walk GROUP_M row blocks down one column strip, so the blocks in flight share
+        // a few W strips and X row blocks in L2 instead of sweeping every W strip for each row block
+        const int n_rb = (m + BM - 1) / BM, n_cb = gridDim.x / n_rb;
+        const int group = blockIdx.x / (GROUP_M * n_cb), first = group * GROUP_M, size = min(n_rb - first, GROUP_M);
+        const int row_block = first + (blockIdx.x % (GROUP_M * n_cb)) % size, col_block = (blockIdx.x % (GROUP_M * n_cb)) / size;
+        gemm_f16_wmma_tile<BM, false, rotate, TX>(smem, x, w, svh, dst, perm, m, n, k, n0, row_block * BM, col_block * BN,
+                                                  n_cb, blockIdx.x);
+    }
 #else
-    GGML_UNUSED_VARS(x, w, svh, dst, m, n, k, n0, tiles, perm);
+    GGML_UNUSED_VARS(x, w, svh, dst, m, n, k, n0, tiles, perm, chunk);
     NO_DEVICE_CODE;
 #endif
 }

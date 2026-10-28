@@ -3,8 +3,6 @@
 #include "common.cuh"
 
 bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc);
-// Routed projections above 8 rows read their routing on the host.
-bool ggml_cuda_exl3_needs_sync(const ggml_tensor * op);
 void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #ifdef GGML_USE_HIP

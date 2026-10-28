@@ -2,7 +2,8 @@
 #include "gemm-wmma.cuh"
 #include "ggml-exl3.h"
 
-#include <cstring>
+#define EXL3_ROUTE_BLOCK       256 // assignments per block of the routing sort
+#define EXL3_ROUTE_MAX_EXPERTS 1024
 
 bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
 #ifdef GGML_USE_HIP
@@ -18,9 +19,11 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
             op->src[0]->ne[2] > INT_MAX) {
         return false;
     }
-    // Banks above 8 rows go through an FP16 GEMM whose input copy is bounded (a transform block row per 4 rows).
+    // Banks above 8 rows go through an FP16 GEMM whose input copy is bounded (a transform block row per 4 rows); a
+    // routed one plans its chunks in one block with a thread per expert.
     if (rows > 8) {
-        return assignments <= 4 * 65535 && assignments * k <= 256 * 1024 * 1024;
+        return assignments <= 4 * 65535 && assignments * k <= 256 * 1024 * 1024 &&
+            (!op->src[4] || op->src[0]->ne[2] <= EXL3_ROUTE_MAX_EXPERTS);
     }
     // Bound the decode workspace and grid.
     return rows <= 8 && assignments <= 512 && assignments * (k + n) <= 16 * 1024 * 1024;
@@ -30,10 +33,6 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
 #endif
 }
 
-bool ggml_cuda_exl3_needs_sync(const ggml_tensor * op) {
-    return op->op == GGML_OP_MUL_MAT_EXL3 && op->src[4] && op->ne[2] > 8;
-}
-
 #ifdef GGML_USE_HIP
 static __device__ __forceinline__ int exl3_expert(const ggml_cuda_exl3_args & a, int assignment) {
     return a.ids ? a.ids[assignment] : 0;
@@ -41,14 +40,10 @@ static __device__ __forceinline__ int exl3_expert(const ggml_cuda_exl3_args & a,
 
 #define EXL3_TRANSFORM_ROWS 4 // the supports check bounds the grid rows
 
+// The format uses groups of 32 lanes. Dispatch is restricted to RDNA4 wave32 devices. A wave rotates one row: the
+// input of assignment into row of xh, or row assignment of yh into dst.
 template<typename T, bool input>
-static __global__ void exl3_transform(ggml_cuda_exl3_args a) {
-    // The format uses groups of 32 lanes. Dispatch is restricted to RDNA4 wave32 devices. A wave rotates one row.
-    const int row = blockIdx.y * EXL3_TRANSFORM_ROWS + threadIdx.x / 32;
-    if (row >= a.assignments) {
-        return;
-    }
-    const int assignment = input && a.perm ? a.perm[row] : row;
+static __device__ __forceinline__ void exl3_transform_row(const ggml_cuda_exl3_args & a, int row, int assignment) {
     const int expert = exl3_expert(a, assignment);
     const bool valid = expert >= 0 && expert < a.experts;
     const int width = input ? a.k : a.n;
@@ -72,6 +67,24 @@ static __global__ void exl3_transform(ggml_cuda_exl3_args a) {
         } else {
             a.dst[size_t(assignment) * width + col] = valid ? value * __half2float(a.svh[size_t(expert) * width + col]) : NAN;
         }
+    }
+}
+
+template<typename T, bool input>
+static __global__ void exl3_transform(ggml_cuda_exl3_args a) {
+    const int row = blockIdx.y * EXL3_TRANSFORM_ROWS + threadIdx.x / 32;
+    if (row >= a.assignments) {
+        return;
+    }
+    exl3_transform_row<T, input>(a, row, input && a.perm ? a.perm[row] : row);
+}
+
+// The input rows of one chunk of the routed GEMM: row i of xh takes assignment perm[chunk.row0 + i].
+static __global__ void exl3_routed_input(ggml_cuda_exl3_args a, const ggml_cuda_routed_chunk * chunk) {
+    const int rows = chunk->rows;
+    const int32_t * perm = a.perm + chunk->row0;
+    for (int row = blockIdx.y * EXL3_TRANSFORM_ROWS + threadIdx.x / 32; row < rows; row += gridDim.y * EXL3_TRANSFORM_ROWS) {
+        exl3_transform_row<half, true>(a, row, perm[row]);
     }
 }
 
@@ -197,12 +210,20 @@ static __global__ void exl3_matrix_rows(ggml_cuda_exl3_args a) {
 }
 
 // Decode columns [n0, n0 + gridDim.x * 16) of a bank into FP16 w[col - n0][k], k contiguous, for a GEMM: the dense
-// bank, or the bank of expert experts[blockIdx.z] into slot blockIdx.z of w.
+// bank, or the bank of expert experts[blockIdx.z] into slot blockIdx.z of w. With a chunk of the routed GEMM, the
+// experts are the chunk's, from experts[chunk.expert0].
 // A block decodes eight 16 x 16 tiles of one column strip and writes each column's 128 values contiguously.
 template<int bits_x2>
-static __global__ void exl3_decode_f16(const uint32_t * packed, const int32_t * experts, half * w, int k, int n, int n0) {
+static __global__ void exl3_decode_f16(const uint32_t * packed, const int32_t * experts, const ggml_cuda_routed_chunk * chunk,
+                                       half * w, int k, int n, int n0) {
     __shared__ half strip[16][128 + 8];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (chunk) {
+        if (int(blockIdx.z) >= chunk->experts) {
+            return;
+        }
+        experts += chunk->expert0;
+    }
     const int nt = n0 / 16 + blockIdx.x;
     if (experts) {
         packed += size_t(experts[blockIdx.z]) * (k / 16) * (n / 16) * (4 * bits_x2);
@@ -229,15 +250,15 @@ static __global__ void exl3_decode_f16(const uint32_t * packed, const int32_t * 
     dst[1] = src[1];
 }
 
-static void exl3_decode_f16_launch(const ggml_cuda_exl3_args & a, const int32_t * experts, int n_experts, half * w,
-                                   int n0, int n_cols, cudaStream_t stream) {
+static void exl3_decode_f16_launch(const ggml_cuda_exl3_args & a, const int32_t * experts, const ggml_cuda_routed_chunk * chunk,
+                                   int n_experts, half * w, int n0, int n_cols, cudaStream_t stream) {
     const dim3 grid(n_cols / 16, a.k / 128, n_experts);
     switch (a.bits_x2) {
-        case 7:  exl3_decode_f16<7 ><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
-        case 8:  exl3_decode_f16<8 ><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
-        case 10: exl3_decode_f16<10><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
-        case 12: exl3_decode_f16<12><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
-        case 14: exl3_decode_f16<14><<<grid, 128, 0, stream>>>(a.packed, experts, w, a.k, a.n, n0); break;
+        case 7:  exl3_decode_f16<7 ><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
+        case 8:  exl3_decode_f16<8 ><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
+        case 10: exl3_decode_f16<10><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
+        case 12: exl3_decode_f16<12><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
+        case 14: exl3_decode_f16<14><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
         default: GGML_ABORT("Unsupported EXL3 rate");
     }
 }
@@ -287,8 +308,189 @@ void ggml_cuda_exl3_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mode mo
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Routed banks above 8 rows: sort the assignments by expert on the host, rotate the rows to FP16 in that order, then
-// per chunk of experts decode their banks to FP16 and run the GEMM over the chunk's tiles of up to BM rows each.
+// Routing of the routed GEMM, on the device so that the op never waits for it: Radiance's stable counting sort in
+// three passes, without an atomic deciding the order. hist counts each block of EXL3_ROUTE_BLOCK assignments per
+// expert; plan scans those counts per expert (an expert's rows in earlier blocks), takes the offsets of the experts'
+// runs and plans the tiles and chunks; place puts each assignment at its expert's offset plus the expert's rows in
+// earlier blocks plus its rank in its block.
+
+static __global__ void exl3_route_hist(const int32_t * ids, int32_t * block_count, uint32_t * dst, int assignments,
+                                       int experts, int n) {
+    extern __shared__ int32_t hist[];
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        hist[e] = 0;
+    }
+    __syncthreads();
+    const int i = blockIdx.x * EXL3_ROUTE_BLOCK + threadIdx.x;
+    if (i < assignments) {
+        const int e = ids[i];
+        if (e >= 0 && e < experts) {
+            atomicAdd(&hist[e], 1);
+        } else {
+            // rows of out-of-range experts are not computed and read NaN, like the other paths
+            for (int c = 0; c < n; ++c) {
+                dst[size_t(i) * n + c] = 0xffffffffu;
+            }
+        }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        block_count[size_t(blockIdx.x) * experts + e] = hist[e];
+    }
+}
+
+// exclusive prefix sum over the block (a multiple of 32 threads, at most 1024) and the total
+static __device__ int exl3_block_scan(int v, int * tmp, int & total) {
+    const int lane = threadIdx.x % 32, wave = threadIdx.x / 32, n_waves = blockDim.x / 32;
+    int x = v;
+#pragma unroll
+    for (int o = 1; o < 32; o *= 2) {
+        const int y = __shfl_up(x, o, 32);
+        x += lane >= o ? y : 0;
+    }
+    if (lane == 31) {
+        tmp[wave] = x;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        int t = lane < n_waves ? tmp[lane] : 0;
+#pragma unroll
+        for (int o = 1; o < 32; o *= 2) {
+            const int y = __shfl_up(t, o, 32);
+            t += lane >= o ? y : 0;
+        }
+        tmp[lane] = t;
+    }
+    __syncthreads();
+    const int below = wave > 0 ? tmp[wave - 1] : 0;
+    total = tmp[n_waves - 1];
+    __syncthreads();
+    return below + x - v;
+}
+
+// One block, a thread per expert. The chunks are groups of max_experts used experts, as the decoded weights of one
+// chunk have to fit; a group with more than chunk_tiles tiles is split into chunks of chunk_tiles tiles, so that the
+// rotated rows of a chunk fit (its first and last experts can then be in two chunks). The chunks after the last are
+// empty, so that the host can launch a bound of them.
+template<int BM>
+__launch_bounds__(EXL3_ROUTE_MAX_EXPERTS)
+static __global__ void exl3_route_plan(int32_t * block_count, int n_blocks, int32_t * offset, int32_t * used_experts,
+                                       ggml_cuda_routed_chunk * chunks, int4 * tiles, int experts, int max_experts,
+                                       int chunk_tiles, int max_chunks) {
+    __shared__ int tmp[32];
+    __shared__ int s_offset[EXL3_ROUTE_MAX_EXPERTS], s_tile[EXL3_ROUTE_MAX_EXPERTS], s_used[EXL3_ROUTE_MAX_EXPERTS];
+    __shared__ int s_chunk[EXL3_ROUTE_MAX_EXPERTS];
+    const int e = threadIdx.x;
+
+    // the expert's rows in the blocks before each block, a batch of loads at a time
+    int rows = 0;
+    if (e < experts) {
+        constexpr int BATCH = 16;
+        for (int b0 = 0; b0 < n_blocks; b0 += BATCH) {
+            int v[BATCH];
+#pragma unroll
+            for (int j = 0; j < BATCH; ++j) {
+                v[j] = block_count[size_t(min(b0 + j, n_blocks - 1)) * experts + e];
+            }
+#pragma unroll
+            for (int j = 0; j < BATCH; ++j) {
+                if (b0 + j < n_blocks) {
+                    block_count[size_t(b0 + j) * experts + e] = rows;
+                    rows += v[j];
+                }
+            }
+        }
+    }
+    const int n_tiles = (rows + BM - 1) / BM;
+    int total_rows, total_tiles, n_used;
+    const int row0  = exl3_block_scan(rows, tmp, total_rows);
+    const int tile0 = exl3_block_scan(n_tiles, tmp, total_tiles);
+    const int used  = exl3_block_scan(rows > 0, tmp, n_used);
+    if (e < experts) {
+        offset[e]   = row0;
+        s_offset[e] = row0;
+        s_tile[e]   = tile0;
+        if (rows > 0) {
+            used_experts[used] = e;
+            s_used[used] = e;
+        }
+    }
+    if (e == 0) {
+        offset[experts] = total_rows;
+    }
+    __syncthreads();
+
+    // chunks: group g of used experts, split by tiles
+    const int n_groups = (n_used + max_experts - 1) / max_experts;
+    const int g = e;
+    int g_tile0 = 0, g_tiles = 0;
+    if (g < n_groups) {
+        g_tile0 = s_tile[s_used[g * max_experts]];
+        g_tiles = ((g + 1) * max_experts < n_used ? s_tile[s_used[(g + 1) * max_experts]] : total_tiles) - g_tile0;
+    }
+    const int n_split = (g_tiles + chunk_tiles - 1) / chunk_tiles;
+    int n_chunks;
+    const int g_chunk0 = exl3_block_scan(n_split, tmp, n_chunks);
+    if (n_chunks > max_chunks) {
+        __builtin_trap();
+    }
+    if (g < n_groups) {
+        s_chunk[g] = g_chunk0;
+        // the used experts of the group, in order, own its tiles; tile t belongs to the last expert starting at or before it
+        const int u0 = g * max_experts, u1 = min(n_used, u0 + max_experts);
+        for (int j = 0; j < n_split; ++j) {
+            const int t0 = g_tile0 + j * chunk_tiles, t1 = min(g_tile0 + g_tiles, t0 + chunk_tiles);
+            int uf = u0, ul = u0;
+            for (int u = u0; u < u1; ++u) {
+                const int tu = s_tile[s_used[u]];
+                uf = tu <= t0     ? u : uf;
+                ul = tu <= t1 - 1 ? u : ul;
+            }
+            const int ef = s_used[uf], el = s_used[ul];
+            const int r0 = s_offset[ef] + (t0 - s_tile[ef]) * BM;
+            const int r1 = min(s_offset[el] + (t1 - s_tile[el]) * BM, ul + 1 < n_used ? s_offset[s_used[ul + 1]] : total_rows);
+            chunks[g_chunk0 + j] = { r0, r1 - r0, t0, t1 - t0, uf, ul - uf + 1 };
+        }
+    }
+    for (int c = n_chunks + e; c < max_chunks; c += blockDim.x) {
+        chunks[c] = {};
+    }
+    __syncthreads();
+
+    // the tiles of each used expert, relative to their chunk
+    if (e < experts && rows > 0) {
+        const int grp = used / max_experts;
+        const int g0  = s_tile[s_used[grp * max_experts]];
+        for (int j = 0; j < n_tiles; ++j) {
+            const int t = tile0 + j;
+            const ggml_cuda_routed_chunk & c = chunks[s_chunk[grp] + (t - g0) / chunk_tiles];
+            tiles[t] = make_int4(row0 + j * BM - c.row0, min(BM, rows - j * BM), used - c.expert0, e);
+        }
+    }
+}
+
+static __global__ void exl3_route_place(const int32_t * ids, const int32_t * block_count, const int32_t * offset,
+                                        int32_t * perm, int assignments, int experts) {
+    __shared__ int32_t s_e[EXL3_ROUTE_BLOCK];
+    const int i = blockIdx.x * EXL3_ROUTE_BLOCK + threadIdx.x;
+    const int e = i < assignments ? ids[i] : -1;
+    const bool valid = e >= 0 && e < experts;
+    s_e[threadIdx.x] = valid ? e : -1;
+    __syncthreads();
+    if (!valid) {
+        return;
+    }
+    // the rank within the block: its earlier assignments to the same expert
+    int rank = 0;
+    for (int j = 0; j < int(threadIdx.x); ++j) {
+        rank += s_e[j] == e;
+    }
+    perm[offset[e] + block_count[size_t(blockIdx.x) * experts + e] + rank] = i;
+}
+
+// Routed banks above 8 rows: sort the assignments by expert on the device, then per chunk of experts rotate their
+// rows to FP16, decode their banks to FP16 and run the GEMM over the chunk's tiles of up to BM rows each. The host
+// launches a bound of chunks for the shapes; the chunks past the last are empty.
 static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using gemm_wmma::BN;
     // a used expert gets a median of 38 rows of a 4096-token batch (10 of 512 experts per token)
@@ -297,85 +499,51 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int experts = dst->src[0]->ne[2];
     cudaStream_t stream = ctx.stream();
 
-    std::vector<int32_t> ids(assignments);
-    CUDA_CHECK(cudaMemcpyAsync(ids.data(), dst->src[4]->data, ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // counting sort by expert; rows of out-of-range experts are not computed and read NaN, like the other paths
-    std::vector<int> start(experts + 1, 0);
-    for (const int32_t e : ids) {
-        if (e >= 0 && e < experts) { ++start[e + 1]; }
-    }
-    std::vector<int32_t> experts_used;
-    for (int e = 0; e < experts; ++e) {
-        if (start[e + 1]) { experts_used.push_back(e); }
-        start[e + 1] += start[e];
-    }
-    const int valid = start[experts];
-    // device copy: the sorted assignments, the experts used, then 16-byte aligned tiles grouped by expert chunk
     // decoded chunks of 32 MiB stay in the 64 MiB Infinity Cache until the GEMM reads them: at 4096 tokens 16 and
     // 64 MiB are 30% slower, 128 MiB and more 45-60%
     const int chunk_experts = std::max<int>(1, (32ll << 20) / (2ll * n * k));
-    const size_t used_offset = valid, tiles_offset = (used_offset + experts_used.size() + 3) / 4 * 4;
-    std::vector<int32_t> host(tiles_offset);
-    std::vector<int> fill(start.begin(), start.end() - 1);
-    for (int i = 0; i < assignments; ++i) {
-        if (ids[i] >= 0 && ids[i] < experts) { host[fill[ids[i]]++] = i; }
-    }
-    std::copy(experts_used.begin(), experts_used.end(), host.begin() + used_offset);
-    // a chunk's rows are contiguous in sorted order; its tiles count rows from the chunk's first row
-    std::vector<int> chunk_tiles = {0}, chunk_rows = {0};
-    int max_chunk_rows = 0;
-    for (size_t s0 = 0; s0 < experts_used.size(); s0 += chunk_experts) {
-        const size_t s1 = std::min(experts_used.size(), s0 + chunk_experts);
-        const int row0 = start[experts_used[s0]];
-        for (size_t s = s0; s < s1; ++s) {
-            const int e = experts_used[s];
-            for (int r0 = start[e]; r0 < start[e + 1]; r0 += BM) {
-                host.insert(host.end(), {r0 - row0, std::min(BM, start[e + 1] - r0), int(s - s0), e});
-            }
-        }
-        chunk_tiles.push_back((host.size() - tiles_offset) / 4);
-        chunk_rows.push_back(start[experts_used[s1 - 1] + 1]);
-        max_chunk_rows = std::max(max_chunk_rows, chunk_rows.back() - row0);
-    }
-    for (int i = 0; i < assignments; ++i) {
-        if (ids[i] < 0 || ids[i] >= experts) {
-            CUDA_CHECK(cudaMemsetAsync((float *) dst->data + size_t(i) * n, 0xff, n * sizeof(float), stream));
-        }
-    }
-    if (valid == 0) {
-        return;
-    }
-    ggml_cuda_pool_alloc<int32_t> dev(ctx.pool(), host.size());
-    // the previous op's upload from the pinned buffer is done: this op synchronized on its routing after it
-    const size_t bytes = host.size() * sizeof(int32_t);
-    if (ctx.exl3_host_size < bytes) {
-        if (ctx.exl3_host) {
-            CUDA_CHECK(cudaFreeHost(ctx.exl3_host));
-        }
-        ctx.exl3_host_size = std::max(bytes, size_t(4) << 20);
-        CUDA_CHECK(cudaMallocHost(&ctx.exl3_host, ctx.exl3_host_size));
-    }
-    std::memcpy(ctx.exl3_host, host.data(), bytes);
-    CUDA_CHECK(cudaMemcpyAsync(dev.get(), ctx.exl3_host, bytes, cudaMemcpyHostToDevice, stream));
+    // and a chunk's rotated rows take at most 32 MiB
+    const int chunk_tiles = std::max<int>(2, (32ll << 20) / (2ll * k) / BM);
+    const int chunk_rows  = chunk_tiles * BM;
+    const int max_used    = std::min(experts, assignments);
+    const int max_tiles   = max_used + (assignments + BM - 1) / BM;
+    // a group of chunk_experts used experts is one chunk per chunk_tiles of its tiles, rounded up
+    const int max_chunks  = (max_used + chunk_experts - 1) / chunk_experts + max_tiles / chunk_tiles;
+    const int n_blocks    = (assignments + EXL3_ROUTE_BLOCK - 1) / EXL3_ROUTE_BLOCK;
 
-    // the rows are rotated per chunk, so the FP16 copy holds one chunk's rows instead of all of them
-    ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(max_chunk_rows) * k);
-    ggml_cuda_pool_alloc<half> w(ctx.pool(), size_t(std::min<size_t>(chunk_experts, experts_used.size())) * n * k);
-    const int4 * tiles = (const int4 *) (dev.get() + tiles_offset);
-    for (size_t c = 0; c + 1 < chunk_tiles.size(); ++c) {
-        const int s0 = c * chunk_experts, n_experts = std::min<int>(chunk_experts, experts_used.size() - s0);
-        const ggml_cuda_exl3_args args = {
-            (const uint32_t *) dst->src[0]->data, (const half *) dst->src[2]->data, (const half *) dst->src[3]->data,
-            (const float *) dst->src[1]->data, (const int32_t *) dst->src[4]->data, (float *) dst->data, xh.get(), nullptr,
-            k, n, experts, chunk_rows[c + 1] - chunk_rows[c], used, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0),
-            dev.get() + chunk_rows[c]};
-        ggml_cuda_exl3_launch(args, GGML_EXL3_F16_DOT, GGML_EXL3_INPUT, stream);
-        exl3_decode_f16_launch(args, dev.get() + used_offset + s0, n_experts, w.get(), 0, n, stream);
-        const int blocks = n / BN * (chunk_tiles[c + 1] - chunk_tiles[c]);
-        gemm_f16_wmma<BM, true, true><<<blocks, gemm_wmma::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst, 0, n, k, 0,
-                                                                           tiles + chunk_tiles[c], dev.get() + chunk_rows[c]);
+    // workspace: block counts, offsets, sorted assignments, used experts, then 16-byte aligned chunks and tiles
+    const size_t o_offset = size_t(n_blocks) * experts, o_perm = o_offset + experts + 1, o_used = o_perm + assignments;
+    const size_t o_chunks = (o_used + experts + 3) / 4 * 4;
+    const size_t o_tiles = o_chunks + size_t(max_chunks) * sizeof(ggml_cuda_routed_chunk) / sizeof(int32_t);
+    ggml_cuda_pool_alloc<int32_t> ws(ctx.pool(), o_tiles + size_t(max_tiles) * 4);
+    const int32_t * ids = (const int32_t *) dst->src[4]->data;
+    ggml_cuda_routed_chunk * chunks = (ggml_cuda_routed_chunk *) (ws.get() + o_chunks);
+    int4 * tiles = (int4 *) (ws.get() + o_tiles);
+
+    exl3_route_hist<<<n_blocks, EXL3_ROUTE_BLOCK, experts * sizeof(int32_t), stream>>>(ids, ws.get(), (uint32_t *) dst->data,
+                                                                                         assignments, experts, n);
+    exl3_route_plan<BM><<<1, (experts + 31) / 32 * 32, 0, stream>>>(ws.get(), n_blocks, ws.get() + o_offset, ws.get() + o_used,
+                                                                    chunks, tiles, experts, chunk_experts, chunk_tiles, max_chunks);
+    exl3_route_place<<<n_blocks, EXL3_ROUTE_BLOCK, 0, stream>>>(ids, ws.get(), ws.get() + o_offset, ws.get() + o_perm,
+                                                                 assignments, experts);
+
+    // launch sizes for the expected chunk, the rows of chunk_experts experts with the average rows; the kernels loop
+    const int n_slots = std::min(chunk_experts, max_used);
+    const int typical_rows = std::min<int>(chunk_rows, (int64_t(assignments) * n_slots + max_used - 1) / max_used);
+    const int input_blocks = (typical_rows + typical_rows / 2 + EXL3_TRANSFORM_ROWS - 1) / EXL3_TRANSFORM_ROWS;
+    const int tile_blocks = n_slots + (typical_rows + typical_rows / 2 + BM - 1) / BM;
+
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(std::min(chunk_rows, assignments)) * k);
+    ggml_cuda_pool_alloc<half> w(ctx.pool(), size_t(n_slots) * n * k);
+    const ggml_cuda_exl3_args args = {
+        (const uint32_t *) dst->src[0]->data, (const half *) dst->src[2]->data, (const half *) dst->src[3]->data,
+        (const float *) dst->src[1]->data, ids, (float *) dst->data, xh.get(), nullptr,
+        k, n, experts, assignments, used, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0), ws.get() + o_perm};
+    for (int c = 0; c < max_chunks; ++c) {
+        exl3_routed_input<<<dim3(k / 128, input_blocks), 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(args, chunks + c);
+        exl3_decode_f16_launch(args, ws.get() + o_used, chunks + c, n_slots, w.get(), 0, n, stream);
+        gemm_f16_wmma<BM, true, true><<<n / BN * tile_blocks, gemm_wmma::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh,
+                                                                                    args.dst, 0, n, k, 0, tiles, args.perm, chunks + c);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -406,10 +574,10 @@ void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         ggml_cuda_exl3_launch(args, GGML_EXL3_F16_DOT, GGML_EXL3_INPUT, stream);
         for (int n0 = 0; n0 < n; n0 += chunk) {
             const int n_cols = std::min(chunk, n - n0);
-            exl3_decode_f16_launch(args, nullptr, 1, w.get(), n0, n_cols, stream);
+            exl3_decode_f16_launch(args, nullptr, nullptr, 1, w.get(), n0, n_cols, stream);
             const int blocks = n_cols / gemm_wmma::BN * ((assignments + 127) / 128);
             gemm_f16_wmma<128, false, true><<<blocks, gemm_wmma::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst,
-                                                                            assignments, n, k, n0, nullptr, nullptr);
+                                                                            assignments, n, k, n0, nullptr, nullptr, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
         return;

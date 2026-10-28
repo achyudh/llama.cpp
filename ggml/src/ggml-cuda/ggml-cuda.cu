@@ -774,9 +774,6 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(mmvq_q8_1.buf));
     }
-    if (exl3_host != nullptr) {
-        CUDA_CHECK(cudaFreeHost(exl3_host));
-    }
     if (mm_siblings.fork_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(mm_siblings.fork_event));
         CUDA_CHECK(cudaEventDestroy(mm_siblings.join_event));
@@ -2828,10 +2825,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // paged attention split by page runs reads the runs on the host when it is launched
         if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_page_runs(node)) {
-            use_cuda_graph = false;
-        }
-
-        if (ggml_cuda_exl3_needs_sync(node)) {
             use_cuda_graph = false;
         }
 

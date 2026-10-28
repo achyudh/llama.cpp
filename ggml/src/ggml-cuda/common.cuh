@@ -1650,11 +1650,6 @@ struct ggml_backend_cuda_context {
     cudaEvent_t copy_event = nullptr;
 
     ggml_cuda_mmvq_q8_1_cache mmvq_q8_1;
-
-    // pinned host memory the routed EXL3 op uploads its sorted routing from (exl3.cu): pageable uploads wait behind
-    // concurrent pageable uploads of other threads (the expert stream)
-    void * exl3_host      = nullptr;
-    size_t exl3_host_size = 0;
     ggml_cuda_mm_siblings     mm_siblings;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
