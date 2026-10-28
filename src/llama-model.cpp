@@ -27,6 +27,7 @@
 #include "ggml-exl3.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -41,6 +42,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2596,18 +2598,44 @@ size_t llama_model::get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp1
         if (unique.empty() || unique.back() != rows[i]) { head_of(rows[i]); unique.push_back(rows[i]); }
     }
     if (can_prefetch.count(table)) { llama_prefetch_rows(table, unique.data(), unique.size()); }
-    ggml_fp16_t decoded[256];
-    for (size_t i = 0; i < order.size();) {
-        const int32_t row = rows[order[i]];
-        const size_t head = head_of(row);
-        if (!ggml_exl3_decode_ngram_row((const uint8_t *) table->data + size_t(row)*table->nb[1], row_bytes,
-                exl3_ngram_bits, dim, (const ggml_fp16_t *) bias->data + head*dim, dim, decoded, dim)) {
-            throw std::runtime_error("EXL3 n-gram row decode failed");
+    // decodes the sorted entries [i0, i1), which start and end at row boundaries
+    std::atomic<bool> failed = false;
+    auto decode = [&](size_t i0, size_t i1) {
+        ggml_fp16_t decoded[256];
+        for (size_t i = i0; i < i1;) {
+            const int32_t row = rows[order[i]];
+            const size_t head = head_of(row);
+            if (!ggml_exl3_decode_ngram_row((const uint8_t *) table->data + size_t(row)*table->nb[1], row_bytes,
+                    exl3_ngram_bits, dim, (const ggml_fp16_t *) bias->data + head*dim, dim, decoded, dim)) {
+                failed = true;
+                return;
+            }
+            do {
+                std::memcpy(out + order[i]*dim, decoded, dim*sizeof(ggml_fp16_t));
+                ++i;
+            } while (i < i1 && rows[order[i]] == row);
         }
-        do {
-            std::memcpy(out + order[i]*dim, decoded, dim*sizeof(ggml_fp16_t));
-            ++i;
-        } while (i < order.size() && rows[order[i]] == row);
+    };
+    // a prefill ubatch gathers rows for thousands of tokens: decode them and take their page faults on several threads
+    const size_t n_threads = std::min<size_t>(unique.size() / 2048 + 1, std::max(1u, std::thread::hardware_concurrency() / 2));
+    if (n_threads <= 1) {
+        decode(0, order.size());
+    } else {
+        std::vector<size_t> bounds = { 0 };
+        for (size_t t = 1; t < n_threads; ++t) {
+            size_t i = std::max(bounds.back(), order.size() * t / n_threads);
+            while (i > 0 && i < order.size() && rows[order[i]] == rows[order[i - 1]]) { ++i; }
+            bounds.push_back(i);
+        }
+        bounds.push_back(order.size());
+        std::vector<std::thread> workers;
+        for (size_t t = 0; t + 1 < bounds.size(); ++t) {
+            workers.emplace_back(decode, bounds[t], bounds[t + 1]);
+        }
+        for (auto & w : workers) { w.join(); }
+    }
+    if (failed) {
+        throw std::runtime_error("EXL3 n-gram row decode failed");
     }
     return unique.size();
 }
