@@ -10813,6 +10813,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int rows : {1, 5, 8}) {
         test_cases.emplace_back(new test_mul_mat_exl3(12, rows, false, 248320));
     }
+    // dense banks above 8 rows: FP16 GEMM, at 2560 inputs and 16384 outputs in two decode chunks
+    for (int bits_x2 : {7, 8, 12}) {
+        for (int rows : {9, 64, 300}) {
+            test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, false));
+        }
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, false, 640, 2560));
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, false, 2560, 640));
+    }
+    test_cases.emplace_back(new test_mul_mat_exl3(7, 17, false, 16384, 2560));
 
     // Decode shapes of the RDNA4 Q8_0/Q4_0 paged decode kernel (4 KV heads x GQA 6, head 256, 1-8 query tokens).
     for (int kv : { 256, 1000, 8192, 32768, }) {
@@ -13439,6 +13448,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, false, 2560, 640));
             test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, false, 640*256, 2560));
         }
+    }
+    // prefill: the widest dense projections (attention q and GDN qkv in, attention and GDN out)
+    for (int rows : {512, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 12288, 2560));
+        test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 10240, 2560));
+        test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 2560, 6144));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
