@@ -27,6 +27,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/exl3.cuh"
+#include "ggml-cuda/mul-mat-wmma.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -2026,6 +2027,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
+    if (ggml_cuda_should_use_mul_mat_wmma(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_wmma(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -2063,7 +2068,8 @@ static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_takes(ggml_backend_cuda_contex
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11) || src0->ne[1] == 1) {
         return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (ggml_cuda_should_use_mul_mat_wmma(src0, src1, dst, cc) ||
+            ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {

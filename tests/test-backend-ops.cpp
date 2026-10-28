@@ -10848,6 +10848,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, true, 2560, 640, 32, 10, 10));
     }
     test_cases.emplace_back(new test_mul_mat_exl3(8, 64, true));
+    // F16 weights with 64 or more rows on RDNA4 (the EXL3 WMMA GEMM with a plain epilogue): outputs that are not a
+    // multiple of 128 and partial row blocks
+    for (int64_t n : {64, 129, 300}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 320, n, 640, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 200, n, 320, {1, 1}, {1, 1}));
+    }
 
     // Decode shapes of the RDNA4 Q8_0/Q4_0 paged decode kernel (4 KV heads x GQA 6, head 256, 1-8 query tokens).
     for (int kv : { 256, 1000, 8192, 32768, }) {
@@ -13480,6 +13486,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 12288, 2560));
         test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 10240, 2560));
         test_cases.emplace_back(new test_mul_mat_exl3(8, rows, false, 2560, 6144));
+    }
+    // prefill: the F16 hyper-connection projections (10240 -> 320 -> 10240)
+    for (int64_t rows : {512, 4096}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 320, rows, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 10240, rows, 320, {1, 1}, {1, 1}));
     }
     // prefill: routed gate/up and down over 512 experts, 10 per token
     for (int rows : {512, 4096}) {
