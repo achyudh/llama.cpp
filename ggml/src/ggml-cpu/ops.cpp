@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -9702,15 +9703,18 @@ static void ggml_compute_forward_flash_attn_ext_paged(
     }
 
     ggml_tensor d = *dst;
-    for (int i = GGML_FA_SRC_PAGES; i <= GGML_FA_SRC_TAG; ++i) {
+    for (int i = GGML_FA_SRC_PAGES; i <= GGML_FA_SRC_CELLS; ++i) {
         d.src[i] = nullptr;
     }
 
-    // the end of the work buffer: [K copy][V copy] when paged, then the widened mask (ggml_graph_plan reserves the space)
-    const ggml_tensor * mask = dst->src[3];
+    // the end of the work buffer: [K copy][V copy] when paged, then the widened mask or the mask of the cell lists
+    // (ggml_graph_plan reserves the space)
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * cells = dst->src[GGML_FA_SRC_CELLS];
     const int64_t n_kv_all = ggml_flash_attn_ext_n_kv(dst);
     const int64_t col0     = ggml_flash_attn_ext_mask_col0(dst);
-    const size_t  size_m   = col0 > 0 ? (size_t) n_kv_all*mask->ne[1]*mask->ne[2]*mask->ne[3]*sizeof(ggml_fp16_t) : 0;
+    const size_t  size_m   = cells    ? (size_t) n_kv_all*cells->ne[1]*cells->ne[3]*sizeof(ggml_fp16_t) :
+                             col0 > 0 ? (size_t) n_kv_all*mask->ne[1]*mask->ne[2]*mask->ne[3]*sizeof(ggml_fp16_t) : 0;
     char * mbase = (char *) (((uintptr_t) params->wdata + params->wsize - size_m) & ~(uintptr_t) (CACHE_LINE_SIZE - 1));
 
     ggml_tensor kg;
@@ -9770,7 +9774,34 @@ static void ggml_compute_forward_flash_attn_ext_paged(
     }
 
     ggml_tensor mg;
-    if (col0 > 0) {
+    if (cells) {
+        // -inf except the listed cells
+        mg = *cells;
+        mg.view_src = nullptr;
+        mg.type  = GGML_TYPE_F16;
+        mg.ne[0] = n_kv_all;
+        mg.nb[0] = sizeof(ggml_fp16_t);
+        mg.nb[1] = n_kv_all*sizeof(ggml_fp16_t);
+        mg.nb[2] = mg.nb[1]*mg.ne[1];
+        mg.nb[3] = mg.nb[2]*mg.ne[2];
+        mg.data  = mbase;
+        const int64_t n_rows = cells->ne[1]*cells->ne[3];
+        const ggml_fp16_t ninf = GGML_CPU_FP32_TO_FP16(-INFINITY);
+        const ggml_fp16_t zero = GGML_CPU_FP32_TO_FP16(0.0f);
+        for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+            ggml_fp16_t * out = (ggml_fp16_t *) ((char *) mg.data + r*mg.nb[1]);
+            for (int64_t j = 0; j < n_kv_all; ++j) {
+                out[j] = ninf;
+            }
+            const int32_t * list = (const int32_t *) ((const char *) cells->data + r*cells->nb[1]);
+            for (int64_t j = 0; j < cells->ne[0] && list[j] >= 0; ++j) {
+                GGML_ASSERT(list[j] < n_kv_all);
+                out[list[j]] = zero;
+            }
+        }
+        ggml_barrier(params->threadpool);
+        d.src[3] = &mg;
+    } else if (col0 > 0) {
         mg = *mask;
         mg.view_src = nullptr;
         mg.ne[0] = n_kv_all;
@@ -9807,7 +9838,8 @@ static void ggml_compute_forward_flash_attn_ext_paged(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    if (dst->src[GGML_FA_SRC_PAGES] || dst->src[GGML_FA_SRC_TAG] || ggml_flash_attn_ext_mask_col0(dst) > 0) {
+    if (dst->src[GGML_FA_SRC_PAGES] || dst->src[GGML_FA_SRC_TAG] || dst->src[GGML_FA_SRC_CELLS] ||
+            ggml_flash_attn_ext_mask_col0(dst) > 0) {
         ggml_compute_forward_flash_attn_ext_paged(params, dst);
         return;
     }
@@ -11924,10 +11956,12 @@ void ggml_compute_forward_top_k_mask(
     const ggml_tensor * blocks = dst->src[3];
     const ggml_tensor * extra  = dst->src[4];
 
-    GGML_ASSERT(dst->type == mask->type);
+    // I32: the kept cells as ascending lists (ggml_top_k_cells)
+    const bool lists = dst->type == GGML_TYPE_I32;
+    GGML_ASSERT(lists || dst->type == mask->type);
     GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
 
-    const int64_t n_kv    = dst->ne[0];
+    const int64_t n_kv    = lists ? ggml_get_op_params_i32(dst, 0) : dst->ne[0];
     const int64_t col0    = n_kv - mask->ne[0];
     const int64_t ne1     = dst->ne[1];
     const int64_t ne2     = dst->ne[2];
@@ -11937,10 +11971,12 @@ void ggml_compute_forward_top_k_mask(
     const int64_t n_pick  = blocks ? blocks->ne[1] : score ? score->ne[0] : n_kv;
     const int64_t n_extra = extra ? extra->ne[0] : 0;
 
-    const size_t ts = ggml_type_size(dst->type);
+    const size_t ts = ggml_type_size(mask->type);
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    std::vector<int32_t> list;
 
     for (int64_t ir = ith; ir < n_rows; ir += nth) {
         const int64_t i1 = ir % ne1;
@@ -11951,7 +11987,9 @@ void ggml_compute_forward_top_k_mask(
             + (i1 % mask->ne[1])*mask->nb[1] + (i2 % mask->ne[2])*mask->nb[2] + (i3 % mask->ne[3])*mask->nb[3];
         char * dst_row = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
 
-        if (dst->type == GGML_TYPE_F16) {
+        list.clear();
+        if (lists) {
+        } else if (dst->type == GGML_TYPE_F16) {
             const ggml_fp16_t ninf = GGML_CPU_FP32_TO_FP16(-INFINITY);
             for (int64_t c = 0; c < n_kv; ++c) {
                 ((ggml_fp16_t *) dst_row)[c] = ninf;
@@ -11963,7 +12001,13 @@ void ggml_compute_forward_top_k_mask(
         }
 
         auto keep = [&](int32_t c) {
-            if (c >= 0 && c < n_kv) {
+            if (c >= 0 && c < n_kv && lists) {
+                const float mv = c < col0 ? 0.0f : mask->type == GGML_TYPE_F16 ?
+                    GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mask_row)[c - col0]) : ((const float *) mask_row)[c - col0];
+                if (std::isfinite(mv)) {
+                    list.push_back(c);
+                }
+            } else if (c >= 0 && c < n_kv) {
                 if (c < col0) {
                     memset(dst_row + c*ts, 0, ts);
                 } else {
@@ -11999,6 +12043,15 @@ void ggml_compute_forward_top_k_mask(
             const char * extra_row = (const char *) extra->data + i1*extra->nb[1] + i2*extra->nb[2] + i3*extra->nb[3];
             for (int64_t j = 0; j < n_extra; ++j) {
                 keep(*(const int32_t *) (extra_row + j*extra->nb[0]));
+            }
+        }
+
+        if (lists) {
+            std::sort(list.begin(), list.end());
+            list.erase(std::unique(list.begin(), list.end()), list.end());
+            int32_t * out = (int32_t *) dst_row;
+            for (int64_t j = 0; j < dst->ne[0]; ++j) {
+                out[j] = j < (int64_t) list.size() ? list[j] : -1;
             }
         }
     }

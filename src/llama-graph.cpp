@@ -3102,8 +3102,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kq_cells) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+    GGML_ASSERT(!kq_cells || (kq_mask == nullptr && cparams.flash_attn && kq_b == nullptr));
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
@@ -3143,6 +3145,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+        if (kq_cells) {
+            ggml_flash_attn_ext_set_cells(cur, kq_cells);
+            res->add_fused_node({LLM_FUSED_OP_TOP_K_CELLS, cur, il});
+        }
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -3584,6 +3590,28 @@ ggml_tensor * llm_graph_context::build_fused_top_k_mask(
 
     ggml_tensor * cur = ggml_top_k_mask_ext(ctx0, kq_mask, rows(top_k), rows(score), blocks, rows(extra), n_kv ? n_kv : kq_mask->ne[0]);
     res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, cur, il});
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_fused_top_k_cells(
+        ggml_tensor * kq_mask,
+        ggml_tensor * top_k,
+        ggml_tensor * score,
+        ggml_tensor * blocks,
+        ggml_tensor * extra,
+                int   il,
+            int64_t   n_kv) const {
+    const int64_t m1 = kq_mask->ne[1];
+    const int64_t m2 = kq_mask->ne[2];
+    const int64_t m3 = kq_mask->ne[3];
+
+    auto rows = [&](ggml_tensor * t) {
+        return t ? ggml_reshape_4d(ctx0, t, t->ne[0], m1, m2, m3) : nullptr;
+    };
+
+    ggml_tensor * cur = ggml_top_k_cells(ctx0, kq_mask, rows(top_k), rows(score), blocks, rows(extra), n_kv);
+    res->add_fused_node({LLM_FUSED_OP_TOP_K_CELLS, cur, il});
 
     return cur;
 }

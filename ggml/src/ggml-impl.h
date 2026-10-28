@@ -195,6 +195,7 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
 #define GGML_FA_SRC_RING_K      6
 #define GGML_FA_SRC_RING_V      7
 #define GGML_FA_SRC_TAG         8
+#define GGML_FA_SRC_CELLS       9
 
 static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
     const uint32_t * p;

@@ -10220,6 +10220,71 @@ struct test_top_k_mask_compact : public test_top_k_mask {
     }
 };
 
+// ggml_top_k_cells: the cells ggml_top_k_mask_ext keeps with a finite mask value, as ascending lists
+struct test_top_k_cells : public test_top_k_mask {
+    const int64_t n_mask; // the mask covers the last n_mask cells
+
+    test_top_k_cells(ggml_type type, int64_t n_kv, int64_t n_blk, int64_t n_pick, int64_t n_top, int64_t n_extra, bool score,
+            int64_t nb, int64_t nh, int64_t ns, bool real, int64_t n_mask)
+        : test_top_k_mask(type, n_kv, n_blk, n_pick, n_top, n_extra, score, nb, nh, ns, real), n_mask(n_mask) {}
+
+    std::string op_desc(ggml_tensor *) override { return "TOP_K_MASK"; }
+    std::string vars() override { return test_top_k_mask::vars() + ",cells=1,n_mask=" + std::to_string(n_mask); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * full = test_top_k_mask::build_graph(ctx);
+        auto * mask = full->src[0];
+        if (n_mask < n_kv) {
+            mask = ggml_cont(ctx, ggml_view_4d(ctx, mask, n_mask, mask->ne[1], mask->ne[2], mask->ne[3],
+                mask->nb[1], mask->nb[2], mask->nb[3], (n_kv - n_mask)*mask->nb[0]));
+        }
+        ggml_tensor * out = ggml_top_k_cells(ctx, mask, full->src[1], full->src[2], full->src[3], full->src[4], n_kv);
+        ggml_set_name(out, "cells");
+        return out;
+    }
+};
+
+// flash attention over cell lists (ggml_flash_attn_ext_set_cells) instead of a mask
+struct test_flash_attn_ext_cells : public test_flash_attn_ext {
+    const int64_t n_list;
+
+    test_flash_attn_ext_cells(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+            ggml_type type_K, ggml_type type_V, int64_t n_list)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, false, false, 0.0f, 0.0f, GGML_PREC_F32, type_K, type_V,
+                              {0, 1, 2, 3}, true, false, n_list), n_list(n_list) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",cells=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_list, nb, 1, nr23[1]);
+        ggml_set_name(cells, "cells");
+        ggml_flash_attn_ext_set_cells(out, cells);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * t = ggml_get_tensor(ctx, "cells");
+        // ascending distinct cells, at least one per row, then -1
+        std::mt19937 gen(0x5A18);
+        std::vector<int32_t> order(kv);
+        std::vector<int32_t> data(ggml_nelements(t), -1);
+        for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+            for (int64_t i = 0; i < kv; ++i) {
+                order[i] = i;
+            }
+            std::shuffle(order.begin(), order.end(), gen);
+            const int64_t count = std::max<int64_t>(1, std::min(kv, n_list) - row % 17);
+            std::sort(order.begin(), order.begin() + count);
+            std::copy(order.begin(), order.begin() + count, data.begin() + row*n_list);
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -11119,6 +11184,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // blocks picked per head, the mask broadcast over the heads
         test_cases.emplace_back(new test_top_k_mask(type, 512, 16, 32, 4, 0, true, 6, 4, 1));
         test_cases.emplace_back(new test_top_k_mask(type, 1024, 8, 128, 16, 8, false, 3, 2, 2));
+        // as cell lists: full and compact masks, picks as cells, broadcast rows, and more cells than one chunk (2^18)
+        test_cases.emplace_back(new test_top_k_cells(type,    256, 4,     64,  16, 3, true,  32, 1, 1, false,    256));
+        test_cases.emplace_back(new test_top_k_cells(type,   1001, 4,     70,  16, 3, true,   7, 1, 1, false,     37));
+        test_cases.emplace_back(new test_top_k_cells(type,   4096, 4,   1024, 512, 3, true,  64, 1, 2, true,    4096));
+        test_cases.emplace_back(new test_top_k_cells(type,   4096, 4,   1024, 512, 3, true,  64, 1, 2, true,     100));
+        test_cases.emplace_back(new test_top_k_cells(type,   1001, 0,      0,  64, 0, false,  7, 1, 3, false,   1001));
+        test_cases.emplace_back(new test_top_k_cells(type,    512, 16,    32,   4, 0, true,   6, 4, 1, false,    512));
+        test_cases.emplace_back(new test_top_k_cells(type, 300000, 4,  75000, 512, 3, true,   3, 1, 1, false, 300000));
+        test_cases.emplace_back(new test_top_k_cells(type, 300000, 4,  75000, 512, 3, true,   3, 1, 1, true,    4096));
     }
 
     // glu ops
@@ -13257,6 +13331,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 32768,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    // cell lists instead of a mask: decode, the dense fallback below the prefill threshold, sparse prefill, short K/V
+    for (int nb : { 1, 5, 67 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_cells(256, 256, 2, {12, 1}, 32768, nb, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2051));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_cells(256, 256, 2, {12, 1}, 4096,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2051));
+    test_cases.emplace_back(new test_flash_attn_ext_cells(256, 256, 2, {12, 1}, 1024,   4, GGML_TYPE_F16,  GGML_TYPE_F16,  2051));
+    test_cases.emplace_back(new test_flash_attn_ext_cells(256, 256, 2, {12, 2}, 32768, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2051));
     // a GQA that is not a multiple of 4 heads per wave takes the decode kernel with one split
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 6, 1}, 32768,  67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {16, 1}, 8192, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1000));

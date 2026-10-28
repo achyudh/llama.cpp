@@ -5593,6 +5593,19 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_cells(
+        struct ggml_tensor * a,
+        struct ggml_tensor * cells) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[3] == NULL);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && ggml_is_contiguous(cells));
+    GGML_ASSERT(cells->ne[1] == a->src[0]->ne[1] && cells->ne[2] == 1 && cells->ne[3] == a->src[0]->ne[3]);
+    GGML_ASSERT(cells->ne[0] > 0 && cells->ne[0] <= INT32_MAX);
+
+    a->src[GGML_FA_SRC_CELLS] = cells;
+    ggml_set_op_params_i32(a, 4, (int32_t) cells->ne[0]);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -6769,14 +6782,15 @@ struct ggml_tensor * ggml_top_k_mask(
     return ggml_top_k_mask_ext(ctx, mask, top_k, score, blocks, extra, mask->ne[0]);
 }
 
-struct ggml_tensor * ggml_top_k_mask_ext(
+static struct ggml_tensor * ggml_top_k_mask_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * mask,
         struct ggml_tensor  * top_k,
         struct ggml_tensor  * score,
         struct ggml_tensor  * blocks,
         struct ggml_tensor  * extra,
-        int64_t               n_kv) {
+        int64_t               n_kv,
+        bool                  cells) {
     GGML_ASSERT(n_kv >= mask->ne[0]);
     GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
     GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
@@ -6799,7 +6813,14 @@ struct ggml_tensor * ggml_top_k_mask_ext(
         GGML_ASSERT(extra->ne[1] == top_k->ne[1] && extra->ne[2] == top_k->ne[2] && extra->ne[3] == top_k->ne[3]);
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, mask->type, n_kv, top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+    // the lists are told apart from the mask by their type
+    const int64_t n_list = top_k->ne[0]*(blocks ? blocks->ne[0] : 1) + (extra ? extra->ne[0] : 0);
+    struct ggml_tensor * result = cells ?
+        ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_list, top_k->ne[1], top_k->ne[2], top_k->ne[3]) :
+        ggml_new_tensor_4d(ctx, mask->type,    n_kv,   top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+    if (cells) {
+        ggml_set_op_params_i32(result, 0, (int32_t) n_kv);
+    }
 
     result->op     = GGML_OP_TOP_K_MASK;
     result->src[0] = mask;
@@ -6809,6 +6830,28 @@ struct ggml_tensor * ggml_top_k_mask_ext(
     result->src[4] = extra;
 
     return result;
+}
+
+struct ggml_tensor * ggml_top_k_mask_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra,
+        int64_t               n_kv) {
+    return ggml_top_k_mask_impl(ctx, mask, top_k, score, blocks, extra, n_kv, false);
+}
+
+struct ggml_tensor * ggml_top_k_cells(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra,
+        int64_t               n_kv) {
+    return ggml_top_k_mask_impl(ctx, mask, top_k, score, blocks, extra, n_kv, true);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

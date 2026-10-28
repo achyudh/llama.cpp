@@ -3024,9 +3024,13 @@ struct ggml_cplan ggml_graph_plan(
                             cur += n_kv*(ggml_row_size(k->type, k->ne[0])*k->ne[2] + ggml_row_size(v->type, v->ne[0])*v->ne[2]);
                             cur += 2*CACHE_LINE_SIZE;
                         }
-                        // a mask narrower than the K/V is widened at the end of the work buffer
-                        const struct ggml_tensor * mask = node->src[3];
-                        if (ggml_flash_attn_ext_mask_col0(node) > 0) {
+                        // a mask narrower than the K/V is widened at the end of the work buffer, cell lists become one
+                        const struct ggml_tensor * mask  = node->src[3];
+                        const struct ggml_tensor * cells = node->src[GGML_FA_SRC_CELLS];
+                        if (cells) {
+                            cur += ggml_flash_attn_ext_n_kv(node)*cells->ne[1]*cells->ne[3]*sizeof(ggml_fp16_t);
+                            cur += CACHE_LINE_SIZE;
+                        } else if (ggml_flash_attn_ext_mask_col0(node) > 0) {
                             cur += ggml_flash_attn_ext_n_kv(node)*mask->ne[1]*mask->ne[2]*mask->ne[3]*sizeof(ggml_fp16_t);
                             cur += CACHE_LINE_SIZE;
                         }

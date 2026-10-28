@@ -2531,6 +2531,12 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // The K/V rows each query attends, as lists instead of a mask (which must be NULL): cells I32 [n_list, n_queries,
+    // 1, ne3], each row in ascending order and padded with -1 (see ggml_top_k_cells). Sets n_kv_max to n_list.
+    GGML_API void ggml_flash_attn_ext_set_cells(
+            struct ggml_tensor * a,
+            struct ggml_tensor * cells);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2844,6 +2850,17 @@ extern "C" {
 
     // The mask covers the last mask->ne[0] cells of n_kv; earlier cells have an implicit zero mask.
     GGML_API struct ggml_tensor * ggml_top_k_mask_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra,
+            int64_t               n_kv);
+
+    // ggml_top_k_mask_ext as lists: res I32 [n_top*n_blk + n_extra, ne1, ne2, ne3], row i holds in ascending order the
+    // cells c that ggml_top_k_mask_ext keeps with a finite mask value, then -1
+    GGML_API struct ggml_tensor * ggml_top_k_cells(
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
             struct ggml_tensor  * top_k,

@@ -760,10 +760,59 @@ struct fattn_widened {
     }
 };
 
+// Cell lists (ggml_flash_attn_ext_set_cells) that the sparse kernel does not take become a mask at the same place:
+// fattn_from_cells holds dst with that mask instead of the lists.
+struct fattn_from_cells {
+    ggml_tensor dst;
+    ggml_tensor mask;
+    size_t      size;
+
+    fattn_from_cells(const ggml_tensor * fa) {
+        const ggml_tensor * cells = fa->src[GGML_FA_SRC_CELLS];
+        dst  = *fa;
+        mask = *cells;
+        mask.view_src = nullptr;
+        mask.type  = GGML_TYPE_F16;
+        mask.ne[0] = fa->src[1]->ne[1];
+        mask.nb[0] = sizeof(half);
+        mask.nb[1] = mask.ne[0]*sizeof(half);
+        mask.nb[2] = mask.nb[1]*mask.ne[1];
+        mask.nb[3] = mask.nb[2]*mask.ne[2];
+        dst.src[3] = &mask;
+        dst.src[GGML_FA_SRC_CELLS] = nullptr;
+        size = GGML_PAD(ggml_nbytes(&mask), 256);
+    }
+};
+
+static __global__ void fattn_cells_to_mask(const int32_t * __restrict__ cells, const int n_list, half * __restrict__ out,
+        const int n_cols) {
+    const int32_t * list = cells + (int64_t) blockIdx.x*n_list;
+    half          * o    = out   + (int64_t) blockIdx.x*n_cols;
+    for (int j = threadIdx.x; j < n_cols; j += blockDim.x) {
+        o[j] = __float2half(-INFINITY);
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < n_list; j += blockDim.x) {
+        const int32_t c = list[j];
+        if (c >= 0 && c < n_cols) {
+            o[c] = __float2half(0.0f);
+        }
+    }
+}
+
+static bool fattn_cells_widened(int device, const ggml_tensor * dst) {
+    return dst->src[GGML_FA_SRC_CELLS] && !ggml_cuda_fattn_sparse_supported(device, dst);
+}
+
 static size_t fattn_stock_alloc_size(int device, const ggml_tensor * dst);
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (fattn_cells_widened(device, dst)) {
+        fattn_from_cells w(dst);
+        return GGML_PAD(fattn_stock_alloc_size(device, &w.dst), 256) + w.size;
+    }
 
     // the paged kernels below read a narrow mask directly
     if (ggml_flash_attn_ext_mask_col0(dst) > 0 &&
@@ -837,6 +886,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_fattn_sync_release(ctx, dst);
         return;
     }
+    if (dst->src[GGML_FA_SRC_CELLS]) {
+        const ggml_tensor * cells = dst->src[GGML_FA_SRC_CELLS];
+        fattn_from_cells w(dst);
+        w.mask.data = (char *) dst->data + GGML_PAD(fattn_stock_alloc_size(ctx.device, &w.dst), 256);
+        GGML_ASSERT(ggml_nrows(cells) <= INT32_MAX && w.mask.ne[0] <= INT32_MAX);
+        fattn_cells_to_mask<<<(unsigned) ggml_nrows(cells), 256, 0, ctx.stream()>>>((const int32_t *) cells->data,
+            (int) cells->ne[0], (half *) w.mask.data, (int) w.mask.ne[0]);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_flash_attn_ext(ctx, &w.dst);
+        return;
+    }
     if (ggml_flash_attn_ext_mask_col0(dst) > 0) {
         GGML_ASSERT(!dst->src[GGML_FA_SRC_PAGES]);
         fattn_widened w(dst);
@@ -869,6 +929,16 @@ bool ggml_cuda_flash_attn_ext_writes_lse(int device, const ggml_tensor * dst) {
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (dst->src[GGML_FA_SRC_CELLS]) {
+        if (ggml_cuda_fattn_sparse_supported(device, dst)) {
+            return true;
+        }
+        if (dst->src[GGML_FA_SRC_PAGES] || dst->src[3]) {
+            return false;
+        }
+        fattn_from_cells w(dst);
+        return ggml_cuda_flash_attn_ext_supported(device, &w.dst);
+    }
     // the sparse K/V set reads the mask's columns as K/V rows
     if (ggml_flash_attn_ext_mask_col0(dst) > 0 && ggml_get_op_params_i32(dst, 4) != 0) {
         return false;

@@ -173,6 +173,12 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_top_k_cells_probe = {
+    /*.op               =*/ LLM_FUSED_OP_TOP_K_CELLS,
+    /*.name             =*/ "top-k cell lists",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -341,6 +347,13 @@ llama_context::llama_context(
     // only the indexer models build this mask, skip the probe for the others
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
+
+    // LLAMA_TOP_K_CELLS=0 keeps the selected mask, for comparison
+    {
+        const char * env = getenv("LLAMA_TOP_K_CELLS");
+        cparams.fused_top_k_cells = env == nullptr || atoi(env) != 0;
+        cparams.auto_ftkc         = cparams.fused_top_k_cells && cparams.auto_ftkm;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -741,6 +754,14 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
         resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
         cparams.auto_ftkm = false;
+    }
+
+    // the lists come from the fused op and are read by flash attention
+    if (cparams.auto_ftkc) {
+        cparams.fused_top_k_cells = cparams.fused_top_k_mask && cparams.flash_attn;
+        LLAMA_LOG_INFO("%s: resolving top-k cell lists support:\n", func);
+        resolve(llm_fused_op_top_k_cells_probe, cparams.fused_top_k_cells);
+        cparams.auto_ftkc = false;
     }
 }
 

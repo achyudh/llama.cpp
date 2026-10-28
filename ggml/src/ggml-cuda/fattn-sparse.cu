@@ -144,6 +144,31 @@ static __global__ void fs_mask_write(
     }
 }
 
+// the length of each cell list (ggml_flash_attn_ext_set_cells): its entries up to the first -1
+__launch_bounds__(256, 1)
+static __global__ void fs_list_count(const int32_t * lists, int32_t * cnt_ptr, const int n_list) {
+    const int32_t * list = lists + (int64_t) blockIdx.x*n_list;
+
+    int c = 0;
+    for (int i = threadIdx.x; i < n_list; i += 256) {
+        c += list[i] >= 0;
+    }
+    c = warp_reduce_sum<WARP_SIZE>(c);
+
+    __shared__ int partial[256/WARP_SIZE];
+    if (threadIdx.x % WARP_SIZE == 0) {
+        partial[threadIdx.x / WARP_SIZE] = c;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int t = 0;
+        for (int w = 0; w < 256/WARP_SIZE; ++w) {
+            t += partial[w];
+        }
+        cnt_ptr[blockIdx.x] = t;
+    }
+}
+
 // a lane's EPL consecutive elements from element e0 of a row (EPL divides 32, so they lie in one quant block), raw:
 // 2-byte loads (Q8_0 / Q4_0 blocks are only 2-byte aligned), dequantized later
 template <ggml_type type, int EPL>
@@ -242,7 +267,7 @@ static __global__ void fs_attend(
         sq[gg][i % (D/2)] = q2;
     }
 
-    const half    * mrow  = mask + (seq % mask_ne3)*s33 + qrow*s31;
+    const half    * mrow  = mask ? mask + (seq % mask_ne3)*s33 + qrow*s31 : nullptr; // none with cell lists
     const int32_t * list  = idx_ptr + ((int64_t) seq*n_q + qrow)*n_kv_max;
     const int       count = cnt_ptr[(int64_t) seq*n_q + qrow];
     const int       per   = (count + n_split - 1)/n_split;
@@ -285,7 +310,7 @@ static __global__ void fs_attend(
                 sv[r][e0 + i] = x[i];
             }
             if (e0 == 0) {
-                smask[r] = __half2float(mrow[c]);
+                smask[r] = mrow ? __half2float(mrow[c]) : 0.0f;
             }
         }
         __syncthreads();
@@ -394,7 +419,7 @@ static __global__ void fs_attend_heads(
         }
     }
 
-    const half    * mrow  = mask + (seq % mask_ne3)*s33 + qrow*s31;
+    const half    * mrow  = mask ? mask + (seq % mask_ne3)*s33 + qrow*s31 : nullptr; // none with cell lists
     const int32_t * list  = idx_ptr + ((int64_t) seq*n_q + qrow)*n_kv_max;
     const int       count = cnt_ptr[(int64_t) seq*n_q + qrow];
 
@@ -420,7 +445,7 @@ static __global__ void fs_attend_heads(
         float mk  = -INFINITY;
         if (lane < nr) {
             c_l = list[rb + lane];
-            mk  = __half2float(mrow[c_l]);
+            mk  = mrow ? __half2float(mrow[c_l]) : 0.0f;
         }
 
         fs_frag<type_K, EPL> fk[R];
@@ -557,7 +582,8 @@ bool ggml_cuda_fattn_sparse_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * cells = dst->src[GGML_FA_SRC_CELLS];
 
     // GGML_CUDA_FATTN_SPARSE=0 selects dense attention for comparison.
     static const bool enabled = [] {
@@ -568,7 +594,7 @@ bool ggml_cuda_fattn_sparse_supported(int device, const ggml_tensor * dst) {
     if (!enabled || !GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[device].warp_size != 32) {
         return false;
     }
-    if (ggml_get_op_params_i32(dst, 4) <= 0 || !mask || dst->src[4] || dst->src[GGML_FA_SRC_PAGES] ||
+    if (ggml_get_op_params_i32(dst, 4) <= 0 || !(mask || cells) || dst->src[4] || dst->src[GGML_FA_SRC_PAGES] ||
             ggml_flash_attn_ext_mask_col0(dst) != 0) {
         return false;
     }
@@ -580,8 +606,12 @@ bool ggml_cuda_fattn_sparse_supported(int device, const ggml_tensor * dst) {
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || Q->nb[0] != sizeof(float)) {
         return false;
     }
-    if (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) || mask->ne[2] != 1 || mask->ne[3] <= 0 || Q->ne[3] % mask->ne[3] != 0 ||
-            mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1]) {
+    if (mask && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) || mask->ne[2] != 1 || mask->ne[3] <= 0 ||
+            Q->ne[3] % mask->ne[3] != 0 || mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1])) {
+        return false;
+    }
+    // ggml_flash_attn_ext_set_cells checked the shape: a list per query, n_kv_max long
+    if (cells && (mask || ggml_get_op_params_i32(dst, 4) != cells->ne[0])) {
         return false;
     }
     if (K->ne[1] <= 0 || K->ne[1] > INT32_MAX - FS_CHUNK || Q->ne[1] <= 0 || Q->ne[2] <= 0 || Q->ne[3] <= 0 ||
@@ -617,23 +647,27 @@ static void fs_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
 
+    // no mask with cell lists
+    const half *  mask_d   = mask ? (const half *) mask->data : nullptr;
+    const int     mask_ne3 = mask ? mask->ne[3] : 1;
+    const int64_t s31      = mask ? mask->nb[1]/sizeof(half) : 0;
+    const int64_t s33      = mask ? mask->nb[3]/sizeof(half) : 0;
+
     const dim3 grid(n_split, K->ne[2], Q->ne[1]*Q->ne[3]);
     if constexpr (G % FS_HPW == 0) {
         if (Q->ne[1] > FS_MAX_Q) {
             GGML_ASSERT(n_split == 1);
             fs_attend_heads<D, G, type_K, type_V><<<grid, (G/FS_HPW)*WARP_SIZE, 0, ctx.stream()>>>(
-                (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data, idx, cnt,
-                (float *) dst->data, scale, Q->ne[1], Q->ne[2], n_kv_max, mask->ne[3],
-                Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-                mask->nb[1]/sizeof(half), mask->nb[3]/sizeof(half));
+                (const char *) Q->data, (const char *) K->data, (const char *) V->data, mask_d, idx, cnt,
+                (float *) dst->data, scale, Q->ne[1], Q->ne[2], n_kv_max, mask_ne3,
+                Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], s31, s33);
             return;
         }
     }
     fs_attend<D, G, type_K, type_V><<<grid, G*WARP_SIZE, 0, ctx.stream()>>>(
-        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data, idx, cnt,
-        parts, meta, (float *) dst->data, scale, Q->ne[1], Q->ne[2], n_kv_max, mask->ne[3],
-        Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-        mask->nb[1]/sizeof(half), mask->nb[3]/sizeof(half));
+        (const char *) Q->data, (const char *) K->data, (const char *) V->data, mask_d, idx, cnt,
+        parts, meta, (float *) dst->data, scale, Q->ne[1], Q->ne[2], n_kv_max, mask_ne3,
+        Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], s31, s33);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
@@ -671,30 +705,41 @@ static void fs_launch_D(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cons
 }
 
 void ggml_cuda_flash_attn_ext_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * cells = dst->src[GGML_FA_SRC_CELLS];
 
     const int D        = Q->ne[0];
     const int n_q      = Q->ne[1];
     const int n_head   = Q->ne[2];
     const int n_seq    = Q->ne[3];
     const int n_rows   = n_q*n_seq;
-    const int n_kv_max = std::min<int64_t>(ggml_get_op_params_i32(dst, 4), K->ne[1]);
+    // the lists' row stride: the compacted mask rows are at most K/V long
+    const int n_kv_max = cells ? cells->ne[0] : std::min<int64_t>(ggml_get_op_params_i32(dst, 4), K->ne[1]);
     const int G        = n_head/K->ne[2];
 
     cudaStream_t stream = ctx.stream();
 
-    const int n_chunks = (mask->ne[0] + FS_CHUNK - 1)/FS_CHUNK;
-    ggml_cuda_pool_alloc<int32_t> idx(ctx.pool(), (size_t) n_rows*n_kv_max);
+    ggml_cuda_pool_alloc<int32_t> idx_alloc(ctx.pool());
     ggml_cuda_pool_alloc<int32_t> cnt(ctx.pool(), n_rows);
-    ggml_cuda_pool_alloc<int32_t> chunk_cnt(ctx.pool(), (size_t) n_rows*n_chunks);
-    {
+    ggml_cuda_pool_alloc<int32_t> chunk_cnt(ctx.pool());
+    const int32_t * idx_ptr;
+    if (cells) {
+        idx_ptr = (const int32_t *) cells->data;
+        fs_list_count<<<n_rows, 256, 0, stream>>>(idx_ptr, cnt.ptr, n_kv_max);
+    } else {
+        const int n_chunks = (mask->ne[0] + FS_CHUNK - 1)/FS_CHUNK;
+        idx_alloc.alloc((size_t) n_rows*n_kv_max);
+        chunk_cnt.alloc((size_t) n_rows*n_chunks);
+        idx_ptr = idx_alloc.ptr;
+
+        int32_t * idx = idx_alloc.ptr;
         const dim3 grid(n_chunks, n_q, n_seq);
         const int64_t s31 = mask->nb[1]/sizeof(half);
         const int64_t s33 = mask->nb[3]/sizeof(half);
         fs_mask_count<<<grid, 256, 0, stream>>>((const half *) mask->data, chunk_cnt.ptr, mask->ne[0], n_q, mask->ne[3], s31, s33);
-        fs_mask_write<<<grid, 256, 0, stream>>>((const half *) mask->data, chunk_cnt.ptr, idx.ptr, cnt.ptr, mask->ne[0], n_q,
+        fs_mask_write<<<grid, 256, 0, stream>>>((const half *) mask->data, chunk_cnt.ptr, idx, cnt.ptr, mask->ne[0], n_q,
             mask->ne[3], s31, s33, n_kv_max);
     }
 
@@ -713,8 +758,8 @@ void ggml_cuda_flash_attn_ext_sparse(ggml_backend_cuda_context & ctx, ggml_tenso
     }
 
     switch (D) {
-        case 128: fs_launch_D<128>(ctx, dst, G, idx.ptr, cnt.ptr, n_kv_max, n_split, parts.ptr, meta.ptr); break;
-        case 256: fs_launch_D<256>(ctx, dst, G, idx.ptr, cnt.ptr, n_kv_max, n_split, parts.ptr, meta.ptr); break;
+        case 128: fs_launch_D<128>(ctx, dst, G, idx_ptr, cnt.ptr, n_kv_max, n_split, parts.ptr, meta.ptr); break;
+        case 256: fs_launch_D<256>(ctx, dst, G, idx_ptr, cnt.ptr, n_kv_max, n_split, parts.ptr, meta.ptr); break;
         default: GGML_ABORT("fatal error");
     }
 

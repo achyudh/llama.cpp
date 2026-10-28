@@ -55,6 +55,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
     LLM_FUSED_OP_TOP_K_MASK,
+    LLM_FUSED_OP_TOP_K_CELLS, // the cell lists and the flash attention that reads them
 };
 
 enum llm_ffn_op_type : int {
@@ -1322,7 +1323,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_cells = nullptr) const; // [n_list, n_tokens/n_stream, 1, n_stream] instead of kq_mask
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1402,6 +1404,16 @@ struct llm_graph_context {
             ggml_tensor * extra,   // [n_extra, n_tokens], can be null
                     int   il,
                 int64_t   n_kv = 0) const;
+
+    // the same selection as ascending cell lists (ggml_top_k_cells) for build_attn_mha's kq_cells
+    ggml_tensor * build_fused_top_k_cells(
+            ggml_tensor * kq_mask,
+            ggml_tensor * top_k,
+            ggml_tensor * score,
+            ggml_tensor * blocks,
+            ggml_tensor * extra,
+                    int   il,
+                int64_t   n_kv) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 

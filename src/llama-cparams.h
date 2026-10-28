@@ -51,6 +51,8 @@ struct llama_cparams {
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
+    bool fused_top_k_cells;  // pass the top-k selection to flash attention as cell lists instead of a mask
+    bool auto_ftkc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

@@ -858,6 +858,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
+    // the same cells as ascending lists for flash attention, once the fused mask is resolved (its probe builds the mask)
+    if (cparams.fused_top_k_mask && cparams.fused_top_k_cells && !cparams.auto_ftkm && cparams.flash_attn) {
+        GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
+
+        ggml_tensor * cells = build_fused_top_k_cells(kq_mask, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs, il, inp_kpool->n_kv);
+        cb(cells, "indexer_cells", il);
+
+        return cells;
+    }
+
     // keep the kq_mask cells of the live picked pools and the tail, -inf elsewhere
     if (cparams.fused_top_k_mask) {
         GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
@@ -963,17 +973,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    // the selection already carries the causal mask, and it comes in the mask layout
+    // the selection already carries the causal mask, and it comes in the mask layout: a mask, or cell lists (I32)
     ggml_tensor * kq_mask = inp->get_kq_mask();
-    GGML_ASSERT(sel->ne[0] == inp->mctx->get_n_kv());
+    const bool cells = sel->type == GGML_TYPE_I32;
+    GGML_ASSERT(cells ? sel->ne[0] == n_sel : sel->ne[0] == inp->mctx->get_n_kv());
     GGML_ASSERT(sel->ne[1] == kq_mask->ne[1] && sel->ne[2] == kq_mask->ne[2] && sel->ne[3] == kq_mask->ne[3]);
-    cb(sel, "kq_mask_qsa", il);
+    cb(sel, cells ? "kq_cells_qsa" : "kq_mask_qsa", il);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    ggml_tensor * cur = cells ?
+        build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, n_sel, kq_scale, il, sel) :
+        build_attn_mha(q, k, v, nullptr, sel,     nullptr, nullptr, n_sel, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
