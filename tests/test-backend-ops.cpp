@@ -8031,6 +8031,51 @@ struct test_top_k : public test_case {
     }
 };
 
+struct test_top_k_repeat_ties : public test_top_k {
+    test_top_k_repeat_ties() : test_top_k(GGML_TYPE_F32, {13376, 64, 1, 1}, 512, true) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "TOP_K";
+    }
+
+    std::string vars() override {
+        return test_top_k::vars() + ",repeat_ties=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        input = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
+        auto checksum = [&]() {
+            return ggml_sum_rows(ctx, ggml_cast(ctx, ggml_top_k(ctx, input, k), GGML_TYPE_F32));
+        };
+        ggml_tensor * first = checksum();
+        ggml_tensor * out = ggml_sqr(ctx, ggml_sub(ctx, checksum(), first));
+        for (int repeat = 0; repeat < 6; ++repeat) {
+            out = ggml_add(ctx, out, ggml_sqr(ctx, ggml_sub(ctx, checksum(), first)));
+        }
+        return out;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double error = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            error += std::abs(a[i]) + std::abs(b[i]);
+        }
+        return error;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::vector<float> values(ne[0], 0.0f);
+        for (int i = 0; i < k - 1; ++i) {
+            values[i] = 2.0f;
+        }
+        values[11317] = values[12499] = 1.0f;
+        for (int64_t row = 0; row < ne[1]; ++row) {
+            ggml_backend_tensor_set(input, values.data(), row*input->nb[1], values.size()*sizeof(float));
+        }
+    }
+};
+
 // top_k over rows like log-probabilities: distinct negative values, fewer
 // than k +inf (none for k = 1, so the expected indices are unique) and many
 // -inf (masked tokens)
@@ -12828,6 +12873,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
+
+    test_cases.emplace_back(new test_top_k_repeat_ties());
 
     // Large-k, including multi-row and ties (qwen4exp)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
