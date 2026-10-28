@@ -13416,6 +13416,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 512));             // Qwen3.8-Flash-Next
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 512, false, true));
 
     for (int64_t n_seq_tokens : { 1, 4, 17 }) {
         for (int commit : { 0, 3, 17 }) {
