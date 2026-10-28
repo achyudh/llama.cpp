@@ -969,6 +969,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_alias_callback callback_alias;
+    void * callback_alias_user_data;
+
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
@@ -992,6 +995,8 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t);
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -1527,8 +1532,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        // a host weight read by the first node of the split may live in a tensor the user provides
+                        struct ggml_tensor * alias = NULL;
+                        if (sched->callback_alias != NULL && sched->n_copies == 1 && i == split->i_start &&
+                                ggml_backend_sched_is_host_weight(src)) {
+                            alias = sched->callback_alias(backend, src, node, sched->callback_alias_user_data);
+                            GGML_ASSERT(alias == NULL || (alias->data != NULL && ggml_are_same_layout(alias, src)));
+                        }
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            if (alias != NULL) {
+                                tensor_copy->view_src  = alias;
+                                tensor_copy->view_offs = 0;
+                                tensor_copy->data      = alias->data;
+                                tensor_copy->buffer    = alias->buffer;
+                            }
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
@@ -2156,6 +2174,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_alias_callback(ggml_backend_sched_t sched, ggml_backend_sched_alias_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_alias = callback;
+    sched->callback_alias_user_data = user_data;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

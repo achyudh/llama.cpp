@@ -326,6 +326,12 @@ extern "C" {
     // `graph` is the compute graph of the split
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // Callback when a split needs a copy of a weight in a host buffer
+    // the user can return a tensor in a buffer of `backend` with the layout of `src` that the copy then aliases: the
+    // copy takes no space in the compute buffer, and the copy callback is still called for it before each compute
+    // `node` is the first node of the split, which reads `src`; the callback is not called with multiple copies
+    typedef struct ggml_tensor * (*ggml_backend_sched_alias_callback)(ggml_backend_t backend, const struct ggml_tensor * src, const struct ggml_tensor * node, void * user_data);
+
     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
     // it happens on the graph allocation path and costs a synchronization of the backends
     // `sched` is the scheduler
@@ -374,6 +380,9 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
+    // Set a callback that can place the copy of a host weight in an existing device tensor
+    GGML_API void                 ggml_backend_sched_set_alias_callback(ggml_backend_sched_t sched, ggml_backend_sched_alias_callback callback, void * user_data);
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);

@@ -779,6 +779,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_alias_callback(sched.get(), sched_alias_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
@@ -2973,6 +2974,21 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+ggml_tensor * llama_context::sched_alias_experts(ggml_backend_t backend, const ggml_tensor * src, const ggml_tensor * node, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    if (!lctx->expert_stream) {
+        return nullptr;
+    }
+    // the same nodes as in sched_copy_experts: an expert matrix multiplication reading src as its bank or scales
+    const bool exl3 = node->op == GGML_OP_MUL_MAT_EXL3;
+    if ((!exl3 && node->op != GGML_OP_MUL_MAT_ID) ||
+        (node->src[0] != src && (!exl3 || (node->src[2] != src && node->src[3] != src)))) {
+        return nullptr;
+    }
+    const ggml_tensor * ids = node->src[exl3 ? 4 : 2];
+    return ids && ggml_nelements(ids) > 0 ? lctx->expert_stream->alias(backend, src, ids->ne[1]) : nullptr;
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
