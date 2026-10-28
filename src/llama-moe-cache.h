@@ -9,8 +9,12 @@
 #include <vector>
 
 struct llama_model;
+struct llama_layer;
 
 bool llama_moe_perf_enabled();
+
+// the expert tensors of a layer and their EXL3 input/output scales: gate, up, down or gate_up, down
+std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_model & model, const llama_layer & layer);
 
 struct llama_moe_perf_data {
     enum metric {

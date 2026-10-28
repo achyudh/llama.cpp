@@ -61,6 +61,22 @@ void llama_moe_perf_data::print(int64_t task, int slot, int phase, int role, int
         ggml_time_us(), task, slot, phase, role, layer, type, total, fields.str().c_str());
 }
 
+// gate, up, down or gate_up, down
+std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_model & model, const llama_layer & layer) {
+    std::vector<ggml_tensor *> res;
+    for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+        if (t != nullptr) {
+            res.push_back(t);
+            const auto it = model.exl3.find(t);
+            if (it != model.exl3.end()) {
+                res.push_back(it->second.suh);
+                res.push_back(it->second.svh);
+            }
+        }
+    }
+    return res;
+}
+
 namespace {
 
 // SLRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
@@ -205,22 +221,6 @@ struct moe_cache_slru {
         return true;
     }
 };
-
-// gate, up, down or gate_up, down
-static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_model & model, const llama_layer & layer) {
-    std::vector<ggml_tensor *> res;
-    for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
-        if (t != nullptr) {
-            res.push_back(t);
-            const auto it = model.exl3.find(t);
-            if (it != model.exl3.end()) {
-                res.push_back(it->second.suh);
-                res.push_back(it->second.svh);
-            }
-        }
-    }
-    return res;
-}
 
 static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, const std::vector<ggml_tensor *> & b) {
     if (a.size() != b.size()) {

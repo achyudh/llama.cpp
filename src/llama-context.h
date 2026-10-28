@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-expert-stream.h"
 #include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
@@ -312,6 +313,8 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    // whole-layer expert uploads for large batches (LLAMA_EXPERT_STREAM=<min tokens>); freed before the backends
+    llama_expert_stream_ptr expert_stream;
     llama_routing_override routing_override;
     bool routing_active = false;
     int64_t moe_perf_task = -1;

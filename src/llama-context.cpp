@@ -574,6 +574,20 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        // experimental: stream the host experts of large batches a layer at a time to the first GPU
+        if (const char * value = std::getenv("LLAMA_EXPERT_STREAM"); value && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            const long long min_tokens = std::atoll(value);
+            if (min_tokens <= 0) {
+                throw std::runtime_error("LLAMA_EXPERT_STREAM must be the smallest batch to stream, in tokens");
+            }
+            for (auto & backend : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    expert_stream = std::make_unique<llama_expert_stream>(model, backend.get(), min_tokens);
+                    break;
+                }
+            }
+        }
+
         // KV streaming: page moves are queued on the stream of the backend that computes the graphs
         if (llama_kv_stream * kv_stream = memory ? memory->get_kv_stream() : nullptr) {
             for (auto & backend : backends) {
@@ -619,6 +633,7 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     perf_moe_flush(true);
+    expert_stream.reset();
 
     if (phase_leader) {
         auto & f = phase_leader->phase_followers;
@@ -2986,6 +3001,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
     if (ggml_nelements(ids) == 0) {
+        return true;
+    }
+
+    // large batches: a device copy of the whole tensor from the layer streamed in while the previous layer computed
+    if (lctx->expert_stream && lctx->expert_stream->copy(backend, src, dst, ids->ne[1])) {
         return true;
     }
 
