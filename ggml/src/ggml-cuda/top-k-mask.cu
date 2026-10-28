@@ -7,7 +7,7 @@
 template <typename T>
 static __global__ void top_k_mask_kernel(
         const T * mask, const int32_t * top_k, const float * score, const int32_t * blocks, const int32_t * extra, T * dst,
-        const int64_t n_kv, const int64_t ne1, const int64_t ne2,
+        const int64_t n_kv, const int64_t n_mask, const int64_t ne1, const int64_t ne2,
         const int64_t m1, const int64_t m2, const int64_t m3,
         const int64_t n_top, const int64_t n_pick, const int64_t n_blk, const int64_t n_extra,
         const int64_t sm1, const int64_t sm2, const int64_t sm3,
@@ -31,6 +31,7 @@ static __global__ void top_k_mask_kernel(
     ggml_cuda_pdl_sync();
 
     const T ninf = ggml_cuda_cast<T>(-INFINITY);
+    const int64_t col0 = n_kv - n_mask;
     if (vec) {
         constexpr int nv = sizeof(int4)/sizeof(T);
         T fill[nv];
@@ -55,7 +56,7 @@ static __global__ void top_k_mask_kernel(
         if (i >= n_top) {
             const int32_t c = extra[(i - n_top)*se0 + i1*se1 + i2*se2 + i3*se3];
             if (c >= 0 && c < n_kv) {
-                dst_row[c] = mask_row[c];
+                dst_row[c] = c < col0 ? ggml_cuda_cast<T>(0.0f) : mask_row[c - col0];
             }
             continue;
         }
@@ -69,14 +70,14 @@ static __global__ void top_k_mask_kernel(
         }
         if (!blocks) {
             if (p < n_kv) {
-                dst_row[p] = mask_row[p];
+                dst_row[p] = p < col0 ? ggml_cuda_cast<T>(0.0f) : mask_row[p - col0];
             }
             continue;
         }
         for (int64_t k = 0; k < n_blk; ++k) {
             const int32_t c = blocks[k*sb0 + p*sb1];
             if (c >= 0 && c < n_kv) {
-                dst_row[c] = mask_row[c];
+                dst_row[c] = c < col0 ? ggml_cuda_cast<T>(0.0f) : mask_row[c - col0];
             }
         }
     }
@@ -90,7 +91,7 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const ggml_tensor * blocks = dst->src[3];
     const ggml_tensor * extra  = dst->src[4];
 
-    const int64_t n_kv = mask->ne[0];
+    const int64_t n_kv = dst->ne[0];
 
     GGML_ASSERT(dst->nb[0] == sizeof(T) && mask->nb[0] == sizeof(T));
     GGML_ASSERT(dst->nb[1] % sizeof(T) == 0 && mask->nb[1] % sizeof(T) == 0);
@@ -115,7 +116,7 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             blocks ? (const int32_t *) blocks->data : nullptr,
             extra  ? (const int32_t *) extra->data  : nullptr,
             (T *) dst->data,
-            n_kv, dst->ne[1], dst->ne[2],
+            n_kv, mask->ne[0], dst->ne[1], dst->ne[2],
             mask->ne[1], mask->ne[2], mask->ne[3],
             top_k->ne[0], n_pick, blocks ? blocks->ne[0] : 1, extra ? extra->ne[0] : 0,
             mask->nb[1]/sizeof(T), mask->nb[2]/sizeof(T), mask->nb[3]/sizeof(T),

@@ -2842,6 +2842,16 @@ extern "C" {
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
 
+    // The mask covers the last mask->ne[0] cells of n_kv; earlier cells have an implicit zero mask.
+    GGML_API struct ggml_tensor * ggml_top_k_mask_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra,
+            int64_t               n_kv);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

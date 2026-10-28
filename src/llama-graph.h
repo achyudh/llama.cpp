@@ -413,6 +413,7 @@ public:
 
     // the attended cells the graph was built for (a compact KQ mask no longer changes with them)
     uint32_t      n_kv          = 0;
+    bool          kq_mask_compact = false;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -1399,7 +1400,8 @@ struct llm_graph_context {
             ggml_tensor * score,   // [n_pick, n_tokens], can be null
             ggml_tensor * blocks,  // [n_blk, n_pick], can be null
             ggml_tensor * extra,   // [n_extra, n_tokens], can be null
-                    int   il) const;
+                    int   il,
+                int64_t   n_kv = 0) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
@@ -1505,7 +1507,7 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool compact_top_k = false) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;

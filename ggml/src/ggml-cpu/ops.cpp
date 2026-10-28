@@ -11927,7 +11927,8 @@ void ggml_compute_forward_top_k_mask(
     GGML_ASSERT(dst->type == mask->type);
     GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
 
-    const int64_t n_kv    = mask->ne[0];
+    const int64_t n_kv    = dst->ne[0];
+    const int64_t col0    = n_kv - mask->ne[0];
     const int64_t ne1     = dst->ne[1];
     const int64_t ne2     = dst->ne[2];
     const int64_t n_rows  = ggml_nrows(dst);
@@ -11963,7 +11964,11 @@ void ggml_compute_forward_top_k_mask(
 
         auto keep = [&](int32_t c) {
             if (c >= 0 && c < n_kv) {
-                memcpy(dst_row + c*ts, mask_row + c*ts, ts);
+                if (c < col0) {
+                    memset(dst_row + c*ts, 0, ts);
+                } else {
+                    memcpy(dst_row + c*ts, mask_row + (c - col0)*ts, ts);
+                }
             }
         };
 

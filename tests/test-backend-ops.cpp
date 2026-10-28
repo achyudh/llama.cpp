@@ -10187,6 +10187,39 @@ struct test_top_k_mask : public test_case {
     }
 };
 
+struct test_top_k_mask_compact : public test_top_k_mask {
+    const int64_t n_mask;
+    const bool reference;
+
+    test_top_k_mask_compact(ggml_type type, int64_t n_mask, bool blocks, bool score, bool reference = true)
+        : test_top_k_mask(type, 257, blocks ? 4 : 0, 65, 16, 3, score, 7, 2, 2), n_mask(n_mask), reference(reference) {}
+
+    std::string op_desc(ggml_tensor *) override { return "TOP_K_MASK"; }
+    std::string vars() override { return test_top_k_mask::vars() + ",n_mask=" + std::to_string(n_mask) + ",reference=" + std::to_string(reference); }
+    bool run_whole_graph() override { return reference; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * full = test_top_k_mask::build_graph(ctx);
+        auto * mask = full->src[0];
+        auto * compact = ggml_cont(ctx, ggml_view_4d(ctx, mask, n_mask, mask->ne[1], mask->ne[2], mask->ne[3],
+            mask->nb[1], mask->nb[2], mask->nb[3], (n_kv - n_mask)*mask->nb[0]));
+        auto * padded = ggml_pad_ext(ctx, ggml_cast(ctx, compact, GGML_TYPE_F32), n_kv - n_mask, 0, 0, 0, 0, 0, 0, 0);
+        padded = ggml_cast(ctx, padded, type);
+        auto * expected = ggml_top_k_mask(ctx, padded, full->src[1], full->src[2], full->src[3], full->src[4]);
+        auto * result = ggml_top_k_mask_ext(ctx, compact, full->src[1], full->src[2], full->src[3], full->src[4], n_kv);
+        return reference ? ggml_concat(ctx, expected, result, 3) : result;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        for (size_t i = 0; reference && i < n / 2; ++i) {
+            if (a[i] != a[i + n / 2] || b[i] != b[i + n / 2]) {
+                return INFINITY;
+            }
+        }
+        return test_top_k_mask::err(a, b, n);
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -11063,6 +11096,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
+        test_cases.emplace_back(new test_top_k_mask_compact(type, 37, true, true, false));
+        for (int64_t n_mask : {1, 37, 257}) {
+            for (bool blocks : {false, true}) {
+                for (bool score : {false, true}) {
+                    test_cases.emplace_back(new test_top_k_mask_compact(type, n_mask, blocks, score));
+                }
+            }
+        }
         test_cases.emplace_back(new test_top_k_mask(type));
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7));
         test_cases.emplace_back(new test_top_k_mask(type, 256, 4, 64, 64, 0, true, 33));

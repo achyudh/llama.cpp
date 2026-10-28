@@ -447,7 +447,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto * inp = build_inp_mem_hybrid();
+    auto * inp = build_inp_mem_hybrid(cparams.fused_top_k_mask);
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
@@ -605,7 +605,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
-    auto * inp_hyb = build_inp_mem_hybrid();
+    auto * inp_hyb = build_inp_mem_hybrid(cparams.fused_top_k_mask);
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
 
     // the draft memory has no recurrent layer, but its input still has to be allocated
@@ -862,7 +862,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     if (cparams.fused_top_k_mask) {
         GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
 
-        ggml_tensor * sel = build_fused_top_k_mask(kq_mask, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs, il);
+        ggml_tensor * sel = build_fused_top_k_mask(kq_mask, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs, il, inp_kpool->n_kv);
         cb(sel, "indexer_sel", il);
 
         return sel;
@@ -965,7 +965,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the selection already carries the causal mask, and it comes in the mask layout
     ggml_tensor * kq_mask = inp->get_kq_mask();
-    GGML_ASSERT(ggml_are_same_shape(sel, kq_mask));
+    GGML_ASSERT(sel->ne[0] == inp->mctx->get_n_kv());
+    GGML_ASSERT(sel->ne[1] == kq_mask->ne[1] && sel->ne[2] == kq_mask->ne[2] && sel->ne[3] == kq_mask->ne[3]);
     cb(sel, "kq_mask_qsa", il);
 
     ggml_tensor * q = q_cur;

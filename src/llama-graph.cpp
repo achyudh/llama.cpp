@@ -27,9 +27,7 @@
 
 // dedup helpers
 
-// compact: the mask may cover only the last cells (llama_kv_cache::get_n_kv_mask); only for masks that only flash
-// attention reads
-// a lightning indexer's top-k mask (ggml_top_k_mask, QSA) reads the mask cell by cell, so it needs all of them
+// Indexers opt in separately when their selection op accepts the compact causal mask.
 static bool kq_mask_can_compact(const llama_hparams & hparams) {
     return hparams.indexer_top_k == 0;
 }
@@ -656,7 +654,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams, kq_mask_can_compact(hparams));
+    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams, kq_mask_compact);
     res &= n_kv == mctx->get_n_kv();
 
     res &= can_reuse_kv_stream(this, mctx);
@@ -1284,7 +1282,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams,
-                             kq_mask_can_compact(inp_attn->hparams));
+                             inp_attn->kq_mask_compact);
     res &= inp_attn->n_kv == mctx->get_attn()->get_n_kv();
 
     res &= can_reuse_kv_stream(inp_attn.get(), mctx->get_attn());
@@ -3330,7 +3328,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+                          bool compact_top_k = false) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3340,7 +3339,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, kq_mask_can_compact(hparams));
+        inp->kq_mask_compact = kq_mask_can_compact(hparams) || compact_top_k;
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, inp->kq_mask_compact);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
         inp->n_kv = mctx_cur->get_n_kv();
     }
@@ -3572,7 +3572,8 @@ ggml_tensor * llm_graph_context::build_fused_top_k_mask(
         ggml_tensor * score,
         ggml_tensor * blocks,
         ggml_tensor * extra,
-                int   il) const {
+                int   il,
+            int64_t   n_kv) const {
     const int64_t m1 = kq_mask->ne[1];
     const int64_t m2 = kq_mask->ne[2];
     const int64_t m3 = kq_mask->ne[3];
@@ -3581,7 +3582,7 @@ ggml_tensor * llm_graph_context::build_fused_top_k_mask(
         return t ? ggml_reshape_4d(ctx0, t, t->ne[0], m1, m2, m3) : nullptr;
     };
 
-    ggml_tensor * cur = ggml_top_k_mask(ctx0, kq_mask, rows(top_k), rows(score), blocks, rows(extra));
+    ggml_tensor * cur = ggml_top_k_mask_ext(ctx0, kq_mask, rows(top_k), rows(score), blocks, rows(extra), n_kv ? n_kv : kq_mask->ne[0]);
     res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, cur, il});
 
     return cur;
@@ -4233,11 +4234,11 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
     );
 }
 
-llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid(bool compact_top_k) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), compact_top_k);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
