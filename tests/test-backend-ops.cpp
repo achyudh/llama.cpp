@@ -6238,19 +6238,25 @@ struct test_mul_mat_exl3 : public test_case {
     const int rows;
     const bool routed;
     const int n;
+    const int k;
 
-    test_mul_mat_exl3(int bits_x2, int rows, bool routed, int n = 256) : bits_x2(bits_x2), rows(rows), routed(routed), n(n) {}
+    test_mul_mat_exl3(int bits_x2, int rows, bool routed, int n = 256, int k = 128) : bits_x2(bits_x2), rows(rows), routed(routed), n(n), k(k) {}
 
     std::string vars() override {
-        return VARS_TO_STR4(bits_x2, rows, routed, n);
+        return VARS_TO_STR5(bits_x2, rows, routed, n, k);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2ull * k * n * rows * (routed ? 4 : 1);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int experts = routed ? 2 : 1;
-        auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 128 / 16 * (n / 16) * 8 * bits_x2, 1, experts);
-        auto * su = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 128, experts);
+        auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, (int64_t) (k / 16) * (n / 16) * 8 * bits_x2, 1, experts);
+        auto * su = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, experts);
         auto * sv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, experts);
-        auto * x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 1, rows) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, rows);
+        auto * x = routed ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, rows) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, rows);
         auto * ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, rows) : nullptr;
         if (ids) { ggml_set_name(ids, "exl3_test_ids"); }
         return ggml_mul_mat_exl3(ctx, p, su, sv, x, ids, bits_x2);
@@ -13425,6 +13431,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // EXL3 projections of a 2560-wide MoE: one expert's gate/up and down, and 256 experts' gate as one matrix
+    for (int bits_x2 : {7, 8}) {
+        for (int rows : {1, 8}) {
+            test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, false, 640, 2560));
+            test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, false, 2560, 640));
+            test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, false, 640*256, 2560));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
