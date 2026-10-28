@@ -1395,7 +1395,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // a copy of the view itself, which the CUDA backend writes together with the conv's input (gdn-conv.cu)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
@@ -1470,13 +1471,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             model.layers[il].ple_norm_conv);
     normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
 
-    // depthwise causal conv, dilated by the n-gram size, as a sum of shifted copies
-    // ggml_conv_1d_dw is documented as unreliable:
+    // depthwise causal conv, dilated by the n-gram size:
     //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
     // The history of the earlier ubatches is prepended, so a chunked prefill matches a single-shot one.
     const int64_t kern = hparams.ple_conv_kernel;
     const int64_t dil  = hparams.ple_ngram_size;
     const int64_t hist = (kern - 1) * dil;
+
+    // the [kern, hc_dim] kernel keeps the file type, so cast it before it multiplies an f32 activation; the cast goes
+    // before the conv's input, where the CUDA backend can run the conv
+    ggml_tensor * conv_w = model.layers[il].ple_conv1d;
+    if (conv_w->type != GGML_TYPE_F32) {
+        conv_w = ggml_cast(ctx0, conv_w, GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, conv_w);
+    }
 
     // the conv history is per sequence, so the input carries the sequence axis too
     const int64_t n_seqs       = ubatch.n_seqs;
@@ -1487,34 +1495,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
             hist, hc_dim, il);
 
-    ggml_tensor * conv_out = nullptr;
-    for (int64_t k = 0; k < kern; ++k) {
-        // tap k reads (kern-1-k)*dilation positions back
-        const int64_t start = hist - (kern - 1 - k) * dil;
-
-        ggml_tensor * shifted = ggml_cont(ctx0,
-                ggml_transpose(ctx0,
-                        ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
-                                padded->nb[1], padded->nb[2],
-                                ggml_row_size(padded->type, start))));
-
-        // column k of the [kern, hc_dim] kernel is one weight per channel
-        ggml_tensor * wk = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
-                        model.layers[il].ple_conv1d->nb[1],
-                        k * model.layers[il].ple_conv1d->nb[0]));
-        // this kernel keeps the file type, so cast it before it multiplies an f32 activation
-        wk = ggml_reshape_1d(ctx0, wk, hc_dim);
-        if (wk->type != GGML_TYPE_F32) {
-            wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
-        }
-
-        ggml_tensor * term = ggml_mul(ctx0, shifted, wk);
-        conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
-    }
-
+    // [hc_dim, n_seq_tokens, n_seqs]: tap k of token t reads padded token t + k*dilation
+    ggml_tensor * conv_out = ggml_ssm_conv_dilated(ctx0, padded, conv_w, (int) dil);
     conv_out = ggml_silu(ctx0, conv_out);
-    conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
+    conv_out = ggml_reshape_3d(ctx0, conv_out, n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
     ggml_tensor * out = ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
