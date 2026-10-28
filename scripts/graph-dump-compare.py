@@ -33,14 +33,22 @@ class Record(dict):
         if key != 'data':
             raise KeyError(key)
         fd = self['fd']
-        raw = os.pread(fd, self['n_bytes'], self['offset'])
-        if hasattr(os, 'posix_fadvise'):
-            os.posix_fadvise(fd, self['offset'], self['n_bytes'], os.POSIX_FADV_DONTNEED)
+        raw = bytearray(self['n_bytes'])
+        offset = 0
+        while offset < len(raw):
+            chunk = os.pread(fd, min(8 * 1024 * 1024, len(raw) - offset), self['offset'] + offset)
+            if not chunk:
+                raise EOFError(f'{self["name"]}: expected {len(raw)} bytes, read {offset}')
+            raw[offset:offset + len(chunk)] = chunk
+            if hasattr(os, 'posix_fadvise'):
+                os.posix_fadvise(fd, self['offset'] + offset, len(chunk), os.POSIX_FADV_DONTNEED)
+            offset += len(chunk)
         return np.frombuffer(raw, dtype='<f4' if self['type'] == GGML_TYPE_F32 else '<i4')
 
 
 def load(path):
     with open(path, 'rb') as f:
+        file_size = os.fstat(f.fileno()).st_size
         if f.read(8) != b'LGDUMP\0\1':
             sys.exit(f'{path}: not a graph dump')
         version, dump_pass, n_tokens = struct.unpack('<III', f.read(12))
@@ -54,6 +62,8 @@ def load(path):
             typ, op = struct.unpack('<II', f.read(8))
             ne = struct.unpack('<4q', f.read(32))
             n_bytes, = struct.unpack('<Q', f.read(8))
+            if n_bytes > file_size - f.tell():
+                raise EOFError(f'{path}: truncated tensor {name}, expected {n_bytes} bytes')
             if typ not in (GGML_TYPE_F32, GGML_TYPE_I32):
                 sys.exit(f'{path}: unsupported type {typ} for {name}')
             records.append(Record(key=(name, seen[name]), name=name, type=typ, op=op, ne=ne, n_bytes=n_bytes,
