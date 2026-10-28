@@ -138,6 +138,7 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+    size_t size_released = 0; // weights copied out of the mappings whose pages were released
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -255,6 +256,10 @@ struct llama_model_loader {
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;
+
+    // unmap a weight copied out of its mapping and drop its pages from the page cache, which the host weights that stay
+    // mapped and the lazily read ones need more
+    void release_weight_pages(const llama_tensor_weight & w) const;
 
     // read a byte range of a weight's data
     // with mmap, returns a pointer into the mapping, otherwise reads into buf and returns buf

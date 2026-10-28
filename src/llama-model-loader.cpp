@@ -15,6 +15,10 @@
 #include <regex>
 #include <unordered_set>
 
+#ifdef __linux__
+#include <fcntl.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1545,6 +1549,14 @@ void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
     mappings.at(w.idx)->unmap_fragment(w.offs, w.offs + ggml_nbytes(w.tensor));
 }
 
+void llama_model_loader::release_weight_pages(const llama_tensor_weight & w) const {
+    unmap_weight(w);
+#ifdef __linux__
+    // only the pages no process maps are dropped: those the tensor shares with its mapped neighbours stay
+    posix_fadvise(files.at(w.idx)->file_id(), w.offs, ggml_nbytes(w.tensor), POSIX_FADV_DONTNEED);
+#endif
+}
+
 const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const {
     GGML_ASSERT(offs + size <= ggml_nbytes(w.tensor));
 
@@ -1750,6 +1762,13 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                // the data now lives in the tensor's own buffer (a device's, or a repacked host one): with 60 GB of
+                // host experts in 64 GB of RAM, the cached pages of these weights would push experts and lazily read
+                // rows out of the page cache
+                if (use_mmap && !check_tensors && !lmlocks && !lazy.has(cur)) {
+                    release_weight_pages(*weight);
+                    size_released += n_size;
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1857,6 +1876,10 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        if (size_released > 0) {
+            LLAMA_LOG_INFO("%s: released the page cache of %.2f MiB of weights copied out of the mappings\n", __func__,
+                size_released / 1024.0 / 1024.0);
+        }
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
