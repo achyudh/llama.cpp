@@ -2806,6 +2806,21 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
+// the batch of a matrix multiplication: the rows of each of its matrix products (tokens for the weights of a model)
+static int64_t ggml_cuda_graph_mul_mat_rows(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_MUL_MAT:      return node->src[1]->ne[1];
+        case GGML_OP_MUL_MAT_ID:   return node->src[1]->ne[2];
+        case GGML_OP_MUL_MAT_EXL3: return node->src[4] ? node->ne[2] : node->ne[1];
+        default:                   return 0;
+    }
+}
+
+// Above this batch the kernels are long enough that replaying a graph saves little, while capturing and instantiating
+// one, the second time a graph repeats, holds the host back for a whole batch (a prefill ubatch of a MoE model with
+// streamed experts is split into a graph per expert group): such graphs run without CUDA graphs.
+static constexpr int64_t GGML_CUDA_GRAPH_MAX_ROWS = 512;
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -2816,6 +2831,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        if (ggml_cuda_graph_mul_mat_rows(node) > GGML_CUDA_GRAPH_MAX_ROWS) {
+            use_cuda_graph = false;
+            if (ggml_cuda_graph_debug_enabled()) {
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to a batch of more than %" PRId64 " rows\n", __func__,
+                               GGML_CUDA_GRAPH_MAX_ROWS);
+            }
         }
 
         // paged attention split by page runs reads the runs on the host when it is launched
