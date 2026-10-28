@@ -3,7 +3,8 @@
 #include "ggml-exl3.h"
 
 #define EXL3_ROUTE_BLOCK       256 // assignments per block of the routing sort
-#define EXL3_ROUTE_MAX_EXPERTS 1024
+#define EXL3_ROUTE_MAX_EXPERTS 16384 // the histogram's LDS: a routed op on a MoE cache bank has one per slot
+#define EXL3_ROUTE_THREADS     1024
 
 bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
 #ifdef GGML_USE_HIP
@@ -20,7 +21,7 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
         return false;
     }
     // Banks above 8 rows go through an FP16 GEMM whose input copy is bounded (a transform block row per 4 rows); a
-    // routed one plans its chunks in one block with a thread per expert.
+    // routed one counts its experts in LDS.
     if (rows > 8) {
         return assignments <= 4 * 65535 && assignments * k <= 256 * 1024 * 1024 &&
             (!op->src[4] || op->src[0]->ne[2] <= EXL3_ROUTE_MAX_EXPERTS);
@@ -368,24 +369,25 @@ static __device__ int exl3_block_scan(int v, int * tmp, int & total) {
     return below + x - v;
 }
 
-// One block, a thread per expert. The chunks are groups of max_experts used experts, as the decoded weights of one
-// chunk have to fit; a group with more than chunk_tiles tiles is split into chunks of chunk_tiles tiles, so that the
-// rotated rows of a chunk fit (its first and last experts can then be in two chunks). The chunks after the last are
-// empty, so that the host can launch a bound of them.
+// One block; each thread takes a contiguous range of the experts (a MoE cache bank has thousands of slots) and of the
+// groups. The chunks are groups of max_experts used experts, as the decoded weights of one chunk have to fit; a group
+// with more than chunk_tiles tiles is split into chunks of chunk_tiles tiles, so that the rotated rows of a chunk fit
+// (its first and last experts can then be in two chunks). The chunks after the last are empty, so that the host can
+// launch a bound of them.
 template<int BM>
-__launch_bounds__(EXL3_ROUTE_MAX_EXPERTS)
-static __global__ void exl3_route_plan(int32_t * block_count, int n_blocks, int32_t * offset, int32_t * used_experts,
-                                       ggml_cuda_routed_chunk * chunks, int4 * tiles, int experts, int max_experts,
-                                       int chunk_tiles, int max_chunks) {
+__launch_bounds__(EXL3_ROUTE_THREADS)
+static __global__ void exl3_route_plan(int32_t * block_count, int n_blocks, int32_t * offset, int32_t * tile_start,
+                                       int32_t * used_experts, int32_t * group_chunk, ggml_cuda_routed_chunk * chunks,
+                                       int4 * tiles, int experts, int max_experts, int chunk_tiles, int max_chunks) {
     __shared__ int tmp[32];
-    __shared__ int s_offset[EXL3_ROUTE_MAX_EXPERTS], s_tile[EXL3_ROUTE_MAX_EXPERTS], s_used[EXL3_ROUTE_MAX_EXPERTS];
-    __shared__ int s_chunk[EXL3_ROUTE_MAX_EXPERTS];
-    const int e = threadIdx.x;
+    const int per = (experts + blockDim.x - 1) / blockDim.x;
+    const int e0 = min(experts, int(threadIdx.x) * per), e1 = min(experts, e0 + per);
 
-    // the expert's rows in the blocks before each block, a batch of loads at a time
-    int rows = 0;
-    if (e < experts) {
+    // the expert's rows in the blocks before each block, a batch of loads at a time; its total in offset for now
+    int rows_sum = 0, tiles_sum = 0, used_sum = 0;
+    for (int e = e0; e < e1; ++e) {
         constexpr int BATCH = 16;
+        int rows = 0;
         for (int b0 = 0; b0 < n_blocks; b0 += BATCH) {
             int v[BATCH];
 #pragma unroll
@@ -400,72 +402,83 @@ static __global__ void exl3_route_plan(int32_t * block_count, int n_blocks, int3
                 }
             }
         }
+        offset[e] = rows;
+        rows_sum  += rows;
+        tiles_sum += (rows + BM - 1) / BM;
+        used_sum  += rows > 0;
     }
-    const int n_tiles = (rows + BM - 1) / BM;
     int total_rows, total_tiles, n_used;
-    const int row0  = exl3_block_scan(rows, tmp, total_rows);
-    const int tile0 = exl3_block_scan(n_tiles, tmp, total_tiles);
-    const int used  = exl3_block_scan(rows > 0, tmp, n_used);
-    if (e < experts) {
-        offset[e]   = row0;
-        s_offset[e] = row0;
-        s_tile[e]   = tile0;
+    const int row_base  = exl3_block_scan(rows_sum, tmp, total_rows);
+    const int tile_base = exl3_block_scan(tiles_sum, tmp, total_tiles);
+    const int used_base = exl3_block_scan(used_sum, tmp, n_used);
+    for (int e = e0, row = row_base, tile = tile_base, used = used_base; e < e1; ++e) {
+        const int rows = offset[e];
+        offset[e]     = row;
+        tile_start[e] = tile;
         if (rows > 0) {
-            used_experts[used] = e;
-            s_used[used] = e;
+            used_experts[used++] = e;
         }
+        row  += rows;
+        tile += (rows + BM - 1) / BM;
     }
-    if (e == 0) {
-        offset[experts] = total_rows;
+    if (threadIdx.x == 0) {
+        offset[experts]     = total_rows;
+        tile_start[experts] = total_tiles;
     }
     __syncthreads();
 
     // chunks: group g of used experts, split by tiles
     const int n_groups = (n_used + max_experts - 1) / max_experts;
-    const int g = e;
-    int g_tile0 = 0, g_tiles = 0;
-    if (g < n_groups) {
-        g_tile0 = s_tile[s_used[g * max_experts]];
-        g_tiles = ((g + 1) * max_experts < n_used ? s_tile[s_used[(g + 1) * max_experts]] : total_tiles) - g_tile0;
+    const int gper = (n_groups + blockDim.x - 1) / blockDim.x;
+    const int g0 = min(n_groups, int(threadIdx.x) * gper), g1 = min(n_groups, g0 + gper);
+    auto group_tile0 = [&](int g) { return g * max_experts < n_used ? tile_start[used_experts[g * max_experts]] : total_tiles; };
+    int split_sum = 0;
+    for (int g = g0; g < g1; ++g) {
+        split_sum += (group_tile0(g + 1) - group_tile0(g) + chunk_tiles - 1) / chunk_tiles;
     }
-    const int n_split = (g_tiles + chunk_tiles - 1) / chunk_tiles;
     int n_chunks;
-    const int g_chunk0 = exl3_block_scan(n_split, tmp, n_chunks);
+    int chunk = exl3_block_scan(split_sum, tmp, n_chunks);
     if (n_chunks > max_chunks) {
         __builtin_trap();
     }
-    if (g < n_groups) {
-        s_chunk[g] = g_chunk0;
+    for (int g = g0; g < g1; ++g) {
+        group_chunk[g] = chunk;
         // the used experts of the group, in order, own its tiles; tile t belongs to the last expert starting at or before it
         const int u0 = g * max_experts, u1 = min(n_used, u0 + max_experts);
-        for (int j = 0; j < n_split; ++j) {
-            const int t0 = g_tile0 + j * chunk_tiles, t1 = min(g_tile0 + g_tiles, t0 + chunk_tiles);
+        const int g_t0 = group_tile0(g), g_t1 = group_tile0(g + 1);
+        for (int t0 = g_t0; t0 < g_t1; t0 += chunk_tiles) {
+            const int t1 = min(g_t1, t0 + chunk_tiles);
             int uf = u0, ul = u0;
             for (int u = u0; u < u1; ++u) {
-                const int tu = s_tile[s_used[u]];
+                const int tu = tile_start[used_experts[u]];
                 uf = tu <= t0     ? u : uf;
                 ul = tu <= t1 - 1 ? u : ul;
             }
-            const int ef = s_used[uf], el = s_used[ul];
-            const int r0 = s_offset[ef] + (t0 - s_tile[ef]) * BM;
-            const int r1 = min(s_offset[el] + (t1 - s_tile[el]) * BM, ul + 1 < n_used ? s_offset[s_used[ul + 1]] : total_rows);
-            chunks[g_chunk0 + j] = { r0, r1 - r0, t0, t1 - t0, uf, ul - uf + 1 };
+            const int ef = used_experts[uf], el = used_experts[ul];
+            const int r0 = offset[ef] + (t0 - tile_start[ef]) * BM;
+            const int r1 = min(offset[el] + (t1 - tile_start[el]) * BM, offset[el + 1]);
+            chunks[chunk++] = { r0, r1 - r0, t0, t1 - t0, uf, ul - uf + 1 };
         }
     }
-    for (int c = n_chunks + e; c < max_chunks; c += blockDim.x) {
+    for (int c = n_chunks + threadIdx.x; c < max_chunks; c += blockDim.x) {
         chunks[c] = {};
     }
     __syncthreads();
 
     // the tiles of each used expert, relative to their chunk
-    if (e < experts && rows > 0) {
-        const int grp = used / max_experts;
-        const int g0  = s_tile[s_used[grp * max_experts]];
-        for (int j = 0; j < n_tiles; ++j) {
-            const int t = tile0 + j;
-            const ggml_cuda_routed_chunk & c = chunks[s_chunk[grp] + (t - g0) / chunk_tiles];
-            tiles[t] = make_int4(row0 + j * BM - c.row0, min(BM, rows - j * BM), used - c.expert0, e);
+    for (int e = e0, used = used_base; e < e1; ++e) {
+        const int rows = offset[e + 1] - offset[e];
+        if (rows == 0) {
+            continue;
         }
+        const int grp = used / max_experts;
+        const int g_t0 = group_tile0(grp);
+        for (int j = 0; j < (rows + BM - 1) / BM; ++j) {
+            const int t = tile_start[e] + j;
+            const ggml_cuda_routed_chunk & c = chunks[group_chunk[grp] + (t - g_t0) / chunk_tiles];
+            tiles[t] = make_int4(offset[e] + j * BM - c.row0, min(BM, rows - j * BM), used - c.expert0, e);
+        }
+        used++;
     }
 }
 
@@ -511,9 +524,13 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int max_chunks  = (max_used + chunk_experts - 1) / chunk_experts + max_tiles / chunk_tiles;
     const int n_blocks    = (assignments + EXL3_ROUTE_BLOCK - 1) / EXL3_ROUTE_BLOCK;
 
-    // workspace: block counts, offsets, sorted assignments, used experts, then 16-byte aligned chunks and tiles
-    const size_t o_offset = size_t(n_blocks) * experts, o_perm = o_offset + experts + 1, o_used = o_perm + assignments;
-    const size_t o_chunks = (o_used + experts + 3) / 4 * 4;
+    const int max_groups  = (max_used + chunk_experts - 1) / chunk_experts;
+
+    // workspace: block counts, offsets, tile starts, sorted assignments, used experts, the groups' first chunks, then
+    // 16-byte aligned chunks and tiles
+    const size_t o_offset = size_t(n_blocks) * experts, o_tile_start = o_offset + experts + 1;
+    const size_t o_perm = o_tile_start + experts + 1, o_used = o_perm + assignments, o_group = o_used + experts;
+    const size_t o_chunks = (o_group + max_groups + 3) / 4 * 4;
     const size_t o_tiles = o_chunks + size_t(max_chunks) * sizeof(ggml_cuda_routed_chunk) / sizeof(int32_t);
     ggml_cuda_pool_alloc<int32_t> ws(ctx.pool(), o_tiles + size_t(max_tiles) * 4);
     const int32_t * ids = (const int32_t *) dst->src[4]->data;
@@ -522,8 +539,9 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     exl3_route_hist<<<n_blocks, EXL3_ROUTE_BLOCK, experts * sizeof(int32_t), stream>>>(ids, ws.get(), (uint32_t *) dst->data,
                                                                                          assignments, experts, n);
-    exl3_route_plan<BM><<<1, (experts + 31) / 32 * 32, 0, stream>>>(ws.get(), n_blocks, ws.get() + o_offset, ws.get() + o_used,
-                                                                    chunks, tiles, experts, chunk_experts, chunk_tiles, max_chunks);
+    exl3_route_plan<BM><<<1, EXL3_ROUTE_THREADS, 0, stream>>>(ws.get(), n_blocks, ws.get() + o_offset, ws.get() + o_tile_start,
+                                                              ws.get() + o_used, ws.get() + o_group, chunks, tiles, experts,
+                                                              chunk_experts, chunk_tiles, max_chunks);
     exl3_route_place<<<n_blocks, EXL3_ROUTE_BLOCK, 0, stream>>>(ids, ws.get(), ws.get() + o_offset, ws.get() + o_perm,
                                                                  assignments, experts);
 

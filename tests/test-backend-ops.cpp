@@ -10853,6 +10853,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, true, 2560, 640, 32, 10, 10));
     }
     test_cases.emplace_back(new test_mul_mat_exl3(8, 64, true));
+    // a MoE cache bank as the routed bank: thousands of slots (the routing plan's threads take several experts each)
+    test_cases.emplace_back(new test_mul_mat_exl3(8, 16, true, 256, 128, 3000, 10, 1));
+    test_cases.emplace_back(new test_mul_mat_exl3(8, 300, true, 256, 128, 3000, 10, 10));
     // F16 weights with 64 or more rows on RDNA4 (the EXL3 WMMA GEMM with a plain epilogue): outputs that are not a
     // multiple of 128 and partial row blocks
     for (int64_t n : {64, 129, 300}) {
