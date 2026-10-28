@@ -4,50 +4,56 @@
 #include <algorithm>
 #include <cstdlib>
 
+// The conv has 4 taps, D apart (its dilation: 1 for the linear-attention conv, 3 for the PLE conv of Qwen4Exp), so its
+// state holds H = 3 D columns.
 struct gdn_conv_match {
     int                 conv_idx = -1;
     const ggml_tensor * x        = nullptr; // [C, T] F32 contiguous, the root of the transposed view
-    const ggml_tensor * state    = nullptr; // [3, C] F32: column j of channel c at j * st_j + c * st_c
-    const ggml_tensor * concat   = nullptr; // [T + 3, C] F32 contiguous
+    const ggml_tensor * state    = nullptr; // [H, C] F32: column j of channel c at j * st_j + c * st_c
+    const ggml_tensor * concat   = nullptr; // [T + H, C] F32 contiguous
     const ggml_tensor * w        = nullptr; // [4, C] F32 contiguous
     ggml_tensor *       out      = nullptr; // the silu node
     int64_t C = 0, T = 0;
-    int     st_j = 1, st_c = 3;  // the state's strides in floats (3 and 1: contiguous; ReplaySSM: a transposed window)
+    int     H = 3, D = 1;
+    int     st_j = 1, st_c = 3;  // the state's strides in floats (H and 1: contiguous; ReplaySSM: a transposed window)
     bool    in_place = false; // the conv output is x's memory
+    bool    staged   = false; // the conv output overlaps x otherwise: the kernel writes the concat, then it is copied
 };
+
+#define GDN_CONV_MAX_H 9
 
 static bool gdn_conv_enabled() {
     static const bool enabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") == nullptr;
     return enabled;
 }
 
-// In place (y is x's memory) the tiles over t would race: tile k reads the 3 rows of x before t0 that tile k - 1 writes.
-// So those rows are first saved per tile into concat columns [3k, 3k + 3) (nothing reads the concat when the conv runs
-// this way), and each tile reads its window's first 3 columns from there: halo[c * row_stride + 3k + r] holds x row
-// t0 - 3 + r.
+// In place (y is x's memory) the tiles over t would race: tile k reads the H rows of x before t0 that tile k - 1 writes.
+// So those rows are first saved per tile into concat columns [Hk, Hk + H) (nothing reads the concat when the conv runs
+// this way), and each tile reads its window's first H columns from there: halo[c * row_stride + Hk + r] holds x row
+// t0 - H + r.
 static __global__ void gdn_conv_save_halo(const float * __restrict__ x, float * __restrict__ halo, const int C, const int T,
-                                          const int tt, const int ntiles, const int row_stride) {
+                                          const int H, const int tt, const int ntiles, const int row_stride) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int k = blockIdx.y + 1; // tile 0 starts from the state
     if (c >= C || k >= ntiles) {
         return;
     }
     const int t0 = k * tt;
-#pragma unroll
-    for (int r = 0; r < 3; ++r) {
-        halo[(size_t) c * row_stride + 3 * k + r] = x[(size_t) (t0 - 3 + r) * C + c];
+    for (int r = 0; r < H; ++r) {
+        halo[(size_t) c * row_stride + H * k + r] = x[(size_t) (t0 - H + r) * C + c];
     }
 }
 
-// y[t, c] = silu(sum_j concat[c, t + j] * w[c, j]) with the concat read from the state, x and (in place) the saved
-// halos. A block covers BS channels and tt steps; within its tile a thread reads row t + 1 before writing row t of its
-// own column, so y may be x.
-template <int BS>
+// y[t, c] = silu(sum_j concat[c, t + j D] * w[c, j]) with the concat read from the state, x and (in place) the saved
+// halos. A block covers BS channels and tt steps; a thread keeps its column's window of H + 1 concat columns in
+// registers and, within its tile, reads row t + 1 before writing row t of its own column, so y may be x.
+template <int BS, int D>
 static __global__ void __launch_bounds__(BS) gdn_conv_direct(const float * __restrict__ state, const int st_j,
                                                             const int st_c, const float * x,
                                                             const float * __restrict__ halo, const int halo_stride,
                                                             const float * __restrict__ w, float * y,
                                                             const int C, const int T, const int tt, const float b) {
+    constexpr int H = 3 * D;
     const int c  = blockIdx.x * BS + threadIdx.x;
     const int k  = blockIdx.y;
     const int t0 = k * tt;
@@ -59,16 +65,16 @@ static __global__ void __launch_bounds__(BS) gdn_conv_direct(const float * __res
     for (int j = 0; j < 4; ++j) {
         wr[j] = w[c * 4 + j];
     }
-    float xw[4];
+    float xw[H + 1];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j <= H; ++j) {
         const int jp = t0 + j; // concat column
-        if (jp < 3) {
+        if (jp < H) {
             xw[j] = state[c * st_c + jp * st_j];
-        } else if (halo != nullptr && j < 3) {
-            xw[j] = halo[(size_t) c * halo_stride + 3 * k + j];
+        } else if (halo != nullptr && j < H) {
+            xw[j] = halo[(size_t) c * halo_stride + H * k + j];
         } else {
-            xw[j] = x[(size_t) (jp - 3) * C + c];
+            xw[j] = x[(size_t) (jp - H) * C + c];
         }
     }
     const int tend = min(T, t0 + tt);
@@ -76,20 +82,21 @@ static __global__ void __launch_bounds__(BS) gdn_conv_direct(const float * __res
         float sumf = 0.0f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            sumf += xw[j] * wr[j];
+            sumf += xw[j * D] * wr[j];
         }
         sumf += b; // the unfused conv adds its (zero) bias at run time
         // the next row of this tile (the first row of the next tile belongs to its block)
         const float next = t + 1 < tend ? x[(size_t) (t + 1) * C + c] : 0.0f;
         y[(size_t) t * C + c] = ggml_cuda_op_silu_single(sumf);
-        xw[0] = xw[1];
-        xw[1] = xw[2];
-        xw[2] = xw[3];
-        xw[3] = next;
+#pragma unroll
+        for (int j = 0; j < H; ++j) {
+            xw[j] = xw[j + 1];
+        }
+        xw[H] = next;
     }
 }
 
-// the concat of build_conv_state: CONCAT(state [3, C], TRANSPOSE(x [C, T])) -> [T + 3, C], F32 and contiguous. The
+// the concat of build_conv_state: CONCAT(state [H, C], TRANSPOSE(x [C, T])) -> [T + H, C], F32 and contiguous. The
 // state is contiguous, or with ReplaySSM the transposed window gathered from the time-major conv records.
 static bool gdn_concat_match(const ggml_tensor * cc, gdn_conv_match & m) {
     if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) {
@@ -100,20 +107,21 @@ static bool gdn_concat_match(const ggml_tensor * cc, gdn_conv_match & m) {
     if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE || !tr->view_src) {
         return false;
     }
-    const ggml_tensor * x = tr->view_src;
+    const ggml_tensor * x = tr->src[0];
     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) {
         return false;
     }
     const int64_t C = x->ne[0];
     const int64_t T = x->ne[1];
-    if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || st->nb[0] % sizeof(float) != 0 ||
-            st->nb[1] % sizeof(float) != 0) {
+    const int64_t H = st->ne[0];
+    if (H < 1 || H > GDN_CONV_MAX_H || H % 3 != 0 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 ||
+            st->nb[0] % sizeof(float) != 0 || st->nb[1] % sizeof(float) != 0) {
         return false;
     }
     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) {
         return false;
     }
-    if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) {
+    if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) {
         return false;
     }
     m.x      = x;
@@ -121,6 +129,8 @@ static bool gdn_concat_match(const ggml_tensor * cc, gdn_conv_match & m) {
     m.concat = cc;
     m.C      = C;
     m.T      = T;
+    m.H      = (int) H;
+    m.D      = (int) H / 3;
     m.st_j   = (int) (st->nb[0] / sizeof(float));
     m.st_c   = (int) (st->nb[1] / sizeof(float));
     return true;
@@ -141,7 +151,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, gdn_conv_match & m
         return false;
     }
 
-    // between the concat and the conv: only 3-column views of the concat and the snapshot copies of them
+    // between the concat and the conv: only H-column views of the concat and the snapshot copies of them
     int conv = -1;
     for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
         const ggml_tensor * t = cgraph->nodes[n];
@@ -157,14 +167,14 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, gdn_conv_match & m
             continue;
         }
         if (t->op == GGML_OP_VIEW) {
-            if (t->ne[0] != 3 || t->ne[1] != C || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float)) {
+            if (t->ne[0] != m.H || t->ne[1] != C || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float)) {
                 return false;
             }
             continue;
         }
         if (t->op == GGML_OP_CPY) {
             const ggml_tensor * s0 = t->src[0];
-            if (!s0 || s0->op != GGML_OP_VIEW || s0->view_src != cc || s0->ne[0] != 3 || s0->ne[1] != C || s0->ne[2] != 1) {
+            if (!s0 || s0->op != GGML_OP_VIEW || s0->view_src != cc || s0->ne[0] != m.H || s0->ne[1] != C || s0->ne[2] != 1) {
                 return false;
             }
             continue;
@@ -178,6 +188,21 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, gdn_conv_match & m
     const ggml_tensor * w  = cv->src[1];
     if (cv->type != GGML_TYPE_F32 || !w || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C || !ggml_is_contiguous(w)) {
         return false;
+    }
+    // the kernels are instantiated for the dilations 1 and 3
+    const int dilation = std::max(1, ggml_get_op_params_i32(cv, 0));
+    if (dilation != m.D || (m.D != 1 && m.D != 3)) {
+        return false;
+    }
+    // the conv runs at the concat: a computed weight (a cast) must be computed before it
+    if (w->op != GGML_OP_NONE) {
+        bool before = false;
+        for (int n = 0; n < i && !before; ++n) {
+            before = cgraph->nodes[n] == w || (w->view_src && cgraph->nodes[n] == w->view_src);
+        }
+        if (!before) {
+            return false;
+        }
     }
     if (cv->ne[0] != C || cv->ne[1] != T || cv->ne[2] != 1 || !ggml_is_contiguous(cv)) {
         return false;
@@ -197,13 +222,15 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, gdn_conv_match & m
         }
     }
     // The conv runs at the concat, where x is still live; in the unfused graph x is dead after the concat, so the
-    // allocator may give its memory to the conv output (seen: the silu output is exactly x) or to tensors created
-    // between the concat and the conv. Writing the output early is safe when its region holds nothing else then:
-    // it is x itself (the in-place kernel) or disjoint from x, the state and the concat, and no node between the
-    // concat and the conv reads or writes it.
+    // allocator may give its memory to the conv output (seen: the silu output is exactly x, or starts some rows before
+    // it) or to tensors created between the concat and the conv. Writing the output early is safe when its region
+    // holds nothing else then: it is x itself (the in-place kernel) or disjoint from the state and the concat, and no
+    // node between the concat and the conv reads or writes it. If it overlaps x otherwise, the kernel writes into the
+    // concat, which nothing reads when the conv runs this way, and the result is copied into place.
     const bool in_place = su->data == x->data && ggml_nbytes(su) == ggml_nbytes(x);
-    if ((ggml_cuda_tensors_overlap(su, x) && !in_place) || ggml_cuda_tensors_overlap(su, st) ||
-            ggml_cuda_tensors_overlap(su, cc) || ggml_cuda_tensors_overlap(su, w)) {
+    const bool staged   = !in_place && ggml_cuda_tensors_overlap(su, x);
+    if (ggml_cuda_tensors_overlap(su, st) || ggml_cuda_tensors_overlap(su, cc) || ggml_cuda_tensors_overlap(su, w) ||
+            (staged && ggml_nbytes(cc) < ggml_nbytes(su))) {
         return false;
     }
     for (int n = i + 1; n < conv; ++n) {
@@ -222,14 +249,15 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, gdn_conv_match & m
     m.w        = w;
     m.out      = su;
     m.in_place = in_place;
+    m.staged   = staged;
     return true;
 }
 
-// The snapshot copies after the concat (CPY of its last 3 columns as of each of the last K tokens into the recurrent
+// The snapshot copies after the concat (CPY of its last H columns as of each of the last K tokens into the recurrent
 // cache, for rollback; with ReplaySSM one copy of the columns the next batch can start from into the time-major conv
 // records) are written by one kernel from the state and x, which also writes the concat when the conv reads it at its
 // own node. In short batches (the verify of a speculative step) this replaces the generic non-contiguous concat (one
-// block per channel for T + 3 columns) and the copy launches.
+// block per channel for T + H columns) and the copy launches.
 #define GDN_SNAP_MAX 32
 
 struct gdn_snaps {
@@ -241,21 +269,21 @@ struct gdn_snaps {
     int     n;
 };
 
-// concat columns [col0, T + 3) of every channel: into out if not null, and into the snapshots that cover them.
+// concat columns [col0, T + H) of every channel: into out if not null, and into the snapshots that cover them.
 // Consecutive threads take consecutive columns of a channel, or with c_fast (time-major snapshots) consecutive
 // channels of a column.
 static __global__ void gdn_concat_snapshots(const float * __restrict__ state, const int st_j, const int st_c,
                                             const float * __restrict__ x, float * __restrict__ out, const int C,
-                                            const int T, const int col0, const int row_stride, const bool c_fast,
-                                            const gdn_snaps snaps) {
-    const int     ncols = T + 3 - col0;
+                                            const int T, const int H, const int col0, const int row_stride,
+                                            const bool c_fast, const gdn_snaps snaps) {
+    const int     ncols = T + H - col0;
     const int64_t idx   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t) C * ncols) {
         return;
     }
     const int   c = c_fast ? (int) (idx % C) : (int) (idx / ncols);
     const int   j = col0 + (c_fast ? (int) (idx / C) : (int) (idx % ncols));
-    const float v = j < 3 ? state[c * st_c + j * st_j] : x[(size_t) (j - 3) * C + c];
+    const float v = j < H ? state[c * st_c + j * st_j] : x[(size_t) (j - H) * C + c];
     if (out != nullptr) {
         out[(size_t) c * row_stride + j] = v;
     }
@@ -292,7 +320,7 @@ static int gdn_snap_check(const ggml_cgraph * cgraph, int i, gdn_conv_match & m,
         const ggml_tensor * v = t->src[0];
         if (v->op != GGML_OP_VIEW || v->view_src != cc || v->type != GGML_TYPE_F32 || v->ne[1] != m.C ||
                 v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != sizeof(float) || v->nb[1] != cc->nb[1] ||
-                v->view_offs % sizeof(float) != 0 || v->view_offs / sizeof(float) + v->ne[0] > (size_t) (m.T + 3)) {
+                v->view_offs % sizeof(float) != 0 || v->view_offs / sizeof(float) + v->ne[0] > (size_t) (m.T + m.H)) {
             break;
         }
         const int64_t w = v->ne[0];
@@ -356,7 +384,7 @@ int ggml_cuda_try_fuse_gdn_conv(ggml_backend_cuda_context & ctx, const ggml_cgra
         // with the conv at the concat nothing reads the concat, so only the snapshots' columns are needed
         int col0 = 0;
         if (direct) {
-            col0 = (int) m.T + 3;
+            col0 = (int) (m.T + m.H);
             for (int k = 0; k < s.n; ++k) {
                 col0 = std::min(col0, s.col[k]);
             }
@@ -365,10 +393,10 @@ int ggml_cuda_try_fuse_gdn_conv(ggml_backend_cuda_context & ctx, const ggml_cgra
         for (int k = 0; k < s.n; ++k) {
             c_fast = c_fast || s.sc[k] == 1;
         }
-        const int64_t n = m.C * (m.T + 3 - col0);
+        const int64_t n = m.C * (m.T + m.H - col0);
         gdn_concat_snapshots<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>(
             (const float *) m.state->data, m.st_j, m.st_c, (const float *) m.x->data,
-            direct ? nullptr : (float *) m.concat->data, (int) m.C, (int) m.T, col0, row_stride, c_fast, s);
+            direct ? nullptr : (float *) m.concat->data, (int) m.C, (int) m.T, m.H, col0, row_stride, c_fast, s);
         CUDA_CHECK(cudaGetLastError());
 
         if (direct) {
@@ -377,18 +405,28 @@ int ggml_cuda_try_fuse_gdn_conv(ggml_backend_cuda_context & ctx, const ggml_cgra
             const int ntiles = (int) ((m.T + TT - 1) / TT);
             float *   halo   = nullptr;
             if (m.in_place && ntiles > 1) {
-                // halos go in concat columns [3, 3 * ntiles), after the snapshots have read x
+                // halos go in concat columns [H, H * ntiles), after the snapshots have read x
                 halo = (float *) m.concat->data;
                 const dim3 hgrid((unsigned) (m.C / BS), (unsigned) (ntiles - 1));
-                gdn_conv_save_halo<<<hgrid, BS, 0, ctx.stream()>>>((const float *) m.x->data, halo, (int) m.C, (int) m.T, TT,
-                                                                   ntiles, row_stride);
+                gdn_conv_save_halo<<<hgrid, BS, 0, ctx.stream()>>>((const float *) m.x->data, halo, (int) m.C, (int) m.T, m.H,
+                                                                   TT, ntiles, row_stride);
                 CUDA_CHECK(cudaGetLastError());
             }
             const dim3 grid((unsigned) (m.C / BS), (unsigned) ntiles);
-            gdn_conv_direct<BS><<<grid, BS, 0, ctx.stream()>>>(
-                (const float *) m.state->data, m.st_j, m.st_c, (const float *) m.x->data, halo, row_stride,
-                (const float *) m.w->data,
-                (float *) m.out->data, (int) m.C, (int) m.T, TT, 0.0f);
+            float * y = m.staged ? (float *) m.concat->data : (float *) m.out->data;
+            auto launch = [&](auto kernel) {
+                kernel<<<grid, BS, 0, ctx.stream()>>>(
+                    (const float *) m.state->data, m.st_j, m.st_c, (const float *) m.x->data, halo, row_stride,
+                    (const float *) m.w->data, y, (int) m.C, (int) m.T, TT, 0.0f);
+            };
+            if (m.D == 1) {
+                launch(gdn_conv_direct<BS, 1>);
+            } else {
+                launch(gdn_conv_direct<BS, 3>);
+            }
+            if (m.staged) {
+                CUDA_CHECK(cudaMemcpyAsync(m.out->data, y, ggml_nbytes(m.out), cudaMemcpyDeviceToDevice, ctx.stream()));
+            }
             CUDA_CHECK(cudaGetLastError());
         }
         return last - i; // the concat, the copies and their views

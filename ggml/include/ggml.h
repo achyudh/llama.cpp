@@ -2590,6 +2590,13 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // tap j of output token i reads token i + j*dilation of sx, which holds (d_conv - 1)*dilation + n_t tokens
+    GGML_API struct ggml_tensor * ggml_ssm_conv_dilated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            int                   dilation);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

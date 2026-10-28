@@ -1837,7 +1837,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:
-            return has_simdgroup_reduction;
+            return has_simdgroup_reduction && ggml_get_op_params_i32(op, 0) <= 1; // no dilation
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;

@@ -2699,7 +2699,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
 #endif
             }
         case GGML_OP_SSM_CONV:
-            return true;
+            return ggml_get_op_params_i32(op, 0) <= 1; // no dilation
         case GGML_OP_CUMSUM:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_TRI:

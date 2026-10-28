@@ -4729,7 +4729,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                           (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
             break;
         case GGML_OP_SSM_CONV:
-            supports_op = op->type == GGML_TYPE_F32;
+            supports_op = op->type == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 0) <= 1; // no dilation
             break;
         case GGML_OP_SSM_SCAN:
             supports_op = op->type == GGML_TYPE_F32 &&

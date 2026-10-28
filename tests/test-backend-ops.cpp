@@ -4896,20 +4896,22 @@ struct test_ssm_conv : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
+    const int dilation;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne_a, ne_b);
+        return VARS_TO_STR4(type, ne_a, ne_b, dilation);
     }
 
     test_ssm_conv(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {10, 10, 10, 1},
-            std::array<int64_t, 4> ne_b = {3, 3, 1, 1})
-        : type(type), ne_a(ne_a), ne_b(ne_b) {}
+            std::array<int64_t, 4> ne_b = {3, 3, 1, 1},
+            int dilation = 1)
+        : type(type), ne_a(ne_a), ne_b(ne_b), dilation(dilation) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
-        ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        ggml_tensor * out = dilation == 1 ? ggml_ssm_conv(ctx, a, b) : ggml_ssm_conv_dilated(ctx, a, b, dilation);
         return out;
     }
 };
@@ -4958,11 +4960,13 @@ struct test_ssm_conv_bias_silu : public test_case {
 };
 
 // The conv input of a linear-attention layer as build_conv_state builds it: CONCAT(state, x^T), the K conv-state
-// snapshot copies of 3-column views of it into a cache, then SSM_CONV + SILU (fused in the CUDA backend)
+// snapshot copies of 3-column views of it into a cache, then SSM_CONV + SILU (fused in the CUDA backend). With a
+// dilation D (the PLE conv of Qwen4Exp) the state and the snapshots have 3 D columns.
 struct test_gdn_conv_state : public test_case {
     const int64_t C;
     const int64_t T;
     const int64_t K; // snapshots (n_rs_seq + 1)
+    const int     D;
 
     std::vector<ggml_tensor *> checked;
 
@@ -4976,17 +4980,18 @@ struct test_gdn_conv_state : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
 
     std::string vars() override {
-        return VARS_TO_STR3(C, T, K);
+        return VARS_TO_STR4(C, T, K, D);
     }
 
-    test_gdn_conv_state(int64_t C = 512, int64_t T = 4, int64_t K = 4) : C(C), T(T), K(K) {}
+    test_gdn_conv_state(int64_t C = 512, int64_t T = 4, int64_t K = 4, int D = 1) : C(C), T(T), K(K), D(D) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, 1);
+        const int64_t H = 3 * D;
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, C, 1);
         ggml_set_name(state, "state");
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
         ggml_set_name(x, "x");
-        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, K);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H * C, K);
         ggml_set_name(cache, "cache");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(w, "w");
@@ -4997,8 +5002,8 @@ struct test_gdn_conv_state : public test_case {
         checked.clear();
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx = std::max<int64_t>(0, T - K + t);
-            ggml_tensor * src = ggml_view_3d(ctx, cc, 3, C, 1, cc->nb[1], cc->nb[2], ggml_row_size(cc->type, s_idx));
-            ggml_tensor * dst = ggml_view_2d(ctx, cache, 3 * C, 1, cache->nb[1], (K - t) * cache->nb[1]);
+            ggml_tensor * src = ggml_view_3d(ctx, cc, H, C, 1, cc->nb[1], cc->nb[2], ggml_row_size(cc->type, s_idx));
+            ggml_tensor * dst = ggml_view_2d(ctx, cache, H * C, 1, cache->nb[1], (K - t) * cache->nb[1]);
             ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
             checked.push_back(cpy);
             if (mode == MODE_TEST) {
@@ -5006,7 +5011,7 @@ struct test_gdn_conv_state : public test_case {
             }
         }
 
-        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, cc, w));
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv_dilated(ctx, cc, w, D));
         ggml_set_name(out, "out");
         checked.push_back(out);
         return out;
@@ -11849,6 +11854,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
     }
+    // dilated (the PLE conv of Qwen4Exp: 4 taps 3 tokens apart)
+    for (int64_t n_t : {1, 5, 64}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {9 + n_t, 1024, 1, 1}, {4, 1024, 1, 1}, 3));
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {9 + n_t, 1024, 2, 1}, {4, 1024, 1, 1}, 3));
+    }
 
     // per-head norms: decode and verify batches (the stock kernels), and prefill ubatches (one wave per row)
     for (const char * mode : {"mul", "scale", "mul_silu"}) {
@@ -11904,6 +11914,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_conv_state(10240, T, 4));
     }
     test_cases.emplace_back(new test_gdn_conv_state(512, 4, 1));
+    // the PLE conv of Qwen4Exp: dilation 3
+    for (int64_t T : {1, 4, 16, 256, 300}) {
+        test_cases.emplace_back(new test_gdn_conv_state(10240, T, 4, 3));
+    }
     // ReplaySSM: verify batches record their conv input; prefill ubatches keep their last columns
     for (int64_t T : {1, 4, 5, 17}) {
         test_cases.emplace_back(new test_gdn_conv_rec(10240, T, 17, (int) (T % 4), true));

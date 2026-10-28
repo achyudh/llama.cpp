@@ -10162,10 +10162,11 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int nth = params->nth;
 
     const int nc  = src1->ne[0]; // d_conv
-    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
+    const int ncs = src0->ne[0]; // (d_conv - 1)*dil + n_t
     const int nr  = src0->ne[1]; // d_inner
     const int n_t =  dst->ne[1]; // tokens per sequence
     const int n_s =  dst->ne[2]; // number of sequences in the batch
+    const int dil = std::max(1, ggml_get_op_params_i32(dst, 0));
 
     GGML_ASSERT( dst->ne[0] == nr);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
@@ -10197,7 +10198,7 @@ static void ggml_compute_forward_ssm_conv_f32(
 
                 // d_conv
                 for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                    sumf += s[i0*dil + i1*ncs] * c[i0 + i1*nc];
                 }
                 x[i1] = sumf;
             }

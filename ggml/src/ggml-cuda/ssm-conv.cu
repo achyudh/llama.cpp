@@ -123,17 +123,43 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+// with a dilation: tap j of token i reads column i + j * dilation; a thread per channel and token (short batches; the
+// long ones run fused at their concat, gdn-conv.cu)
+template <bool apply_silu, int d_conv>
+static __global__ void ssm_conv_dilated_f32(const float * __restrict__ src0, const float * __restrict__ src1,
+                                            const float * __restrict__ bias, const int src0_nb1, const int src0_nb2,
+                                            const int src1_nb1, float * __restrict__ dst, const int dst_nb1,
+                                            const int dst_nb2, const int dilation) {
+    const int c = blockIdx.y * blockDim.x + threadIdx.x;
+    const int i = blockIdx.z;
+    const float * x = (const float *) ((const char *) src0 + blockIdx.x * src0_nb2 + c * src0_nb1);
+    const float * w = (const float *) ((const char *) src1 + c * src1_nb1);
+    float sumf = 0.0f;
+#pragma unroll
+    for (int j = 0; j < d_conv; j++) {
+        sumf += x[i + j * dilation] * w[j];
+    }
+    sumf += bias != nullptr ? bias[c] : 0.0f;
+    float * y = (float *) ((char *) dst + blockIdx.x * dst_nb2 + i * dst_nb1);
+    y[c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
-                              const int64_t n_s, cudaStream_t stream) {
+                              const int64_t n_s, const int dilation, cudaStream_t stream) {
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
-        if (n_t <= 32) {
+        if (dilation > 1) {
+            GGML_ASSERT(n_t <= 65535);
+            const dim3 blocks(n_s, nr / threads, n_t);
+            ssm_conv_dilated_f32<apply_silu, kNC><<<blocks, threads, 0, stream>>>(src0, src1, bias, src0_nb1, src0_nb2, src1_nb1,
+                                                                                  dst, dst_nb1, dst_nb2, dilation);
+        } else if (n_t <= 32) {
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
@@ -177,6 +203,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const int64_t nr  = src0->ne[1];                // d_inner
     const int64_t n_t = out->ne[1];                 // tokens per sequence
     const int64_t n_s = out->ne[2];                 // number of sequences in the batch
+    const int     dilation = std::max(1, ggml_get_op_params_i32(dst, 0));
 
     GGML_ASSERT(out->ne[0] == nr);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
@@ -199,9 +226,9 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
     if (fuse_silu) {
         ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, dilation, stream);
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, dilation, stream);
     }
 }

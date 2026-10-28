@@ -5744,20 +5744,31 @@ struct ggml_tensor * ggml_ssm_conv(
         struct ggml_context * ctx,
         struct ggml_tensor  * sx,
         struct ggml_tensor  * c) {
+    return ggml_ssm_conv_dilated(ctx, sx, c, 1);
+}
+
+struct ggml_tensor * ggml_ssm_conv_dilated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        int                   dilation) {
     GGML_ASSERT(ggml_is_3d(sx));
     GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(dilation >= 1);
 
     const int64_t d_conv  = c->ne[0];
     const int64_t d_inner = c->ne[1];
-    const int64_t n_t     = sx->ne[0] - d_conv + 1; // tokens per sequence
+    const int64_t n_t     = sx->ne[0] - (d_conv - 1)*dilation; // tokens per sequence
     const int64_t n_s     = sx->ne[2];
 
     // TODO: maybe support other strides than 1?
-    GGML_ASSERT(sx->ne[0] == d_conv - 1 + n_t);
     GGML_ASSERT(sx->ne[1] == d_inner);
     GGML_ASSERT(n_t >= 0);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    // op_params[0]: the dilation, 0 (unset) meaning 1
+    ggml_set_op_params_i32(result, 0, dilation);
 
     result->op     = GGML_OP_SSM_CONV;
     result->src[0] = sx;
