@@ -10842,8 +10842,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, false, 2560, 640));
     }
     test_cases.emplace_back(new test_mul_mat_exl3(7, 17, false, 16384, 2560));
-    // routed banks above 8 rows: grouped FP16 GEMM over tiles of one expert's rows; expert 0 spans several tiles, the
-    // 640 x 2560 shapes decode 32 experts in two chunks, and down projections read one input row per slot
+    // routed banks above 8 rows: FP16 GEMM decoding the banks over tiles of one expert's rows; expert 0 spans several
+    // tiles, and down projections read one input row per slot
     for (int bits_x2 : {7, 8, 12}) {
         for (int rows : {9, 300}) {
             test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, true, 256, 128, 16, 4, 1));
@@ -10853,6 +10853,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 33, true, 2560, 640, 32, 10, 10));
     }
     test_cases.emplace_back(new test_mul_mat_exl3(8, 64, true));
+    test_cases.emplace_back(new test_mul_mat_exl3(14, 33, true, 640, 2560, 32, 10, 1));
+    // 7000 assignments of 2560 inputs are two chunks of rotated rows, with expert 0's rows in both
+    test_cases.emplace_back(new test_mul_mat_exl3(7, 700, true, 640, 2560, 64, 10, 1));
     // a MoE cache bank as the routed bank: thousands of slots (the routing plan's threads take several experts each)
     test_cases.emplace_back(new test_mul_mat_exl3(8, 16, true, 256, 128, 3000, 10, 1));
     test_cases.emplace_back(new test_mul_mat_exl3(8, 300, true, 256, 128, 3000, 10, 10));

@@ -26,8 +26,8 @@ void ggml_cuda_mul_mat_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor *
     cudaStream_t stream = ctx.stream();
     // the GEMM reads the FP32 activations and converts them on their way to LDS
     const int blocks = ((n + gemm_wmma::BN - 1) / gemm_wmma::BN) * ((m + 127) / 128);
-    gemm_f16_wmma<128, false, false, float><<<blocks, gemm_wmma::THREADS, 0, stream>>>(
-        (const float *) src1->data, (const half *) src0->data, nullptr, (float *) dst->data, m, n, k, 0, nullptr, nullptr, nullptr);
+    gemm_f16_wmma<128, false, float><<<blocks, gemm_wmma::THREADS, 0, stream>>>(
+        (const float *) src1->data, (const half *) src0->data, nullptr, (float *) dst->data, m, n, k, 0);
     CUDA_CHECK(cudaGetLastError());
 #else
     GGML_UNUSED_VARS(ctx, src0, src1, dst);

@@ -6,6 +6,11 @@
 #define EXL3_ROUTE_MAX_EXPERTS 16384 // the histogram's LDS: a routed op on a MoE cache bank has one per slot
 #define EXL3_ROUTE_THREADS     1024
 
+// a chunk of the routed GEMM: its rows in the expert-sorted order and its tiles in the tile list
+struct ggml_cuda_routed_chunk {
+    int32_t row0, rows, tile0, tiles;
+};
+
 bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
 #ifdef GGML_USE_HIP
     if (cc < GGML_CUDA_CC_RDNA4 || cc >= GGML_CUDA_CC_OFFSET_AMD + 0x1300 || !ggml_exl3_op_supported(op)) {
@@ -210,26 +215,13 @@ static __global__ void exl3_matrix_rows(ggml_cuda_exl3_args a) {
     }
 }
 
-// Decode columns [n0, n0 + gridDim.x * 16) of a bank into FP16 w[col - n0][k], k contiguous, for a GEMM: the dense
-// bank, or the bank of expert experts[blockIdx.z] into slot blockIdx.z of w. With a chunk of the routed GEMM, the
-// experts are the chunk's, from experts[chunk.expert0].
+// Decode columns [n0, n0 + gridDim.x * 16) of a dense bank into FP16 w[col - n0][k], k contiguous, for a GEMM.
 // A block decodes eight 16 x 16 tiles of one column strip and writes each column's 128 values contiguously.
 template<int bits_x2>
-static __global__ void exl3_decode_f16(const uint32_t * packed, const int32_t * experts, const ggml_cuda_routed_chunk * chunk,
-                                       half * w, int k, int n, int n0) {
+static __global__ void exl3_decode_f16(const uint32_t * packed, half * w, int k, int n, int n0) {
     __shared__ half strip[16][128 + 8];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    if (chunk) {
-        if (int(blockIdx.z) >= chunk->experts) {
-            return;
-        }
-        experts += chunk->expert0;
-    }
     const int nt = n0 / 16 + blockIdx.x;
-    if (experts) {
-        packed += size_t(experts[blockIdx.z]) * (k / 16) * (n / 16) * (4 * bits_x2);
-        w += size_t(blockIdx.z) * gridDim.x * 16 * k;
-    }
 #pragma unroll
     for (int t = 0; t < 2; ++t) {
         const int kt = blockIdx.y * 8 + warp * 2 + t;
@@ -251,15 +243,14 @@ static __global__ void exl3_decode_f16(const uint32_t * packed, const int32_t * 
     dst[1] = src[1];
 }
 
-static void exl3_decode_f16_launch(const ggml_cuda_exl3_args & a, const int32_t * experts, const ggml_cuda_routed_chunk * chunk,
-                                   int n_experts, half * w, int n0, int n_cols, cudaStream_t stream) {
-    const dim3 grid(n_cols / 16, a.k / 128, n_experts);
+static void exl3_decode_f16_launch(const ggml_cuda_exl3_args & a, half * w, int n0, int n_cols, cudaStream_t stream) {
+    const dim3 grid(n_cols / 16, a.k / 128);
     switch (a.bits_x2) {
-        case 7:  exl3_decode_f16<7 ><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
-        case 8:  exl3_decode_f16<8 ><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
-        case 10: exl3_decode_f16<10><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
-        case 12: exl3_decode_f16<12><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
-        case 14: exl3_decode_f16<14><<<grid, 128, 0, stream>>>(a.packed, experts, chunk, w, a.k, a.n, n0); break;
+        case 7:  exl3_decode_f16<7 ><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
+        case 8:  exl3_decode_f16<8 ><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
+        case 10: exl3_decode_f16<10><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
+        case 12: exl3_decode_f16<12><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
+        case 14: exl3_decode_f16<14><<<grid, 128, 0, stream>>>(a.packed, w, a.k, a.n, n0); break;
         default: GGML_ABORT("Unsupported EXL3 rate");
     }
 }
@@ -369,22 +360,21 @@ static __device__ int exl3_block_scan(int v, int * tmp, int & total) {
     return below + x - v;
 }
 
-// One block; each thread takes a contiguous range of the experts (a MoE cache bank has thousands of slots) and of the
-// groups. The chunks are groups of max_experts used experts, as the decoded weights of one chunk have to fit; a group
-// with more than chunk_tiles tiles is split into chunks of chunk_tiles tiles, so that the rotated rows of a chunk fit
-// (its first and last experts can then be in two chunks). The chunks after the last are empty, so that the host can
-// launch a bound of them.
+// One block; each thread takes a contiguous range of the experts (a MoE cache bank has thousands of slots). The tiles
+// are {first row in the expert-sorted order, rows (at most BM), 0, expert} for each expert's rows; chunk c takes the
+// tiles whose first row is in [c * chunk_rows, (c + 1) * chunk_rows), so a chunk's rows span fewer than
+// chunk_rows + BM. The chunks after the last are empty, so that the host can launch a bound of them.
 template<int BM>
 __launch_bounds__(EXL3_ROUTE_THREADS)
-static __global__ void exl3_route_plan(int32_t * block_count, int n_blocks, int32_t * offset, int32_t * tile_start,
-                                       int32_t * used_experts, int32_t * group_chunk, ggml_cuda_routed_chunk * chunks,
-                                       int4 * tiles, int experts, int max_experts, int chunk_tiles, int max_chunks) {
+static __global__ void exl3_route_plan(int32_t * block_count, int n_blocks, int32_t * offset, int32_t * chunk_tile0,
+                                       ggml_cuda_routed_chunk * chunks, int4 * tiles, int experts, int chunk_rows,
+                                       int max_chunks) {
     __shared__ int tmp[32];
     const int per = (experts + blockDim.x - 1) / blockDim.x;
     const int e0 = min(experts, int(threadIdx.x) * per), e1 = min(experts, e0 + per);
 
     // the expert's rows in the blocks before each block, a batch of loads at a time; its total in offset for now
-    int rows_sum = 0, tiles_sum = 0, used_sum = 0;
+    int rows_sum = 0, tiles_sum = 0;
     for (int e = e0; e < e1; ++e) {
         constexpr int BATCH = 16;
         int rows = 0;
@@ -405,80 +395,48 @@ static __global__ void exl3_route_plan(int32_t * block_count, int n_blocks, int3
         offset[e] = rows;
         rows_sum  += rows;
         tiles_sum += (rows + BM - 1) / BM;
-        used_sum  += rows > 0;
     }
-    int total_rows, total_tiles, n_used;
+    int total_rows, total_tiles;
     const int row_base  = exl3_block_scan(rows_sum, tmp, total_rows);
     const int tile_base = exl3_block_scan(tiles_sum, tmp, total_tiles);
-    const int used_base = exl3_block_scan(used_sum, tmp, n_used);
-    for (int e = e0, row = row_base, tile = tile_base, used = used_base; e < e1; ++e) {
+    for (int e = e0, row = row_base, tile = tile_base; e < e1; ++e) {
         const int rows = offset[e];
-        offset[e]     = row;
-        tile_start[e] = tile;
-        if (rows > 0) {
-            used_experts[used++] = e;
+        offset[e] = row;
+        for (int j = 0; j < (rows + BM - 1) / BM; ++j) {
+            tiles[tile++] = make_int4(row + j * BM, min(BM, rows - j * BM), 0, e);
         }
-        row  += rows;
-        tile += (rows + BM - 1) / BM;
+        row += rows;
     }
     if (threadIdx.x == 0) {
-        offset[experts]     = total_rows;
-        tile_start[experts] = total_tiles;
+        offset[experts] = total_rows;
     }
     __syncthreads();
 
-    // chunks: group g of used experts, split by tiles
-    const int n_groups = (n_used + max_experts - 1) / max_experts;
-    const int gper = (n_groups + blockDim.x - 1) / blockDim.x;
-    const int g0 = min(n_groups, int(threadIdx.x) * gper), g1 = min(n_groups, g0 + gper);
-    auto group_tile0 = [&](int g) { return g * max_experts < n_used ? tile_start[used_experts[g * max_experts]] : total_tiles; };
-    int split_sum = 0;
-    for (int g = g0; g < g1; ++g) {
-        split_sum += (group_tile0(g + 1) - group_tile0(g) + chunk_tiles - 1) / chunk_tiles;
-    }
-    int n_chunks;
-    int chunk = exl3_block_scan(split_sum, tmp, n_chunks);
+    // a tile starts the chunks from the one after its predecessor's to its own (consecutive tiles start fewer than
+    // BM <= chunk_rows rows apart, so at most one)
+    const int n_chunks = total_tiles > 0 ? tiles[total_tiles - 1].x / chunk_rows + 1 : 0;
     if (n_chunks > max_chunks) {
         __builtin_trap();
     }
-    for (int g = g0; g < g1; ++g) {
-        group_chunk[g] = chunk;
-        // the used experts of the group, in order, own its tiles; tile t belongs to the last expert starting at or before it
-        const int u0 = g * max_experts, u1 = min(n_used, u0 + max_experts);
-        const int g_t0 = group_tile0(g), g_t1 = group_tile0(g + 1);
-        for (int t0 = g_t0; t0 < g_t1; t0 += chunk_tiles) {
-            const int t1 = min(g_t1, t0 + chunk_tiles);
-            int uf = u0, ul = u0;
-            for (int u = u0; u < u1; ++u) {
-                const int tu = tile_start[used_experts[u]];
-                uf = tu <= t0     ? u : uf;
-                ul = tu <= t1 - 1 ? u : ul;
-            }
-            const int ef = used_experts[uf], el = used_experts[ul];
-            const int r0 = offset[ef] + (t0 - tile_start[ef]) * BM;
-            const int r1 = min(offset[el] + (t1 - tile_start[el]) * BM, offset[el + 1]);
-            chunks[chunk++] = { r0, r1 - r0, t0, t1 - t0, uf, ul - uf + 1 };
+    for (int t = threadIdx.x; t < total_tiles; t += blockDim.x) {
+        const int c = tiles[t].x / chunk_rows, prev = t > 0 ? tiles[t - 1].x / chunk_rows : -1;
+        for (int cc = prev + 1; cc <= c; ++cc) {
+            chunk_tile0[cc] = t;
         }
     }
-    for (int c = n_chunks + threadIdx.x; c < max_chunks; c += blockDim.x) {
-        chunks[c] = {};
+    if (threadIdx.x == 0) {
+        chunk_tile0[n_chunks] = total_tiles;
     }
     __syncthreads();
-
-    // the tiles of each used expert, relative to their chunk
-    for (int e = e0, used = used_base; e < e1; ++e) {
-        const int rows = offset[e + 1] - offset[e];
-        if (rows == 0) {
-            continue;
+    for (int c = threadIdx.x; c < max_chunks; c += blockDim.x) {
+        if (c < n_chunks) {
+            const int t0 = chunk_tile0[c], t1 = chunk_tile0[c + 1];
+            const int4 last = tiles[t1 - 1];
+            const int row0 = tiles[t0].x;
+            chunks[c] = { row0, last.x + last.y - row0, t0, t1 - t0 };
+        } else {
+            chunks[c] = {};
         }
-        const int grp = used / max_experts;
-        const int g_t0 = group_tile0(grp);
-        for (int j = 0; j < (rows + BM - 1) / BM; ++j) {
-            const int t = tile_start[e] + j;
-            const ggml_cuda_routed_chunk & c = chunks[group_chunk[grp] + (t - g_t0) / chunk_tiles];
-            tiles[t] = make_int4(offset[e] + j * BM - c.row0, min(BM, rows - j * BM), used - c.expert0, e);
-        }
-        used++;
     }
 }
 
@@ -501,36 +459,197 @@ static __global__ void exl3_route_place(const int32_t * ids, const int32_t * blo
     perm[offset[e] + block_count[size_t(blockIdx.x) * experts + e] + rank] = i;
 }
 
-// Routed banks above 8 rows: sort the assignments by expert on the device, then per chunk of experts rotate their
-// rows to FP16, decode their banks to FP16 and run the GEMM over the chunk's tiles of up to BM rows each. The host
-// launches a bound of chunks for the shapes; the chunks past the last are empty.
+#ifdef GGML_CUDA_GEMM_WMMA
+template<int bits_x2, int BM>
+constexpr int exl3_gemm_smem() {
+    using namespace gemm_wmma;
+    return std::max(2 * (BM + BN) * LDK * 2 + 2 * 2 * (BN / 16) * (4 * bits_x2) * 4, YROWS * LDY * 4);
+}
+
+// One routed tile of the GEMM that decodes the bank in its W load, as gemm_f16_wmma_tile otherwise: rows x (m of them,
+// rotated) times the columns col0.. of one expert's packed bank, in NT threads (a wave computes 32 x 64). Each K step
+// of 32 is two K by eight N trellis tiles of the column block; their packed words go through LDS two steps ahead (a
+// lane's fragment reads words that other lanes loaded), and the waves decode them into the W stage one step ahead.
+// Waves whose rows are all past m skip their X loads and math.
+template<int bits_x2, int BM, int NT>
+static __device__ __forceinline__ void exl3_gemm_tile(char * smem, const half * __restrict__ x, const uint32_t * __restrict__ packed,
+                                                      const half * __restrict__ svh, float * __restrict__ dst,
+                                                      const int32_t * __restrict__ perm, int m, int n, int k, int col0, int vb) {
+    using namespace gemm_wmma;
+    constexpr int WM = BM / (NT / 32 / WAVES_N);
+    constexpr int A_PIECES = BM * BK / 8 / NT;
+    constexpr int STAGE = (BM + BN) * LDK;
+    constexpr int TW = 4 * bits_x2;   // words per 16 x 16 trellis tile
+    constexpr int SEG = BN / 16 * TW; // words of the column block's tiles in one K tile row
+    constexpr int PW = 2 * SEG;       // and in one K step
+    constexpr int P_PIECES = (PW + NT - 1) / NT;
+    constexpr int TPW = 2 * (BN / 16) / (NT / 32); // trellis tiles decoded per wave and step
+    static_assert(WM == 32 && A_PIECES >= 1, "a wave computes 32 rows");
+    _Float16 * stages = (_Float16 *) smem;
+    uint32_t * pk = (uint32_t *) (smem + 2 * STAGE * 2);
+
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int wm = warp / WAVES_N, wn = warp % WAVES_N;
+
+    gemm_wmma_float8 acc[WM / 16][WN / 16];
+#pragma unroll
+    for (int i = 0; i < WM / 16; ++i) {
+#pragma unroll
+        for (int j = 0; j < WN / 16; ++j) { acc[i][j] = gemm_wmma_float8{0, 0, 0, 0, 0, 0, 0, 0}; }
+    }
+
+    const int n_tiles = n / 16;
+    const __amdgpu_buffer_rsrc_t xr = gemm_wmma_rsrc(x, uint32_t(m) * k * 2);
+    const __amdgpu_buffer_rsrc_t pr = gemm_wmma_rsrc(packed, uint32_t(k / 16) * n_tiles * TW * 4);
+    uint32_t xo[A_PIECES], po[P_PIECES];
+    bool xlive[A_PIECES];
+#pragma unroll
+    for (int p = 0; p < A_PIECES; ++p) {
+        const int idx = tid + p * NT, r = idx / (BK / 8), c = (idx % (BK / 8)) * 8;
+        // rows past m are not loaded: an output row depends only on its own input row and is not written
+        xo[p] = (uint32_t(min(r, m - 1)) * k + c) * 2;
+        xlive[p] = r < m;
+    }
+    const bool live = wm * WM < m;
+#pragma unroll
+    for (int p = 0; p < P_PIECES; ++p) {
+        const int idx = min(tid + p * NT, PW - 1);
+        po[p] = ((idx / SEG) * n_tiles * TW + col0 / 16 * TW + idx % SEG) * 4;
+    }
+    gemm_wmma_half8 ra[A_PIECES] = {};
+    uint32_t rp[P_PIECES];
+    const int kstart = (vb % 32) * 128 % k;
+
+#define EG_KP(K0) ((K0) + kstart < k ? (K0) + kstart : (K0) + kstart - k)
+#define EG_LOAD_X(K0)                                                                                    \
+    {                                                                                                      \
+        const int kp = EG_KP(K0);                                                                        \
+        _Pragma("unroll") for (int p = 0; p < A_PIECES; ++p) { if (xlive[p]) { ra[p] = gemm_wmma_load16(xr, xo[p], kp * 2); } } \
+    }
+#define EG_LOAD_P(K0)                                                                                    \
+    {                                                                                                      \
+        const int kp = EG_KP(K0);                                                                        \
+        _Pragma("unroll") for (int p = 0; p < P_PIECES; ++p) {                                             \
+            rp[p] = __builtin_amdgcn_raw_buffer_load_b32(pr, (int) po[p], (int) (kp / 16 * n_tiles * TW * 4), 0); \
+        }                                                                                                  \
+    }
+#define EG_STORE_X(STAGE_PTR)                                                                            \
+    _Pragma("unroll") for (int p = 0; p < A_PIECES; ++p) {                                                 \
+        const int idx = tid + p * NT, r = idx / (BK / 8), c = (idx % (BK / 8)) * 8;                       \
+        *(gemm_wmma_half8 *) ((STAGE_PTR) + r * LDK + c) = ra[p];                                          \
+    }
+#define EG_STORE_P(PK)                                                                                   \
+    _Pragma("unroll") for (int p = 0; p < P_PIECES; ++p) {                                                 \
+        if (PW % NT == 0 || tid + p * NT < PW) { (PK)[tid + p * NT] = rp[p]; }                             \
+    }
+// lane holds k = (lane & 3) * 2 + (j & 1) + 8 * ((j >> 1) & 1) and n = lane / 4 + 8 * (j >> 2) of its tile
+#define EG_DECODE(PK, STAGE_PTR)                                                                         \
+    _Pragma("unroll") for (int h = 0; h < TPW; ++h) {                                                      \
+        const int kt = (warp * TPW + h) / (BN / 16), nt = (warp * TPW + h) % (BN / 16);                  \
+        half2 v[4];                                                                                        \
+        ggml_cuda_exl3_fragment2<bits_x2>((PK) + kt * SEG + nt * TW, lane, v);                             \
+        _Pragma("unroll") for (int j = 0; j < 4; ++j) {                                                    \
+            const int r = (lane & 3) * 2 + 8 * (j & 1), c = lane / 4 + 8 * (j >> 1);                        \
+            *(half2 *) ((STAGE_PTR) + (BM + nt * 16 + c) * LDK + kt * 16 + r) = v[j];                      \
+        }                                                                                                  \
+    }
+// step K0 multiplies stage CUR; it decodes the next step's W from the packed words of buffer CUR ^ 1 into the other
+// stage (both last read before the previous barrier), loads the next step's X and the packed words two steps ahead,
+// and stores them into the other stage and packed buffer CUR (decoded in the previous step).
+#define EG_STEP(K0, CUR)                                                                                 \
+    {                                                                                                      \
+        EG_LOAD_X((K0) + BK);                                                                            \
+        EG_LOAD_P((K0) + 2 * BK);                                                                        \
+        EG_DECODE(pk + ((CUR) ^ 1) * PW, stages + ((CUR) ^ 1) * STAGE);                                  \
+        const _Float16 * as = stages + (CUR) * STAGE + (wm * WM + lane % 16) * LDK + 8 * (lane / 16);      \
+        const _Float16 * bs = stages + (CUR) * STAGE + (BM + wn * WN + lane % 16) * LDK + 8 * (lane / 16); \
+        if (live) _Pragma("unroll") for (int kk = 0; kk < BK / 16; ++kk) {                                 \
+            gemm_wmma_half8 b[WN / 16];                                                                    \
+            _Pragma("unroll") for (int j = 0; j < WN / 16; ++j) { b[j] = *(const gemm_wmma_half8 *) (bs + j * 16 * LDK + kk * 16); } \
+            _Pragma("unroll") for (int i = 0; i < WM / 16; ++i) {                                          \
+                const gemm_wmma_half8 a = *(const gemm_wmma_half8 *) (as + i * 16 * LDK + kk * 16);       \
+                _Pragma("unroll") for (int j = 0; j < WN / 16; ++j) {                                      \
+                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b[j], acc[i][j]);      \
+                }                                                                                          \
+            }                                                                                              \
+        }                                                                                                  \
+        __builtin_amdgcn_sched_barrier(0);                                                                 \
+        EG_STORE_X(stages + ((CUR) ^ 1) * STAGE);                                                        \
+        EG_STORE_P(pk + (CUR) * PW);                                                                     \
+        gemm_wmma_lds_barrier();                                                                           \
+    }
+
+    EG_LOAD_P(0);
+    EG_STORE_P(pk);
+    EG_LOAD_P(BK);
+    EG_STORE_P(pk + PW);
+    EG_LOAD_X(0);
+    EG_STORE_X(stages);
+    gemm_wmma_lds_barrier();
+    EG_DECODE(pk, stages);
+    gemm_wmma_lds_barrier();
+    for (int k0 = 0; k0 < k; k0 += 2 * BK) {
+        EG_STEP(k0, 0);
+        EG_STEP(k0 + BK, 1);
+    }
+#undef EG_STEP
+#undef EG_DECODE
+#undef EG_STORE_P
+#undef EG_STORE_X
+#undef EG_LOAD_P
+#undef EG_LOAD_X
+#undef EG_KP
+
+    gemm_wmma_epilogue<BM, true, true, NT>(smem, acc, svh, dst, perm, m, n, 0, 0, col0);
+}
+#endif // GGML_CUDA_GEMM_WMMA
+
+// The routed GEMM over one chunk of rows: block b computes column block b % (n / BN) of the chunk's tiles
+// b / (n / BN), b / (n / BN) + gridDim.x / (n / BN), ...; x holds the chunk's rotated rows.
+template<int bits_x2, int BM, int NT>
+__launch_bounds__(NT)
+static __global__ void exl3_routed_gemm_decode(const half * __restrict__ xh, const uint32_t * __restrict__ packed,
+                                               const half * __restrict__ svh, float * __restrict__ dst,
+                                               const int4 * __restrict__ tiles, const int32_t * __restrict__ perm,
+                                               const ggml_cuda_routed_chunk * __restrict__ chunk, int n, int k) {
+#ifdef GGML_CUDA_GEMM_WMMA
+    using namespace gemm_wmma;
+    __shared__ __attribute__((aligned(16))) char smem[exl3_gemm_smem<bits_x2, BM>()];
+    const int n_cb = n / BN, cb = blockIdx.x % n_cb;
+    const int tile0 = chunk->tile0, n_tiles = chunk->tiles, row0 = chunk->row0;
+    const size_t bank_words = size_t(k / 16) * (n / 16) * (4 * bits_x2);
+    for (int t = blockIdx.x / n_cb; t < n_tiles; t += gridDim.x / n_cb) {
+        const int4 tile = tiles[tile0 + t];
+        exl3_gemm_tile<bits_x2, BM, NT>(smem, xh + size_t(tile.x - row0) * k, packed + size_t(tile.w) * bank_words,
+                                        svh + size_t(tile.w) * n, dst, perm + tile.x, tile.y, n, k, cb * BN,
+                                        (tile0 + t) * n_cb + cb);
+        gemm_wmma_lds_barrier();
+    }
+#else
+    GGML_UNUSED_VARS(xh, packed, svh, dst, tiles, perm, chunk, n, k);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Routed banks above 8 rows, decoding the banks in the GEMM: sort the assignments by expert on the device, then per
+// chunk of rows rotate them to FP16 and run the GEMM over the chunk's tiles of up to BM rows of one expert each. The
+// host launches the chunks of all assignments; with invalid experts the last ones can be empty.
 static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using gemm_wmma::BN;
-    // a used expert gets a median of 38 rows of a 4096-token batch (10 of 512 experts per token)
-    constexpr int BM = 64;
+    constexpr int BM = 128, NT = 256;
     const int k = dst->src[2]->ne[0], n = dst->ne[0], used = dst->ne[1], assignments = dst->ne[1] * dst->ne[2];
     const int experts = dst->src[0]->ne[2];
     cudaStream_t stream = ctx.stream();
 
-    // decoded chunks of 32 MiB stay in the 64 MiB Infinity Cache until the GEMM reads them: at 4096 tokens 16 and
-    // 64 MiB are 30% slower, 128 MiB and more 45-60%
-    const int chunk_experts = std::max<int>(1, (32ll << 20) / (2ll * n * k));
-    // and a chunk's rotated rows take at most 32 MiB
-    const int chunk_tiles = std::max<int>(2, (32ll << 20) / (2ll * k) / BM);
-    const int chunk_rows  = chunk_tiles * BM;
-    const int max_used    = std::min(experts, assignments);
-    const int max_tiles   = max_used + (assignments + BM - 1) / BM;
-    // a group of chunk_experts used experts is one chunk per chunk_tiles of its tiles, rounded up
-    const int max_chunks  = (max_used + chunk_experts - 1) / chunk_experts + max_tiles / chunk_tiles;
-    const int n_blocks    = (assignments + EXL3_ROUTE_BLOCK - 1) / EXL3_ROUTE_BLOCK;
+    // a chunk's rotated rows take at most 32 MiB, so they stay in the Infinity Cache for its column blocks
+    const int chunk_rows = std::max<int>(BM, (32ll << 20) / (2ll * k));
+    const int max_chunks = (assignments + chunk_rows - 1) / chunk_rows;
+    const int max_tiles  = std::min(experts, assignments) + (assignments + BM - 1) / BM;
+    const int n_blocks   = (assignments + EXL3_ROUTE_BLOCK - 1) / EXL3_ROUTE_BLOCK;
 
-    const int max_groups  = (max_used + chunk_experts - 1) / chunk_experts;
-
-    // workspace: block counts, offsets, tile starts, sorted assignments, used experts, the groups' first chunks, then
-    // 16-byte aligned chunks and tiles
-    const size_t o_offset = size_t(n_blocks) * experts, o_tile_start = o_offset + experts + 1;
-    const size_t o_perm = o_tile_start + experts + 1, o_used = o_perm + assignments, o_group = o_used + experts;
-    const size_t o_chunks = (o_group + max_groups + 3) / 4 * 4;
+    // workspace: block counts, offsets, sorted assignments, chunk starts, then 16-byte aligned chunks and tiles
+    const size_t o_offset = size_t(n_blocks) * experts, o_perm = o_offset + experts + 1;
+    const size_t o_tile0 = o_perm + assignments, o_chunks = (o_tile0 + max_chunks + 1 + 3) / 4 * 4;
     const size_t o_tiles = o_chunks + size_t(max_chunks) * sizeof(ggml_cuda_routed_chunk) / sizeof(int32_t);
     ggml_cuda_pool_alloc<int32_t> ws(ctx.pool(), o_tiles + size_t(max_tiles) * 4);
     const int32_t * ids = (const int32_t *) dst->src[4]->data;
@@ -539,29 +658,32 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     exl3_route_hist<<<n_blocks, EXL3_ROUTE_BLOCK, experts * sizeof(int32_t), stream>>>(ids, ws.get(), (uint32_t *) dst->data,
                                                                                          assignments, experts, n);
-    exl3_route_plan<BM><<<1, EXL3_ROUTE_THREADS, 0, stream>>>(ws.get(), n_blocks, ws.get() + o_offset, ws.get() + o_tile_start,
-                                                              ws.get() + o_used, ws.get() + o_group, chunks, tiles, experts,
-                                                              chunk_experts, chunk_tiles, max_chunks);
+    exl3_route_plan<BM><<<1, EXL3_ROUTE_THREADS, 0, stream>>>(ws.get(), n_blocks, ws.get() + o_offset, ws.get() + o_tile0,
+                                                              chunks, tiles, experts, chunk_rows, max_chunks);
     exl3_route_place<<<n_blocks, EXL3_ROUTE_BLOCK, 0, stream>>>(ids, ws.get(), ws.get() + o_offset, ws.get() + o_perm,
                                                                  assignments, experts);
 
-    // launch sizes for the expected chunk, the rows of chunk_experts experts with the average rows; the kernels loop
-    const int n_slots = std::min(chunk_experts, max_used);
-    const int typical_rows = std::min<int>(chunk_rows, (int64_t(assignments) * n_slots + max_used - 1) / max_used);
-    const int input_blocks = (typical_rows + typical_rows / 2 + EXL3_TRANSFORM_ROWS - 1) / EXL3_TRANSFORM_ROWS;
-    const int tile_blocks = n_slots + (typical_rows + typical_rows / 2 + BM - 1) / BM;
-
-    ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(std::min(chunk_rows, assignments)) * k);
-    ggml_cuda_pool_alloc<half> w(ctx.pool(), size_t(n_slots) * n * k);
+    const int xh_rows = std::min(chunk_rows + BM, assignments);
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(xh_rows) * k);
     const ggml_cuda_exl3_args args = {
         (const uint32_t *) dst->src[0]->data, (const half *) dst->src[2]->data, (const half *) dst->src[3]->data,
         (const float *) dst->src[1]->data, ids, (float *) dst->data, xh.get(), nullptr,
         k, n, experts, assignments, used, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0), ws.get() + o_perm};
+    const int input_blocks = (xh_rows + EXL3_TRANSFORM_ROWS - 1) / EXL3_TRANSFORM_ROWS;
+    // the GEMM blocks loop over the chunk's tiles, about 16 blocks per WGP (nsm counts WGPs; 4 were 2-7% slower, 32
+    // no faster)
+    const int n_cb = n / BN;
+    const int blocks = n_cb * std::max(1, std::min(max_tiles, 16 * ggml_cuda_info().devices[ctx.device].nsm / n_cb));
     for (int c = 0; c < max_chunks; ++c) {
         exl3_routed_input<<<dim3(k / 128, input_blocks), 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(args, chunks + c);
-        exl3_decode_f16_launch(args, ws.get() + o_used, chunks + c, n_slots, w.get(), 0, n, stream);
-        gemm_f16_wmma<BM, true, true><<<n / BN * tile_blocks, gemm_wmma::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh,
-                                                                                    args.dst, 0, n, k, 0, tiles, args.perm, chunks + c);
+        switch (args.bits_x2) {
+            case 7:  exl3_routed_gemm_decode<7,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
+            case 8:  exl3_routed_gemm_decode<8,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
+            case 10: exl3_routed_gemm_decode<10, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
+            case 12: exl3_routed_gemm_decode<12, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
+            case 14: exl3_routed_gemm_decode<14, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
+            default: GGML_ABORT("Unsupported EXL3 rate");
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -592,10 +714,10 @@ void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         ggml_cuda_exl3_launch(args, GGML_EXL3_F16_DOT, GGML_EXL3_INPUT, stream);
         for (int n0 = 0; n0 < n; n0 += chunk) {
             const int n_cols = std::min(chunk, n - n0);
-            exl3_decode_f16_launch(args, nullptr, nullptr, 1, w.get(), n0, n_cols, stream);
+            exl3_decode_f16_launch(args, w.get(), n0, n_cols, stream);
             const int blocks = n_cols / gemm_wmma::BN * ((assignments + 127) / 128);
-            gemm_f16_wmma<128, false, true><<<blocks, gemm_wmma::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst,
-                                                                            assignments, n, k, n0, nullptr, nullptr, nullptr);
+            gemm_f16_wmma<128, true><<<blocks, gemm_wmma::THREADS, 0, stream>>>(xh.get(), w.get(), args.svh, args.dst,
+                                                                      assignments, n, k, n0);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
