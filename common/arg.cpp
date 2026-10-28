@@ -1690,6 +1690,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--outputs-max"}, "N",
+        string_format("maximum outputs (logits or embeddings) of a batch, which sizes the output head's compute buffer; "
+            "the server sets its own (default: %d, 0 = batch size)", params.n_outputs_max),
+        [](common_params & params, int value) {
+            params.n_outputs_max = value;
+        }
+    ).set_env("LLAMA_ARG_OUTPUTS_MAX"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
