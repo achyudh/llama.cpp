@@ -176,13 +176,82 @@ static void projection(const char * bank, const char * input, const char * prefi
     gguf_free(meta); gguf_free(data); ggml_free(weights); ggml_free(inputs);
 }
 
+static void auxiliary_upload() {
+    auto * backend = ggml_backend_cuda_init(0);
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto upload = (ggml_exl3_aux_upload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_exl3_aux_upload");
+    assert(upload);
+    auto * ctx = ggml_init({1024*1024, nullptr, true});
+    auto * scratch = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, GGML_EXL3_AUX_SCRATCH_BYTES);
+    ggml_exl3_aux_batch batch{};
+    batch.n_slots = 83;
+    const int widths[] = {2560, 640, 2560, 640, 640, 2560};
+    for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
+        batch.banks[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, widths[i], 1, batch.n_slots+1);
+    }
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    auto * host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+    auto * host = ggml_backend_buft_alloc_buffer(host_buft, GGML_EXL3_AUX_SCRATCH_BYTES);
+    assert(buffer && host && ggml_backend_buffer_get_type(host) == host_buft);
+    auto * payload = (uint16_t *) ggml_backend_buffer_get_base(host);
+    for (int count : {0, 1, 3, 10, 80}) {
+        ggml_backend_buffer_clear(buffer, 0x5a);
+        batch.count = count;
+        for (int i = 0; i < count; ++i) { batch.slots[i] = (i*17+3)%batch.n_slots; }
+        std::vector<std::vector<uint16_t>> expected;
+        size_t words = 0;
+        for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
+            expected.emplace_back(ggml_nelements(batch.banks[i]), 0x5a5a);
+            for (int j = 0; j < count; ++j) {
+                for (int k = 0; k < widths[i]; ++k) {
+                    const uint16_t value = uint16_t(i*32713+j*131+k*17);
+                    payload[words++] = value;
+                    expected.back()[batch.slots[j]*widths[i]+k] = value;
+                }
+            }
+        }
+        assert(upload(backend, scratch, payload, words*2, &batch));
+        ggml_backend_synchronize(backend);
+        auto check = [&] {
+            for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
+                std::vector<uint16_t> actual(expected[i].size());
+                ggml_backend_tensor_get(batch.banks[i], actual.data(), 0, actual.size()*2);
+                assert(actual == expected[i]);
+            }
+        };
+        check();
+        if (count) {
+            auto invalid = batch;
+            invalid.count = GGML_EXL3_AUX_MAX_FILLS+1;
+            assert(!upload(backend, scratch, payload, words*2, &invalid));
+            invalid = batch; invalid.slots[0] = -1;
+            assert(!upload(backend, scratch, payload, words*2, &invalid));
+            invalid.slots[0] = batch.n_slots;
+            assert(!upload(backend, scratch, payload, words*2, &invalid));
+            invalid = batch; invalid.banks[1] = invalid.banks[0];
+            assert(!upload(backend, scratch, payload, words*2, &invalid));
+            assert(!upload(backend, scratch, payload, words*2-2, &batch));
+            assert(!upload(backend, scratch, payload, GGML_EXL3_AUX_SCRATCH_BYTES+1, &batch));
+            if (count > 1) {
+                invalid = batch; invalid.slots[1] = invalid.slots[0];
+                assert(!upload(backend, scratch, payload, words*2, &invalid));
+            }
+            ggml_backend_synchronize(backend);
+            check();
+        }
+    }
+    ggml_backend_buffer_free(host); ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_backend_free(backend);
+    std::puts("auxiliary uploads: exact bytes, untouched slots and guards, malformed requests rejected");
+}
+
 int main(int argc, char ** argv) {
     CUDA_CHECK(cudaSetDevice(0));
     hipDeviceProp_t prop;
     CUDA_CHECK(hipGetDeviceProperties(&prop, 0));
     assert(std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
-    if (argc == 3 && std::strcmp(argv[1], "--codec") == 0) { codec(argv[2]); }
+    if (argc == 2 && std::strcmp(argv[1], "--aux-upload") == 0) { auxiliary_upload(); }
+    else if (argc == 3 && std::strcmp(argv[1], "--codec") == 0) { codec(argv[2]); }
     else if (argc == 5) { projection(argv[2], argv[3], argv[4]); }
-    else { std::fprintf(stderr, "usage: %s --codec FIXTURE | --bundle BANK INPUT OUTPUT_PREFIX\n", argv[0]); return 1; }
+    else { std::fprintf(stderr, "usage: %s --aux-upload | --codec FIXTURE | --bundle BANK INPUT OUTPUT_PREFIX\n", argv[0]); return 1; }
     return 0;
 }

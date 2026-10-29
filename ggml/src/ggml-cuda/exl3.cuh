@@ -1,11 +1,14 @@
 #pragma once
 
 #include "common.cuh"
+#include "ggml-exl3.h"
 
 bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc);
 void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #ifdef GGML_USE_HIP
+void ggml_cuda_exl3_aux_scatter(ggml_backend_cuda_context & ctx, const ggml_tensor * scratch, const ggml_exl3_aux_batch & batch);
+
 // GGML_EXL3_F32_ROWS decodes a dense bank once for all rows; routed banks use GGML_EXL3_F32_FRAGMENT.
 enum ggml_cuda_exl3_mode { GGML_EXL3_F32, GGML_EXL3_F16_DOT, GGML_EXL3_F32_FRAGMENT, GGML_EXL3_F32_ROWS };
 enum ggml_cuda_exl3_stage { GGML_EXL3_INPUT, GGML_EXL3_MATRIX, GGML_EXL3_OUTPUT, GGML_EXL3_ALL };

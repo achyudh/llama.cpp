@@ -36,7 +36,7 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // pin: bytes of the host experts to pin for the GPU (whole expert tensors, in layer order), SIZE_MAX = all
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin = 0);
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin = 0, bool aux_allowed = false);
     ~llama_moe_cache();
 
     // the device that caches layer il

@@ -40,6 +40,41 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
 }
 
 #ifdef GGML_USE_HIP
+struct exl3_aux_scatter_args {
+    const uint4 * src;
+    uint4 * banks[GGML_EXL3_AUX_BANKS];
+    size_t offsets[GGML_EXL3_AUX_BANKS];
+    size_t widths[GGML_EXL3_AUX_BANKS];
+    int32_t slots[GGML_EXL3_AUX_MAX_FILLS];
+    int32_t count;
+};
+
+static __global__ void exl3_aux_scatter(exl3_aux_scatter_args a) {
+    const int bank = blockIdx.z, fill = blockIdx.y;
+    const size_t col = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (bank < GGML_EXL3_AUX_BANKS && fill < a.count && col < a.widths[bank]) {
+        a.banks[bank][size_t(a.slots[fill])*a.widths[bank] + col] =
+            a.src[a.offsets[bank] + size_t(fill)*a.widths[bank] + col];
+    }
+}
+
+void ggml_cuda_exl3_aux_scatter(ggml_backend_cuda_context & ctx, const ggml_tensor * scratch, const ggml_exl3_aux_batch & batch) {
+    exl3_aux_scatter_args a{};
+    a.src = (const uint4 *) scratch->data;
+    a.count = batch.count;
+    size_t offset = 0, width = 0;
+    for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
+        a.banks[i] = (uint4 *) batch.banks[i]->data;
+        a.widths[i] = batch.banks[i]->nb[2]/sizeof(uint4);
+        a.offsets[i] = offset;
+        offset += a.widths[i]*batch.count;
+        width = std::max(width, a.widths[i]);
+    }
+    std::copy(batch.slots, batch.slots + batch.count, a.slots);
+    exl3_aux_scatter<<<dim3((width + 255)/256, batch.count, GGML_EXL3_AUX_BANKS), 256, 0, ctx.stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static __device__ __forceinline__ int exl3_expert(const ggml_cuda_exl3_args & a, int assignment) {
     return a.ids ? a.ids[assignment] : 0;
 }

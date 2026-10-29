@@ -6615,8 +6615,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#ifdef GGML_USE_HIP
+static bool ggml_backend_cuda_exl3_aux_upload(ggml_backend_t backend, ggml_tensor * scratch,
+        const void * payload, size_t bytes, const ggml_exl3_aux_batch * batch) {
+    if (!batch || batch->count < 0 || batch->count > GGML_EXL3_AUX_MAX_FILLS) {
+        return false;
+    }
+    if (batch->count == 0) {
+        return true;
+    }
+    if (!backend || !ggml_backend_is_cuda(backend) || !scratch || !payload || batch->n_slots <= 0 || batch->n_slots == INT_MAX) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    auto buft = ggml_backend_cuda_buffer_type(ctx->device);
+    auto valid = [&](const ggml_tensor * t) {
+        return t && t->data && t->buffer && !t->view_src && ggml_is_contiguous(t) &&
+            ggml_backend_buffer_get_type(t->buffer) == buft;
+    };
+    if (!valid(scratch) || scratch->type != GGML_TYPE_I8 || bytes > GGML_EXL3_AUX_SCRATCH_BYTES || bytes > ggml_nbytes(scratch)) {
+        return false;
+    }
+    size_t required = 0;
+    for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
+        const auto * bank = batch->banks[i];
+        if (!valid(bank) || bank->type != GGML_TYPE_F16 || bank->ne[2] != int64_t(batch->n_slots) + 1 ||
+                bank->ne[3] != 1 || !bank->nb[2] || bank->nb[2]%16 || bank->nb[2] > (bytes - required)/batch->count) {
+            return false;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (bank->data == batch->banks[j]->data) { return false; }
+        }
+        required += bank->nb[2]*batch->count;
+    }
+    if (required != bytes) { return false; }
+    for (int i = 0; i < batch->count; ++i) {
+        if (batch->slots[i] < 0 || batch->slots[i] >= batch->n_slots) { return false; }
+        for (int j = 0; j < i; ++j) {
+            if (batch->slots[i] == batch->slots[j]) { return false; }
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(scratch->data, payload, bytes, cudaMemcpyHostToDevice, ctx->stream()));
+    ggml_cuda_exl3_aux_scatter(*ctx, scratch, *batch);
+    return true;
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_exl3_aux_upload") == 0) {
+        return (void *)ggml_backend_cuda_exl3_aux_upload;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

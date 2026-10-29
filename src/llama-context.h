@@ -315,9 +315,6 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    llama_moe_cache_ptr moe_cache;
-    // whole-layer expert uploads for large batches (LLAMA_EXPERT_STREAM=<min tokens>); freed before the backends
-    llama_expert_stream_ptr expert_stream;
     llama_routing_override routing_override;
     bool routing_active = false;
     int64_t moe_perf_task = -1;
@@ -427,6 +424,9 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+    // These borrow backend handles and must also release them first when construction fails.
+    llama_moe_cache_ptr moe_cache;
+    llama_expert_stream_ptr expert_stream; // whole-layer uploads for LLAMA_EXPERT_STREAM
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

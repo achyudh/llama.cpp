@@ -587,7 +587,8 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_pin_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_pin_size,
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !cparams.pipeline_parallel);
         }
 
         // experimental: stream the host experts of large batches a layer at a time to the first GPU
@@ -650,6 +651,7 @@ llama_context::~llama_context() {
     synchronize();
     perf_moe_flush(true);
     expert_stream.reset();
+    moe_cache.reset();
 
     if (phase_leader) {
         auto & f = phase_leader->phase_followers;

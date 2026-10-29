@@ -50,6 +50,22 @@ GGML_API bool ggml_exl3_compute_forward(struct ggml_tensor * op);
 // Thread ith of nth computes its share of the output; results do not depend on nth.
 GGML_API bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth);
 
+#define GGML_EXL3_AUX_BANKS 6
+#define GGML_EXL3_AUX_MAX_FILLS 80
+#define GGML_EXL3_AUX_SCRATCH_BYTES (2 * 1024 * 1024)
+
+struct ggml_backend;
+struct ggml_exl3_aux_batch {
+    struct ggml_tensor * banks[GGML_EXL3_AUX_BANKS];
+    int32_t slots[GGML_EXL3_AUX_MAX_FILLS];
+    int32_t count;
+    int32_t n_slots;
+};
+
+// Internal backend extension. Payload is bank-major, then fill-major; the caller keeps it alive until completion.
+typedef bool (*ggml_exl3_aux_upload_t)(struct ggml_backend * backend, struct ggml_tensor * scratch,
+                                      const void * payload, size_t bytes, const struct ggml_exl3_aux_batch * batch);
+
 #ifdef __cplusplus
 }
 #endif
