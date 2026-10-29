@@ -45,11 +45,22 @@ public:
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 
+    // whether the graph should queue the shared expert between the routing and the slot lookup (LLAMA_MOE_SHARED_EARLY)
+    bool shared_early() const;
+
+    // the route trigger of layer il, a host weight whose GET_ROWS by the selected experts starts the split of the
+    // shared expert: its copy reads the selected experts back; nullptr if get_slot_map is nullptr or shared_early is false
+    ggml_tensor * get_route_trigger(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
 
-    // ggml_backend_sched copy callback, returns false if src is not a slot map
+    // ggml_backend_sched copy callback, returns false if src is not a slot map or route trigger
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+
+    // ggml_backend_sched ordered copy callback: route triggers, and the slot maps whose selected experts their route
+    // trigger read back (they do not need the scheduler to wait or the other inputs of their split)
+    bool copy_ordered(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

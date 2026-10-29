@@ -2755,6 +2755,25 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
+    // the route trigger is a host weight too: its lookup starts a split after the routing, whose copy callback reads the
+    // selected experts back, so the shared expert queued in that split runs while the host waits for them
+    // (not when the selection is a graph input, such as a replayed routing, which the split's input copies provide)
+    const ggml_tensor * ids_root = ids;
+    while (ids_root->view_src) {
+        ids_root = ids_root->view_src;
+    }
+    if (moe_shared_early != nullptr && !(ids_root->flags & GGML_TENSOR_FLAG_INPUT)) {
+        ggml_tensor * trigger = moe_cache->get_route_trigger(il, selected_experts->ne[1], selected_experts->ne[0]);
+        ggml_tensor * route   = trigger ? ggml_get_rows(ctx0, trigger, ids) : nullptr;
+        if (route && ggml_backend_supports_op(moe_cache->backend(il), route)) {
+            ggml_backend_sched_set_tensor_backend(sched, route, moe_cache->backend(il));
+            cb(route, "ffn_moe_route", il);
+            ggml_build_forward_expand(gf, route);
+            ggml_build_forward_expand(gf, moe_shared_early);
+        }
+    }
+    moe_shared_early = nullptr;
+
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]

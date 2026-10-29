@@ -283,6 +283,8 @@ private:
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
 
+    // ggml_backend_sched ordered copy callback, reads back the selected experts of the MoE cache early
+    static bool sched_copy_moe_cache(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
     static ggml_tensor * sched_alias_experts(ggml_backend_t backend, const ggml_tensor * src, const ggml_tensor * node, void * user_data);

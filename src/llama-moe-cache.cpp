@@ -262,6 +262,9 @@ struct llama_moe_cache::impl {
         ggml_backend_buffer_type_t aux_host_buft = nullptr;
         size_t aux_bytes = 0;
         bool aux_enabled = false;
+        // pinned destination of the selected experts read back when a route trigger is copied, and its completion
+        ggml_backend_buffer_ptr ids_host;
+        ggml_backend_event_t ids_ready = nullptr;
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -281,6 +284,7 @@ struct llama_moe_cache::impl {
         int32_t ig = -1;                    // -1 if the layer is not cached
         int32_t n_expert_used = 0;
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+        ggml_tensor * trigger = nullptr;    // I32 [1, n_expert] in host memory, its lookup starts the split after the routing
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
         llama_moe_perf_data perf;
         llama_moe_perf_data perf_last;
@@ -309,6 +313,14 @@ struct llama_moe_cache::impl {
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
     std::unordered_map<const ggml_tensor *, int32_t> layer_of; // slot map -> layer
+    std::unordered_map<const ggml_tensor *, int32_t> trigger_of; // route trigger -> layer
+
+    // LLAMA_MOE_SHARED_EARLY: the graph runs the shared expert between the routing and the slot lookup;
+    // early reads the selected experts back before it, serial after it (a control)
+    enum shared_mode { SHARED_OFF, SHARED_EARLY, SHARED_SERIAL } shared = SHARED_OFF;
+    // the layer whose selected experts were read back by its route trigger and are not yet consumed
+    int32_t pending_il = -1;
+    const ggml_tensor * pending_sel = nullptr;
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
@@ -403,6 +415,15 @@ struct llama_moe_cache::impl {
         if (aux_mode && std::strcmp(aux_mode, "0") != 0 && std::strcmp(aux_mode, "1") != 0 && std::strcmp(aux_mode, "reserve") != 0) {
             throw std::invalid_argument("LLAMA_MOE_AUX_BATCH must be 0, 1 or reserve");
         }
+        const char * shared_mode = aux_allowed && devices.size() == 1 ? std::getenv("LLAMA_MOE_SHARED_EARLY") : nullptr;
+        if (shared_mode && std::strcmp(shared_mode, "0") != 0 && std::strcmp(shared_mode, "1") != 0 && std::strcmp(shared_mode, "serial") != 0) {
+            throw std::invalid_argument("LLAMA_MOE_SHARED_EARLY must be 0, 1 or serial");
+        }
+        if (shared_mode && std::strcmp(shared_mode, "0") != 0) {
+            shared = std::strcmp(shared_mode, "1") == 0 ? SHARED_EARLY : SHARED_SERIAL;
+            LLAMA_LOG_INFO("%s: MoE shared expert between the routing and the slot lookup, read back %s\n", __func__,
+                shared == SHARED_EARLY ? "before it" : "after it");
+        }
         if (aux_mode && std::strcmp(aux_mode, "0") != 0) {
             for (const group & g : groups) {
                 if (!g.exl3_bits_x2 || g.ref.size() != 9) { continue; }
@@ -476,7 +497,7 @@ struct llama_moe_cache::impl {
             }
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            n_tensors_host  += g.layers.size();
+            n_tensors_host  += g.layers.size()*(shared ? 2 : 1);
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -537,6 +558,12 @@ struct llama_moe_cache::impl {
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
                 layer_of[l.slot_map] = il;
                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+                if (shared) {
+                    l.trigger = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(l.trigger, "moe_cache.route_trigger-%d", il);
+                    trigger_of[l.trigger] = il;
+                    buf_host_size += GGML_PAD(ggml_nbytes(l.trigger), alignment_host);
+                }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
@@ -604,6 +631,19 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("%s: MoE auxiliary batching %s, %.2f MiB device scratch inside cache budget\n", __func__,
                     d.aux_enabled ? "enabled" : "reserved only", d.aux_bytes/1024.0/1024.0);
             }
+            if (shared == SHARED_EARLY && d.buf && !model.hparams.no_alloc) {
+                auto * host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(d.backend));
+                if (host_buft) {
+                    d.ids_host.reset(ggml_backend_buft_alloc_buffer(host_buft, max_batch*n_expert_used*sizeof(int32_t)));
+                }
+                if (d.ids_host && ggml_backend_buffer_get_type(d.ids_host.get()) == host_buft) {
+                    d.ids_ready = ggml_backend_event_new(ggml_backend_get_device(d.backend));
+                }
+                if (!d.ids_ready) {
+                    d.ids_host.reset();
+                    LLAMA_LOG_WARN("%s: pinned readback or events unavailable; the shared expert runs after the readback\n", __func__);
+                }
+            }
         }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -659,7 +699,8 @@ struct llama_moe_cache::impl {
     ~impl() {
         log_stats();
         for (auto & d : devices) {
-            if (d.aux_host) { ggml_backend_synchronize(d.backend); }
+            if (d.aux_host || d.ids_host) { ggml_backend_synchronize(d.backend); }
+            if (d.ids_ready) { ggml_backend_event_free(d.ids_ready); }
         }
     }
 
@@ -674,6 +715,53 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         return l.slot_map;
+    }
+
+    ggml_tensor * get_route_trigger(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+        if (!shared || get_slot_map(il, n_tokens, n_expert_used) == nullptr) {
+            return nullptr;
+        }
+        return layers[il].trigger;
+    }
+
+    // the route trigger of layer il is copied after the split that selects its experts: read them back before the
+    // following split (the shared expert) is queued, so the slot map copy waits only for the routing
+    bool read_routes(ggml_backend_t backend, int32_t il, ggml_tensor * dst, ggml_cgraph * graph) {
+        const layer & l = layers[il];
+        device & d = devices[groups[l.ig].id];
+        GGML_ASSERT(backend == d.backend);
+
+        const ggml_tensor * route = nullptr;
+        for (int i = 0; i < ggml_graph_n_nodes(graph) && route == nullptr; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+                route = node;
+            }
+        }
+        GGML_ASSERT(route != nullptr);
+        const ggml_tensor * sel = route->src[1];
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node == sel || node == sel->view_src) {
+                GGML_ABORT("the experts of layer %d are selected in the same split as their route trigger", il);
+            }
+        }
+        GGML_ASSERT(ggml_is_contiguous(sel));
+
+        pending_il  = -1;
+        pending_sel = nullptr;
+        if (shared != SHARED_EARLY || !d.ids_ready || ggml_nbytes(sel) > ggml_backend_buffer_get_size(d.ids_host.get())) {
+            return true; // the slot map copy reads them back after the shared expert
+        }
+        const int64_t t0 = llama_moe_perf_enabled() ? ggml_time_us() : 0;
+        ggml_backend_tensor_get_async(backend, sel, ggml_backend_buffer_get_base(d.ids_host.get()), 0, ggml_nbytes(sel));
+        ggml_backend_event_record(d.ids_ready, backend);
+        if (t0) {
+            layers[il].perf.values[llama_moe_perf_data::submit_us] += ggml_time_us() - t0;
+        }
+        pending_il  = il;
+        pending_sel = sel;
+        return true;
     }
 
     ggml_tensor * get_experts(const ggml_tensor * w) const {
@@ -760,6 +848,9 @@ struct llama_moe_cache::impl {
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        if (const auto it_trigger = trigger_of.find(src); it_trigger != trigger_of.end()) {
+            return read_routes(backend, it_trigger->second, dst, graph);
+        }
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -795,8 +886,18 @@ struct llama_moe_cache::impl {
         ids.resize(ggml_nelements(sel));
         const bool observe = llama_moe_perf_enabled();
         const int64_t t_ids = observe ? ggml_time_us() : 0;
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        // a pending readback was queued after the routing by the route trigger: the scheduler did not wait for the
+        // backend, and waiting for the readback also waits for all earlier uploads and uses of the staging buffers
+        if (pending_il == il && pending_sel == sel) {
+            const device & d = devices[g.id];
+            ggml_backend_event_synchronize(d.ids_ready);
+            std::memcpy(ids.data(), ggml_backend_buffer_get_base(d.ids_host.get()), ggml_nbytes(sel));
+        } else {
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+            ggml_backend_synchronize(backend);
+        }
+        pending_il  = -1;
+        pending_sel = nullptr;
         const int64_t t_plan = observe ? ggml_time_us() : 0;
 
         size_t n_hit = 0, n_evicted = 0;
@@ -822,7 +923,7 @@ struct llama_moe_cache::impl {
         size_t aux_bytes = 0;
         bool batched = false;
         if (devices[g.id].aux_enabled && l.n_expert_used > 0 && ids.size() <= (size_t) 8*l.n_expert_used) {
-            // The readback synchronization above also completes the previous use of the shared staging buffers.
+            // The readback wait above also completes the previous use of the shared staging buffers.
             const int64_t t_pack = observe ? ggml_time_us() : 0;
             batched = pack_aux(l, g, aux_batch, aux_bytes);
             if (observe) { l.perf.values[llama_moe_perf_data::submit_us] += ggml_time_us() - t_pack; }
@@ -938,12 +1039,28 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
     return pimpl->get_slot_map(il, n_tokens, n_expert_used);
 }
 
+ggml_tensor * llama_moe_cache::get_route_trigger(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return pimpl->get_route_trigger(il, n_tokens, n_expert_used);
+}
+
+bool llama_moe_cache::shared_early() const {
+    return pimpl->shared != impl::SHARED_OFF;
+}
+
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
+}
+
+bool llama_moe_cache::copy_ordered(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    if (pimpl->trigger_of.count(src)) {
+        return pimpl->copy(backend, src, dst, graph);
+    }
+    const auto it = pimpl->layer_of.find(src);
+    return it != pimpl->layer_of.end() && it->second == pimpl->pending_il && pimpl->copy(backend, src, dst, graph);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
@@ -958,6 +1075,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         }
         if (d.aux_host_buft) {
             res[d.aux_host_buft] += d.aux_bytes;
+        }
+        if (d.ids_host) {
+            res[ggml_backend_buffer_get_type(d.ids_host.get())] += ggml_backend_buffer_get_size(d.ids_host.get());
         }
     }
     if (pimpl->buf_host) {

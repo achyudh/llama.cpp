@@ -968,6 +968,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
+    ggml_backend_sched_copy_callback callback_copy_ordered;
+    void * callback_copy_ordered_user_data;
 
     ggml_backend_sched_alias_callback callback_alias;
     void * callback_alias_user_data;
@@ -1841,6 +1843,17 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// the ordered copy callback of a host weight, without waiting for the split backend
+static bool ggml_backend_sched_copy_ordered(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    const int split_backend_id = split->backend_id;
+    ggml_backend_t split_backend = sched->backends[split_backend_id];
+    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+    }
+    struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+    return sched->callback_copy_ordered(split_backend, input, input_cpy, &split->graph, sched->callback_copy_ordered_user_data);
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -1905,14 +1918,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
-        // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        // host weights with an ordered copy callback go first: they order their own copies and do not read the other
+        // inputs, so they need not wait for the synchronization of the user inputs
+        uint64_t ordered = 0;
+        if (sched->callback_copy_ordered != NULL) {
+            for (int input_id = 0; input_id < split->n_inputs && input_id < 64; input_id++) {
+                if (ggml_backend_sched_is_host_weight(split->inputs[input_id]) &&
+                    ggml_backend_sched_copy_ordered(sched, split, split->inputs[input_id])) {
+                    ordered |= uint64_t(1) << input_id;
+                }
+            }
+        }
+        // the other weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+            if (ggml_backend_sched_is_host_weight(split->inputs[input_id]) && (input_id >= 64 || !(ordered >> input_id & 1))) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
@@ -2174,6 +2198,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_ordered_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy_ordered = callback;
+    sched->callback_copy_ordered_user_data = user_data;
 }
 
 void ggml_backend_sched_set_alias_callback(ggml_backend_sched_t sched, ggml_backend_sched_alias_callback callback, void * user_data) {

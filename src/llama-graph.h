@@ -1120,6 +1120,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    // work the next MoE cache lookup queues between the routing and the lookup (the shared expert), see build_moe_cache_slots
+    mutable ggml_tensor * moe_shared_early = nullptr;
 
     const llama_prec_policy * prec_policy;
 

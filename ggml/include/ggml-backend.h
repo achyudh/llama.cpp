@@ -381,6 +381,11 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Like the copy callback, but called before the split's other inputs are copied and without waiting for the split
+    // backend to finish its earlier work: the callback must order its own copy after the earlier users of dst and must
+    // not read the split's other inputs; if it returns false the weight is copied later as usual (copy callback)
+    GGML_API void                 ggml_backend_sched_set_ordered_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
     // Set a callback that can place the copy of a host weight in an existing device tensor
     GGML_API void                 ggml_backend_sched_set_alias_callback(ggml_backend_sched_t sched, ggml_backend_sched_alias_callback callback, void * user_data);
 
