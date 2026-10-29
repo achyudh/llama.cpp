@@ -136,6 +136,8 @@ public:
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
 
+    const llama_ubatch * get_next_ubatch() const;
+
 private:
     // the index of the next ubatch to process
     size_t i_next = 0;

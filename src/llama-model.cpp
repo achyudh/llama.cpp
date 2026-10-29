@@ -2620,7 +2620,34 @@ std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }
 
-size_t llama_model::get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp16_t * out, size_t out_elements) const {
+std::vector<int32_t> llama_model::get_ngram_indices(const llama_ubatch & ubatch, const std::vector<llama_token> & prev) const {
+    const int64_t n_gram = hparams.ple_ngram_size;
+    const int64_t n_heads = hparams.ple_n_heads;
+    const int64_t n_prev = n_gram - 1;
+    GGML_ASSERT(n_gram >= 2 && n_gram <= LLAMA_MAX_PLE_NGRAM && prev.size() == size_t(ubatch.n_tokens)*n_prev);
+    // Image rows hash the image token, or EOS when no image token is stored.
+    const llama_token img_tok = hparams.ple_image_token_id != 0 ? hparams.ple_image_token_id : hparams.ple_eos_token_id;
+    std::vector<int32_t> idx(size_t(ubatch.n_tokens)*n_heads);
+    std::vector<int32_t> ctx(n_gram);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const bool is_embd = !ubatch.token || (ubatch.is_mixed() && ubatch.type[i]);
+        ctx[0] = is_embd ? img_tok : ubatch.token[i];
+        for (int64_t s = 1; s < n_gram; ++s) {
+            ctx[s] = prev[size_t(i)*n_prev + (n_prev - s)];
+        }
+        for (int64_t n = 2; n <= n_gram; ++n) {
+            const int64_t base = (n - 2)*hparams.ple_heads_per_ngram;
+            for (uint32_t g = 0; g < hparams.ple_heads_per_ngram; ++g) {
+                const int64_t h = base + g;
+                idx[size_t(i)*n_heads + h] = llama_ngram_hash(ctx.data(), hparams.ple_layer_multipliers.data(), n,
+                    hparams.ple_eos_token_id, hparams.ple_head_vocab_sizes[h], hparams.ple_head_offsets[h]);
+            }
+        }
+    }
+    return idx;
+}
+
+size_t llama_model::get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp16_t * out, size_t out_elements, size_t max_threads) const {
     const auto * table = per_layer_tok_embd;
     const auto * bias = per_layer_tok_embd_bias;
     const int dim = hparams.ple_head_dim;
@@ -2686,7 +2713,10 @@ size_t llama_model::get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp1
         }
     };
     // a prefill ubatch gathers rows for thousands of tokens: decode them and take their page faults on several threads
-    const size_t n_threads = std::min<size_t>(unique.size() / 2048 + 1, std::max(1u, std::thread::hardware_concurrency() / 2));
+    size_t n_threads = std::min<size_t>(unique.size() / 2048 + 1, std::max(1u, std::thread::hardware_concurrency() / 2));
+    if (max_threads) {
+        n_threads = std::min(n_threads, max_threads);
+    }
     if (n_threads <= 1) {
         decode(0, order.size());
     } else {

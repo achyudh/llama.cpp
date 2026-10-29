@@ -78,6 +78,12 @@ static int actual(const char * fixture, const char * source, const char * output
         assert(unique == std::set<int32_t>((int32_t *) ids->data, (int32_t *) ids->data+n).size());
         assert(!memcmp(result.data()+1, ref->data, n*160*2));
         assert(result.front() == 0x5a5a && result.back() == 0x5a5a);
+        for (size_t max_threads : {1, 2, 4, 16}) {
+            std::fill(result.begin(), result.end(), 0x5a5a);
+            assert(model->get_ngram_rows((int32_t *) ids->data, n, result.data()+1, n*160, max_threads) == unique);
+            assert(!memcmp(result.data()+1, ref->data, n*160*2));
+            assert(result.front() == 0x5a5a && result.back() == 0x5a5a);
+        }
         assert(out.write((const char *) (result.data()+1), n*160*2));
         printf("ngram_gather: case=%u rows=%zu unique=%zu packed_bytes=%zu output_bytes=%zu us=%lld\n", c, n, unique, unique*162, n*320, (long long) elapsed);
     }

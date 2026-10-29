@@ -80,6 +80,12 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // EXL3 n-gram rows gathered ahead by the decode loop (ple_n_heads x ple_head_dim per token); null: set_input gathers them
+    std::shared_ptr<const std::vector<ggml_fp16_t>> embd_ngram = nullptr;
+
+    // Resolve history from adjacent text ubatches without reading or changing the KV cache.
+    bool get_contiguous_prev_tokens(const llama_ubatch & prev, uint32_t n, std::vector<llama_token> & res) const;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd

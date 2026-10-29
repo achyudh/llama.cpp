@@ -12,6 +12,39 @@
 #include <algorithm>
 #include <sstream>
 
+bool llama_ubatch::get_contiguous_prev_tokens(const llama_ubatch & prev, uint32_t n, std::vector<llama_token> & res) const {
+    if (!n || n >= LLAMA_MAX_PLE_NGRAM || !token || !prev.token || is_mixed() || prev.is_mixed() || !n_pos || !prev.n_pos) {
+        return false;
+    }
+    std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, llama_token>>> history;
+    for (uint32_t i = 0; i < prev.n_tokens; ++i) {
+        if (prev.n_seq_id[i] != 1) {
+            return false;
+        }
+        auto & seq = history[prev.seq_id[i][0]];
+        if (prev.pos[i] < 0 || (!seq.empty() && int64_t(prev.pos[i]) != int64_t(seq.back().first) + 1)) {
+            return false;
+        }
+        seq.emplace_back(prev.pos[i], prev.token[i]);
+    }
+    std::vector<llama_token> result(size_t(n_tokens)*n);
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (n_seq_id[i] != 1) {
+            return false;
+        }
+        auto & seq = history[seq_id[i][0]];
+        if (seq.size() < n || int64_t(pos[i]) != int64_t(seq.back().first) + 1) {
+            return false;
+        }
+        for (uint32_t j = 0; j < n; ++j) {
+            result[size_t(i)*n + j] = seq[seq.size() - n + j].second;
+        }
+        seq.emplace_back(pos[i], token[i]);
+    }
+    res.swap(result);
+    return true;
+}
+
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed) : n_pos_per_embd(n_pos_per_embd), allow_mixed(allow_mixed) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;

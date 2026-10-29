@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-kv-stream.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -19,6 +20,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1656,7 +1658,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, const std::function<void()> & inputs_ready) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1717,6 +1719,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (inputs_ready) {
+        inputs_ready();
     }
 
     static const bool trace_moe = std::getenv("GGML_CPU_MOE_TRACE") != nullptr;
@@ -2174,8 +2180,52 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // LLAMA_NGRAM_OVERLAP=0 gathers every ubatch's n-gram rows in its own set_input, for comparison
+    static const bool ngram_overlap_env = [] {
+        const char * env = std::getenv("LLAMA_NGRAM_OVERLAP");
+        return !env || atoi(env) != 0;
+    }();
+    static const size_t ngram_threads_env = [] {
+        const char * env = std::getenv("LLAMA_NGRAM_OVERLAP_THREADS");
+        return env ? (size_t) std::max(1, atoi(env)) : (size_t) 4;
+    }();
+    const size_t ngram_threads = ngram_threads_env; // a lambda captures only automatic variables
+    const bool ngram_overlap = model.exl3_ngram_bits && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && ngram_overlap_env;
+    const auto * hybrid = ngram_overlap ? dynamic_cast<const llama_memory_hybrid_context *>(mctx.get()) : nullptr;
+    // The async future joins on every exit; its worker owns only row IDs and reads immutable model weights.
+    std::future<std::shared_ptr<const std::vector<ggml_fp16_t>>> ngram_pending;
+    const llama_ubatch * ngram_next = nullptr;
+
     do {
-        const auto & ubatch = mctx->get_ubatch();
+        auto ubatch = mctx->get_ubatch();
+
+        if (ngram_pending.valid()) {
+            if (ngram_next && ngram_next->data == ubatch.data && ngram_next->token == ubatch.token) {
+                // a failed lookahead leaves the rows to the ubatch's own set_input, which reports its error itself
+                try {
+                    ubatch.embd_ngram = ngram_pending.get();
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_WARN("%s: n-gram lookahead failed, gathering serially: %s\n", __func__, e.what());
+                }
+            } else {
+                ngram_pending = {};
+            }
+        }
+        ngram_next = hybrid ? hybrid->get_next_ubatch() : nullptr;
+        std::vector<llama_token> ngram_prev;
+        std::function<void()> inputs_ready;
+        if (ngram_next && ngram_next->n_tokens > 8 &&
+                ngram_next->get_contiguous_prev_tokens(ubatch, hparams.ple_ngram_size - 1, ngram_prev)) {
+            auto ids = model.get_ngram_indices(*ngram_next, ngram_prev);
+            const auto * ngram_model = &model;
+            inputs_ready = [ngram_model, ngram_threads, ids = std::move(ids), &ngram_pending]() mutable {
+                ngram_pending = std::async(std::launch::async, [ngram_model, ngram_threads, ids = std::move(ids)] {
+                    auto rows = std::make_shared<std::vector<ggml_fp16_t>>(ids.size()*ngram_model->hparams.ple_head_dim);
+                    ngram_model->get_ngram_rows(ids.data(), ids.size(), rows->data(), rows->size(), ngram_threads);
+                    return std::shared_ptr<const std::vector<ggml_fp16_t>>(std::move(rows));
+                });
+            };
+        }
 
         // count the outputs in this ubatch
         {
@@ -2195,7 +2245,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, inputs_ready);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

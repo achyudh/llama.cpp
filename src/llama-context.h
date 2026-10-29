@@ -14,6 +14,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -144,7 +145,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+        const std::function<void()> & inputs_ready = {});
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);

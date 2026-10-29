@@ -910,7 +910,8 @@ struct llama_model {
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     // Decode each unique requested row once; storage stays in the existing lazy host mapping.
-    size_t get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp16_t * out, size_t out_elements) const;
+    size_t get_ngram_rows(const int32_t * rows, size_t n_rows, ggml_fp16_t * out, size_t out_elements, size_t max_threads = 0) const;
+    std::vector<int32_t> get_ngram_indices(const llama_ubatch & ubatch, const std::vector<llama_token> & prev) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

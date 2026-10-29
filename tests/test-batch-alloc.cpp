@@ -1131,6 +1131,59 @@ static void test_compat(testing & t) {
     });
 }
 
+static void test_ngram_history(testing & t) {
+    auto batch = [](int start, int count, bool interleaved) {
+        llama_batch_allocr ba(1);
+        auto ub = ba.ubatch_reserve(count, 2);
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            const int seq = interleaved ? i % 2 : i / count;
+            const int pos = start + (interleaved ? i / 2 : i % count);
+            ub.n_seq_id[i] = 1;
+            ub.seq_id[i] = &ub.seq_id_unq[seq];
+            ub.pos[i] = pos;
+            ub.token[i] = seq*100 + pos;
+        }
+        return ub;
+    };
+    t.test("adjacent_sequences", [&](testing & t) {
+        for (bool interleaved : {false, true}) {
+            auto prev = batch(0, 4, interleaved);
+            auto next = batch(4, 3, !interleaved);
+            // Text M-RoPE uses the first position section for token history.
+            prev.n_pos = next.n_pos = 4;
+            std::vector<llama_token> result;
+            t.assert_true(next.get_contiguous_prev_tokens(prev, 2, result));
+            t.assert_equal(size_t(12), result.size());
+            for (uint32_t i = 0; i < next.n_tokens; ++i) {
+                t.assert_equal(next.token[i] - 2, result[2*i]);
+                t.assert_equal(next.token[i] - 1, result[2*i + 1]);
+            }
+        }
+    });
+    t.test("fallback_preserves_output", [&](testing & t) {
+        for (int variant = 0; variant < 10; ++variant) {
+            auto prev = batch(0, 4, false);
+            auto next = batch(4, 3, false);
+            int8_t mixed = 0;
+            switch (variant) {
+                case 0: prev.pos[2]++; break;
+                case 1: prev.pos[2]--; break;
+                case 2: next.pos[0]--; break;
+                case 3: next.pos[0]++; break;
+                case 4: prev.n_seq_id[0] = 2; break;
+                case 5: next.n_seq_id[0] = 2; break;
+                case 6: next.type = &mixed; break;
+                case 7: next.token = nullptr; break;
+                case 8: next.n_pos = 0; break;
+                case 9: prev = batch(3, 1, false); break;
+            }
+            std::vector<llama_token> result = {1234};
+            t.assert_true(!next.get_contiguous_prev_tokens(prev, 2, result));
+            t.assert_true(result == std::vector<llama_token>{1234});
+        }
+    });
+}
+
 static void test_mtp_embd_width(testing & t) {
     t.test("mtp_keeps_n_embd_inp_and_takes_state_at_n_embd_out", [&](testing & t) {
         llama_hparams hparams = {};
@@ -1199,6 +1252,7 @@ int main(int argc, char ** argv) {
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
+    t.test("ngram_history",  test_ngram_history);
 
     return t.summary();
 }

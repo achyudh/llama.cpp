@@ -1293,52 +1293,21 @@ public:
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hparams = model.hparams;
 
-    // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
-    // stand in the image token id that the reference hashes, or EOS if the file has no such key
-    // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
-    const llama_token img_tok = hparams.ple_image_token_id != 0
-        ? (llama_token) hparams.ple_image_token_id
-        : (llama_token) hparams.ple_eos_token_id;
-    auto tok_of = [&](int64_t k) -> llama_token {
-        const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[k]);
-        return is_embd ? img_tok : ubatch->token[k];
-    };
-
-    const int64_t n_tokens = ubatch->n_tokens;
-    const int64_t n_gram   = hparams.ple_ngram_size;
-    const int64_t n_heads  = hparams.ple_n_heads;
-    const int64_t per_gram = hparams.ple_heads_per_ngram;
-    const int64_t eos      = hparams.ple_eos_token_id;
-    const int64_t n_prev   = n_gram - 1;
-
-    std::vector<int32_t> idx(n_heads * n_tokens);
+    if (emb && ubatch->embd_ngram) {
+        const auto & prepared = *ubatch->embd_ngram;
+        GGML_ASSERT(prepared.size()*sizeof(ggml_fp16_t) == ggml_nbytes(emb));
+        ggml_backend_tensor_set(emb, prepared.data(), 0, prepared.size()*sizeof(ggml_fp16_t));
+        return;
+    }
 
     GGML_ASSERT(mctx != nullptr);
-
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        // the preceding tokens would be ambiguous, see get_prev_tokens()
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
-    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
-    mctx->get_prev_tokens(*ubatch, n_prev, prev);
-
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        std::vector<int32_t> ctx(n_gram);
-        ctx[0] = tok_of(i);
-        for (int64_t s = 1; s < n_gram; ++s) {
-            ctx[s] = prev[i*n_prev + (n_prev - s)];
-        }
-
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] = llama_ngram_hash(ctx.data(), hparams.ple_layer_multipliers.data(), n,
-                    eos, hparams.ple_head_vocab_sizes[h_i], hparams.ple_head_offsets[h_i]);
-            }
-        }
-    }
+    // apply_ubatch() stored this ubatch, so its own tokens are also available in the KV cells.
+    mctx->get_prev_tokens(*ubatch, hparams.ple_ngram_size - 1, prev);
+    const auto idx = model.get_ngram_indices(*ubatch, prev);
 
     if (emb) {
         decoded.resize(idx.size()*hparams.ple_head_dim);
