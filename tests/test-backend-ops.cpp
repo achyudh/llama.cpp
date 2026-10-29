@@ -10285,6 +10285,54 @@ struct test_flash_attn_ext_cells : public test_flash_attn_ext {
     }
 };
 
+struct test_flash_attn_ext_cells_equal : public test_flash_attn_ext_cells {
+    const bool empty;
+
+    test_flash_attn_ext_cells_equal(int64_t kv, int64_t n_list, ggml_type type, bool empty = false)
+        : test_flash_attn_ext_cells(256, 256, 2, {12, 1}, kv, 1, type, type, n_list), empty(empty) {}
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+    std::string vars() override { return test_flash_attn_ext_cells::vars() + ",mask_cells_equal=1,empty=" + std::to_string(empty); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * lists = test_flash_attn_ext_cells::build_graph(ctx);
+        auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+        ggml_set_name(mask, "mask_cells");
+        auto * full = ggml_flash_attn_ext(ctx, lists->src[0], lists->src[1], lists->src[2], mask,
+                                        1.0f/sqrtf(hsk), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_n_kv_max(full, n_list);
+        ggml_prec_set_acc(full, GGML_PREC_F32);
+        return ggml_concat(ctx, full, lists, 3);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_cells::initialize_tensors(ctx);
+        auto * cells = ggml_get_tensor(ctx, "cells");
+        std::vector<int32_t> ids(ggml_nelements(cells));
+        ggml_backend_tensor_get(cells, ids.data(), 0, ids.size()*sizeof(int32_t));
+        if (empty) {
+            std::fill(ids.begin(), ids.end(), -1);
+            ggml_backend_tensor_set(cells, ids.data(), 0, ids.size()*sizeof(int32_t));
+        }
+        auto * mask = ggml_get_tensor(ctx, "mask_cells");
+        std::vector<ggml_fp16_t> data(ggml_nelements(mask), ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t r = 0; r < ggml_nrows(cells); ++r) {
+            for (int64_t j = 0; j < n_list && ids[r*n_list + j] >= 0; ++j) {
+                data[r*kv + ids[r*n_list + j]] = ggml_fp32_to_fp16(0.0f);
+            }
+        }
+        ggml_backend_tensor_set(mask, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (memcmp(a, a + n/2, n/2*sizeof(float)) || memcmp(b, b + n/2, n/2*sizeof(float))) {
+            return INFINITY;
+        }
+        return test_flash_attn_ext::err(a, b, n);
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -13338,6 +13386,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_cells(256, 256, 2, {12, 1}, 4096,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2051));
     test_cases.emplace_back(new test_flash_attn_ext_cells(256, 256, 2, {12, 1}, 1024,   4, GGML_TYPE_F16,  GGML_TYPE_F16,  2051));
     test_cases.emplace_back(new test_flash_attn_ext_cells(256, 256, 2, {12, 2}, 32768, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2051));
+    for (int64_t kv : {256, 512, 1024, 2048}) {
+        test_cases.emplace_back(new test_flash_attn_ext_cells_equal(kv, kv + 3, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_cells_equal(kv, 2051, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_cells_equal(1024, 2051, GGML_TYPE_Q8_0, true));
     // a GQA that is not a multiple of 4 heads per wave takes the decode kernel with one split
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 6, 1}, 32768,  67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {16, 1}, 8192, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1000));

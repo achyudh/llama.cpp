@@ -746,9 +746,10 @@ void ggml_cuda_flash_attn_ext_sparse(ggml_backend_cuda_context & ctx, ggml_tenso
     // about 2 blocks per CU, at least two staging steps per split
     const int nsm     = ggml_cuda_info().devices[ctx.device].nsm;
     const int blocks  = K->ne[2]*n_rows;
+    const int n_kv_split = std::min<int64_t>(n_kv_max, K->ne[1]);
     // a prefill has a row per block: one split, so that each row's sum order is fixed
     const int n_split = n_q > FS_MAX_Q ? 1 :
-        std::max(1, std::min((2*nsm + blocks - 1)/blocks, (n_kv_max + 2*FS_ROWS - 1)/(2*FS_ROWS)));
+        std::max(1, std::min((2*nsm + blocks - 1)/blocks, (n_kv_split + 2*FS_ROWS - 1)/(2*FS_ROWS)));
 
     ggml_cuda_pool_alloc<float>  parts(ctx.pool());
     ggml_cuda_pool_alloc<float2> meta(ctx.pool());
