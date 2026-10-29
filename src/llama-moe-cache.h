@@ -20,7 +20,8 @@ struct llama_moe_perf_data {
     enum metric {
         hits, misses, evictions, hit_bytes, fill_bytes, fill_calls, bypass_bytes, bypass_calls,
         bypass_large, bypass_other, padding_bytes, d2d_bytes, d2d_calls, id_bytes, id_calls,
-        id_wait_us, plan_us, submit_us, copy_le64k, copy_le1m, copy_le4m, copy_gt4m, count
+        id_wait_us, plan_us, submit_us, copy_le64k, copy_le1m, copy_le4m, copy_gt4m,
+        extra_hits, extra_misses, extra_fill_bytes, extra_invalidated, count
     };
     std::array<uint64_t, count> values = {};
 
@@ -54,6 +55,11 @@ public:
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
+    ggml_tensor * get_extra_experts(const ggml_tensor * w) const;
+
+    bool wants_staging() const;
+    void attach_staging(ggml_backend_t backend, ggml_backend_buffer_t buffer);
+    void set_staging_active(bool active);
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map or route trigger
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);

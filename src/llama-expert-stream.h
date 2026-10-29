@@ -35,6 +35,11 @@ public:
 
     size_t staging_size() const { return staging_bytes; }
 
+    ggml_backend_t get_backend() const { return backend; }
+    ggml_backend_buffer_t staging_buffer() const { return staging; }
+    bool streams(int64_t n_tokens) const { return n_tokens >= min_tokens; }
+    void set_borrowed(bool value);
+
 private:
     struct slot {
         int                  layer = -1;      // model layer whose group is (being) uploaded
@@ -71,6 +76,7 @@ private:
 
     // main thread only
     int current_layer = -1, current_group = -1; // the group the compute stream was last made to wait for
+    bool borrowed = false;
 
     // shared with the copy thread
     std::mutex              mutex;

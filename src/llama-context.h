@@ -427,8 +427,8 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
     // These borrow backend handles and must also release them first when construction fails.
-    llama_moe_cache_ptr moe_cache;
     llama_expert_stream_ptr expert_stream; // whole-layer uploads for LLAMA_EXPERT_STREAM
+    llama_moe_cache_ptr moe_cache; // can borrow the expert stream's staging
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

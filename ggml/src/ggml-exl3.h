@@ -46,8 +46,11 @@ struct ggml_exl3_bundle {
 GGML_API bool ggml_exl3_load_bundle(const struct gguf_context * metadata, struct ggml_context * tensors,
                                    struct ggml_exl3_bundle * bundle);
 GGML_API bool ggml_exl3_op_supported(const struct ggml_tensor * op);
-// Routed projections of cached banks: the accumulation order does not depend on the slots the experts occupy.
+// Cache projections keep K order independent of physical slot placement.
 GGML_API bool ggml_exl3_set_cache_order(struct ggml_tensor * op);
+// Optional second expert bank; slot IDs continue after the base bank. No allocation.
+GGML_API bool ggml_exl3_set_extra(struct ggml_tensor * op, struct ggml_tensor * packed,
+                                struct ggml_tensor * suh, struct ggml_tensor * svh);
 GGML_API bool ggml_exl3_compute_forward(struct ggml_tensor * op);
 // Thread ith of nth computes its share of the output; results do not depend on nth.
 GGML_API bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth);
@@ -62,6 +65,8 @@ struct ggml_exl3_aux_batch {
     int32_t slots[GGML_EXL3_AUX_MAX_FILLS];
     int32_t count;
     int32_t n_slots;
+    struct ggml_tensor * extra_banks[GGML_EXL3_AUX_BANKS];
+    int32_t base_slots;
 };
 
 // Internal backend extension. Payload is bank-major, then fill-major; the caller keeps it alive until completion.

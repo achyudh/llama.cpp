@@ -147,6 +147,25 @@ int llama_expert_stream::next_layer(int il, int steps) const {
     return order[(position[il] + steps) % order.size()];
 }
 
+void llama_expert_stream::set_borrowed(bool value) {
+    if (borrowed == value) { return; }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return queue.empty(); });
+    }
+    ggml_backend_synchronize(copy_backend);
+    ggml_backend_synchronize(backend);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto & s : slots) {
+            s.layer = -1;
+            s.uploaded = false;
+        }
+    }
+    current_layer = current_group = -1;
+    borrowed = value;
+}
+
 ggml_tensor * llama_expert_stream::alias(ggml_backend_t backend, const ggml_tensor * w, int64_t n_tokens) const {
     if (backend != this->backend || n_tokens < min_tokens) {
         return nullptr;
@@ -164,6 +183,7 @@ bool llama_expert_stream::copy(ggml_backend_t backend, const ggml_tensor * w, gg
         return false;
     }
     const entry & e = it->second;
+    GGML_ASSERT(!borrowed);
     acquire(e.layer, e.group);
     if (dst->data != staged[e.layer][e.index]->data) {
         ggml_backend_tensor_copy_async(backend, backend, staged[e.layer][e.index], dst);

@@ -52,7 +52,8 @@ void llama_moe_perf_data::print(int64_t task, int slot, int phase, int role, int
     static const char * names[count] = {
         "hits", "misses", "evictions", "hit_bytes", "fill_bytes", "fill_calls", "bypass_bytes", "bypass_calls",
         "bypass_large", "bypass_other", "padding_bytes", "d2d_bytes", "d2d_calls", "id_bytes", "id_calls",
-        "id_wait_us", "plan_us", "submit_us", "copy_le64k", "copy_le1m", "copy_le4m", "copy_gt4m"
+        "id_wait_us", "plan_us", "submit_us", "copy_le64k", "copy_le1m", "copy_le4m", "copy_gt4m",
+        "extra_hits", "extra_misses", "extra_fill_bytes", "extra_invalidated"
     };
     std::ostringstream fields;
     for (size_t i = 0; i < count; ++i) {
@@ -84,6 +85,7 @@ namespace {
 struct moe_cache_slru {
     int32_t n_expert = 0;
     int32_t n_slots  = 0;
+    int32_t active_slots = 0;
 
     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
@@ -103,6 +105,7 @@ struct moe_cache_slru {
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
+        active_slots = n_slots;
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
         prev.resize(n_slots);
@@ -148,7 +151,7 @@ struct moe_cache_slru {
 
     void touch(int32_t s) {
         move(s, true);
-        if (n_protected > n_slots/2) {
+        if (n_protected > active_slots/2) {
             move(head[1], false);
         }
     }
@@ -156,6 +159,7 @@ struct moe_cache_slru {
     int32_t victim(int32_t il) const {
         for (int segment = 0; segment < 2; ++segment) {
             for (int32_t s = head[segment]; s >= 0; s = next[s]) {
+                if (s >= active_slots) { continue; }
                 const int32_t key = key_of[s];
                 // keep every expert selected by this request, including earlier fills
                 if (key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen) {
@@ -164,6 +168,23 @@ struct moe_cache_slru {
             }
         }
         GGML_ABORT("no SLRU victim");
+    }
+
+    size_t set_active(int32_t count) {
+        GGML_ASSERT(count > 0 && count <= n_slots);
+        size_t removed = 0;
+        for (int32_t s = count; s < active_slots; ++s) {
+            const int32_t key = key_of[s];
+            if (key >= 0) {
+                slot_map[key / n_expert][key % n_expert] = -1;
+                key_of[s] = -1;
+                removed++;
+            }
+            move(s, false);
+        }
+        active_slots = count;
+        while (n_protected > active_slots/2) { move(head[1], false); }
+        return removed;
     }
 
     struct fill {
@@ -190,7 +211,7 @@ struct moe_cache_slru {
                 uniq.push_back(ids[i]);
             }
         }
-        if (uniq.size() > (size_t) n_slots) {
+        if (uniq.size() > (size_t) active_slots) {
             return false;
         }
 
@@ -273,6 +294,9 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> ref;   // expert tensors of the first layer
         std::vector<int32_t> layers;
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
+        std::vector<ggml_tensor *> extra_banks;
+        std::vector<ggml_tensor *> extra_views;
+        int32_t base_slots = 0;
         size_t host_bytes = 0;
         int32_t n_slots = 0;
         int exl3_bits_x2 = 0;
@@ -332,6 +356,10 @@ struct llama_moe_cache::impl {
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
+    ggml_context_ptr ctx_extra;
+    enum staging_mode { STAGING_OFF, STAGING_ON, STAGING_RESERVE } staging = STAGING_OFF;
+    bool staging_active = false;
+    size_t staging_used = 0;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin, bool aux_allowed) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
@@ -414,6 +442,14 @@ struct llama_moe_cache::impl {
         const char * aux_mode = aux_allowed && devices.size() == 1 ? std::getenv("LLAMA_MOE_AUX_BATCH") : nullptr;
         if (aux_mode && std::strcmp(aux_mode, "0") != 0 && std::strcmp(aux_mode, "1") != 0 && std::strcmp(aux_mode, "reserve") != 0) {
             throw std::invalid_argument("LLAMA_MOE_AUX_BATCH must be 0, 1 or reserve");
+        }
+        const char * staging_mode = aux_allowed ? std::getenv("LLAMA_MOE_CACHE_STAGING") : nullptr;
+        if (staging_mode && std::strcmp(staging_mode, "0") != 0) {
+            if (!aux_allowed || devices.size() != 1 || !aux_mode || std::strcmp(aux_mode, "1") != 0 ||
+                    (std::strcmp(staging_mode, "1") != 0 && std::strcmp(staging_mode, "reserve") != 0)) {
+                throw std::invalid_argument("LLAMA_MOE_CACHE_STAGING requires 1 or reserve, one target GPU and LLAMA_MOE_AUX_BATCH=1");
+            }
+            staging = std::strcmp(staging_mode, "1") == 0 ? STAGING_ON : STAGING_RESERVE;
         }
         const char * shared_mode = aux_allowed && devices.size() == 1 ? std::getenv("LLAMA_MOE_SHARED_EARLY") : nullptr;
         if (shared_mode && std::strcmp(shared_mode, "0") != 0 && std::strcmp(shared_mode, "1") != 0 && std::strcmp(shared_mode, "serial") != 0) {
@@ -704,6 +740,103 @@ struct llama_moe_cache::impl {
         }
     }
 
+    void attach_staging(ggml_backend_t backend, ggml_backend_buffer_t buffer) {
+        if (staging == STAGING_OFF) { return; }
+        if (ctx_extra || devices.size() != 1 || devices[0].backend != backend || !buffer ||
+                ggml_backend_buffer_get_type(buffer) != devices[0].buft || !devices[0].aux_enabled) {
+            throw std::runtime_error("MoE staging cache requires the target's staging buffer and pinned auxiliary batching");
+        }
+        const size_t align = ggml_backend_buft_get_alignment(devices[0].buft);
+        const size_t available = ggml_backend_buffer_get_size(buffer);
+        const size_t host_bytes = devices[0].host_bytes;
+        if (!align || !host_bytes || !ggml_backend_buffer_get_base(buffer)) {
+            throw std::runtime_error("MoE staging cache has no usable backing buffer");
+        }
+        auto allocation = [&](const group & g, int32_t slots) {
+            size_t total = 0;
+            for (auto * t : g.ref) {
+                if (!t->nb[2] || size_t(slots) + 1 > (SIZE_MAX - (align - 1))/t->nb[2]) {
+                    throw std::runtime_error("MoE staging cache bank size overflow");
+                }
+                const size_t bytes = GGML_PAD((size_t(slots) + 1)*t->nb[2], align);
+                if (bytes > SIZE_MAX - total) { throw std::runtime_error("MoE staging cache size overflow"); }
+                total += bytes;
+            }
+            return total;
+        };
+        std::vector<int32_t> counts(groups.size(), 0);
+        for (size_t i = 0; i < groups.size(); ++i) {
+            const group & g = groups[i];
+            if (g.id != 0 || !g.n_slots || !g.exl3_bits_x2 || g.ref.size() != 9 ||
+                    layers.size() > size_t(INT32_MAX)/g.slru.n_expert) {
+                throw std::runtime_error("MoE staging cache requires supported EXL3 base banks");
+            }
+            const size_t budget = (size_t) ((long double) available*g.host_bytes/host_bytes);
+            const int32_t limit = std::min<int64_t>(16384 - g.n_slots, int64_t(g.layers.size())*g.slru.n_expert - g.n_slots);
+            while (counts[i] < limit && allocation(g, counts[i] + 1) <= budget) { counts[i]++; }
+            if (!counts[i]) { throw std::runtime_error("MoE staging cache has no room for an extension bank"); }
+        }
+        ctx_extra.reset(ggml_init({groups.size()*18*ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx_extra) { throw std::runtime_error("failed to create the MoE staging cache context"); }
+        char * base = (char *) ggml_backend_buffer_get_base(buffer);
+        for (size_t i = 0; i < groups.size(); ++i) {
+            group & g = groups[i];
+            const int32_t count = counts[i];
+            g.base_slots = g.n_slots;
+            for (auto * t : g.ref) {
+                auto * bank = ggml_new_tensor_3d(ctx_extra.get(), t->type, t->ne[0], t->ne[1], count + 1);
+                const size_t size = GGML_PAD(ggml_backend_buft_get_alloc_size(devices[0].buft, bank), align);
+                if (staging_used > available || size > available - staging_used || bank->nb[2] != t->nb[2]) {
+                    throw std::runtime_error("MoE staging cache bank exceeds its backing buffer");
+                }
+                ggml_format_name(bank, "moe_cache.extra.%zu.%s", i, t->name);
+                if (ggml_backend_tensor_alloc(buffer, bank, base + staging_used) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("failed to bind a MoE staging cache bank");
+                }
+                staging_used += size;
+                auto * view = ggml_view_3d(ctx_extra.get(), bank, bank->ne[0], bank->ne[1], count, bank->nb[1], bank->nb[2], 0);
+                ggml_format_name(view, "moe_cache.extra_view.%zu.%s", i, t->name);
+                ggml_backend_view_init(view);
+                g.extra_banks.push_back(bank);
+                g.extra_views.push_back(view);
+            }
+            g.n_slots += count;
+            g.slru.init(layers.size(), g.slru.n_expert, g.n_slots);
+            for (int32_t il : g.layers) { g.slru.slot_map[il] = (int32_t *) layers[il].slot_map->data; }
+            g.slru.set_active(g.base_slots);
+            LLAMA_LOG_INFO("moe_staging: group=%zu base_slots=%d extra_slots=%d total_slots=%d bits_x2=%d\n",
+                i, g.base_slots, count, g.n_slots, g.exl3_bits_x2);
+        }
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        LLAMA_LOG_INFO("moe_staging: borrowed_bytes=%zu buffer_bytes=%zu device_payload_added=0 mode=%s\n",
+            staging_used, available, staging == STAGING_ON ? "enabled" : "reserve");
+    }
+
+    void set_staging_active(bool active) {
+        if (!ctx_extra || staging_active == active) { return; }
+        const int64_t start = ggml_time_us();
+        ggml_backend_synchronize(devices[0].backend);
+        pending_il = -1;
+        pending_sel = nullptr;
+        size_t invalidated = 0;
+        for (auto & g : groups) {
+            if (!active) {
+                for (int32_t s = g.base_slots; s < g.slru.active_slots; ++s) {
+                    const int32_t key = g.slru.key_of[s];
+                    if (key >= 0) { layers[key/g.slru.n_expert].perf.values[llama_moe_perf_data::extra_invalidated]++; }
+                }
+                invalidated += g.slru.set_active(g.base_slots);
+            } else {
+                for (auto * bank : g.extra_banks) {
+                    ggml_backend_tensor_memset(bank, 0, (bank->ne[2] - 1)*bank->nb[2], bank->nb[2]);
+                }
+                g.slru.set_active(staging == STAGING_ON ? g.n_slots : g.base_slots);
+            }
+        }
+        staging_active = active;
+        LLAMA_LOG_INFO("moe_staging: active=%d invalidated=%zu transition_us=%" PRId64 "\n", active, invalidated, ggml_time_us() - start);
+    }
+
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
@@ -711,7 +844,7 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > groups[l.ig].max_tokens || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        if (n_tokens == 0 || n_tokens > groups[l.ig].max_tokens || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > (groups[l.ig].base_slots ? groups[l.ig].base_slots : groups[l.ig].n_slots)) {
             return nullptr;
         }
         return l.slot_map;
@@ -790,9 +923,12 @@ struct llama_moe_cache::impl {
             n++;
         }
 
-        ggml_tensor * bank = g.banks[b.ip];
+        const bool extra = g.base_slots && slots[e] >= g.base_slots;
+        ggml_tensor * bank = extra ? g.extra_banks[b.ip] : g.banks[b.ip];
+        if (!extra && g.base_slots) { n = std::min<int64_t>(n, g.base_slots - slots[e]); }
+        const int32_t local = slots[e] - (extra ? g.base_slots : 0);
         ggml_reset(ctx_views.get());
-        ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], slots[e]*bank->nb[2]);
+        ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], local*bank->nb[2]);
         ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
         ggml_backend_view_init(src_view);
         ggml_backend_view_init(dst_view);
@@ -831,9 +967,11 @@ struct llama_moe_cache::impl {
             }
             bytes += w->nb[2]*fills.size();
             batch.banks[i] = bank;
+            batch.extra_banks[i] = g.base_slots ? g.extra_banks[indices[i]] : nullptr;
         }
         batch.count = (int32_t) fills.size();
         batch.n_slots = g.n_slots;
+        batch.base_slots = g.base_slots;
         for (size_t i = 0; i < fills.size(); ++i) { batch.slots[i] = fills[i].slot; }
         auto * out = (uint8_t *) ggml_backend_buffer_get_base(d.aux_host.get());
         if (!out) { return false; }
@@ -915,6 +1053,15 @@ struct llama_moe_cache::impl {
             perf[llama_moe_perf_data::hits] += n_hit;
             perf[llama_moe_perf_data::misses] += fills.size();
             perf[llama_moe_perf_data::evictions] += n_evicted;
+            if (g.base_slots) {
+                size_t requested = 0, missed = 0, expert_bytes = 0;
+                for (auto e : g.slru.uniq) { requested += g.slru.slot_map[il][e] >= g.base_slots; }
+                for (const auto & f : fills) { missed += f.slot >= g.base_slots; }
+                for (const auto * w : l.experts) { expert_bytes += w->nb[2]; }
+                perf[llama_moe_perf_data::extra_hits] += requested - missed;
+                perf[llama_moe_perf_data::extra_misses] += missed;
+                perf[llama_moe_perf_data::extra_fill_bytes] += missed*expert_bytes;
+            }
             for (const auto * w : l.experts) {
                 perf[llama_moe_perf_data::hit_bytes] += n_hit*w->nb[2];
             }
@@ -932,15 +1079,18 @@ struct llama_moe_cache::impl {
         size_t bytes = 0;
         auto upload_bank = [&](size_t ip) {
             const ggml_tensor * w    = l.experts[ip];
-            ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
             for (size_t i = 0; i < fills.size();) {
+                const bool extra = g.base_slots && fills[i].slot >= g.base_slots;
+                ggml_tensor * bank = extra ? g.extra_banks[ip] : g.banks[ip];
+                const int32_t local = fills[i].slot - (extra ? g.base_slots : 0);
                 size_t n = 1;
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                    if (!extra && g.base_slots && fills[i + n].slot >= g.base_slots) { break; }
                     n++;
                 }
                 const int64_t t_copy = observe ? ggml_time_us() : 0;
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, local*expert_size, n*expert_size);
                 if (observe) {
                     l.perf.values[llama_moe_perf_data::submit_us] += ggml_time_us() - t_copy;
                 }
@@ -968,6 +1118,7 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+
 
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
@@ -1049,6 +1200,25 @@ bool llama_moe_cache::shared_early() const {
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+ggml_tensor * llama_moe_cache::get_extra_experts(const ggml_tensor * w) const {
+    const auto it = pimpl->bindings.find(w);
+    if (it == pimpl->bindings.end()) { return nullptr; }
+    const auto & g = pimpl->groups[pimpl->layers[it->second.il].ig];
+    return g.extra_views.empty() ? nullptr : g.extra_views[it->second.ip];
+}
+
+bool llama_moe_cache::wants_staging() const {
+    return pimpl->staging != impl::STAGING_OFF;
+}
+
+void llama_moe_cache::attach_staging(ggml_backend_t backend, ggml_backend_buffer_t buffer) {
+    pimpl->attach_staging(backend, buffer);
+}
+
+void llama_moe_cache::set_staging_active(bool active) {
+    pimpl->set_staging_active(active);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {

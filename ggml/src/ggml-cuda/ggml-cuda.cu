@@ -6637,14 +6637,32 @@ static bool ggml_backend_cuda_exl3_aux_upload(ggml_backend_t backend, ggml_tenso
         return false;
     }
     size_t required = 0;
+    const bool split = batch->base_slots > 0;
+    if (batch->base_slots < 0 || (split && batch->base_slots >= batch->n_slots)) { return false; }
     for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
         const auto * bank = batch->banks[i];
-        if (!valid(bank) || bank->type != GGML_TYPE_F16 || bank->ne[2] != int64_t(batch->n_slots) + 1 ||
+        if (!valid(bank) || bank->type != GGML_TYPE_F16 || bank->ne[2] != int64_t(split ? batch->base_slots : batch->n_slots) + 1 ||
                 bank->ne[3] != 1 || !bank->nb[2] || bank->nb[2]%16 || bank->nb[2] > (bytes - required)/batch->count) {
+            return false;
+        }
+        const auto * extra = batch->extra_banks[i];
+        if (split) {
+            if (!valid(extra) || extra->type != bank->type || extra->ne[0] != bank->ne[0] || extra->ne[1] != bank->ne[1] ||
+                    extra->ne[2] != int64_t(batch->n_slots - batch->base_slots) + 1 || extra->ne[3] != 1 ||
+                    extra->nb[2] != bank->nb[2]) { return false; }
+        } else if (extra) {
             return false;
         }
         for (int j = 0; j < i; ++j) {
             if (bank->data == batch->banks[j]->data) { return false; }
+        }
+        if (extra) {
+            for (int j = 0; j < GGML_EXL3_AUX_BANKS; ++j) {
+                if (batch->banks[j] && extra->data == batch->banks[j]->data) { return false; }
+            }
+            for (int j = 0; j < i; ++j) {
+                if (extra->data == batch->extra_banks[j]->data) { return false; }
+            }
         }
         required += bank->nb[2]*batch->count;
     }

@@ -604,6 +604,10 @@ llama_context::llama_context(
                 }
             }
         }
+        if (moe_cache && moe_cache->wants_staging()) {
+            if (!expert_stream) { throw std::runtime_error("LLAMA_MOE_CACHE_STAGING requires LLAMA_EXPERT_STREAM"); }
+            moe_cache->attach_staging(expert_stream->get_backend(), expert_stream->staging_buffer());
+        }
 
         // KV streaming: page moves are queued on the stream of the backend that computes the graphs
         if (llama_kv_stream * kv_stream = memory ? memory->get_kv_stream() : nullptr) {
@@ -650,8 +654,8 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     perf_moe_flush(true);
-    expert_stream.reset();
     moe_cache.reset();
+    expert_stream.reset();
 
     if (phase_leader) {
         auto & f = phase_leader->phase_followers;
@@ -1662,6 +1666,16 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, const std::function<void()> & inputs_ready) {
+    if (moe_cache && moe_cache->wants_staging()) {
+        const bool borrow = !expert_stream->streams(ubatch.n_tokens);
+        if (borrow) {
+            expert_stream->set_borrowed(true);
+            moe_cache->set_staging_active(true);
+        } else {
+            moe_cache->set_staging_active(false);
+            expert_stream->set_borrowed(false);
+        }
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
