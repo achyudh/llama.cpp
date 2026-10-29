@@ -646,7 +646,7 @@ __launch_bounds__(NT)
 static __global__ void exl3_routed_gemm_decode(const half * __restrict__ xh, const uint32_t * __restrict__ packed,
                                                const half * __restrict__ svh, float * __restrict__ dst,
                                                const int4 * __restrict__ tiles, const int32_t * __restrict__ perm,
-                                               const ggml_cuda_routed_chunk * __restrict__ chunk, int n, int k) {
+                                               const ggml_cuda_routed_chunk * __restrict__ chunk, int n, int k, bool cache_order) {
 #ifdef GGML_CUDA_GEMM_WMMA
     using namespace gemm_wmma;
     __shared__ __attribute__((aligned(16))) char smem[exl3_gemm_smem<bits_x2, BM>()];
@@ -655,13 +655,16 @@ static __global__ void exl3_routed_gemm_decode(const half * __restrict__ xh, con
     const size_t bank_words = size_t(k / 16) * (n / 16) * (4 * bits_x2);
     for (int t = blockIdx.x / n_cb; t < n_tiles; t += gridDim.x / n_cb) {
         const int4 tile = tiles[tile0 + t];
+        // the K start staggers by the tile's position in the expert-sorted list, which for cached banks depends on the
+        // slots the experts happen to occupy: those stagger by column block only, so moving an expert does not change
+        // its accumulation order
         exl3_gemm_tile<bits_x2, BM, NT>(smem, xh + size_t(tile.x - row0) * k, packed + size_t(tile.w) * bank_words,
                                         svh + size_t(tile.w) * n, dst, perm + tile.x, tile.y, n, k, cb * BN,
-                                        (tile0 + t) * n_cb + cb);
+                                        cache_order ? cb : (tile0 + t) * n_cb + cb);
         gemm_wmma_lds_barrier();
     }
 #else
-    GGML_UNUSED_VARS(xh, packed, svh, dst, tiles, perm, chunk, n, k);
+    GGML_UNUSED_VARS(xh, packed, svh, dst, tiles, perm, chunk, n, k, cache_order);
     NO_DEVICE_CODE;
 #endif
 }
@@ -709,14 +712,15 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     // no faster)
     const int n_cb = n / BN;
     const int blocks = n_cb * std::max(1, std::min(max_tiles, 16 * ggml_cuda_info().devices[ctx.device].nsm / n_cb));
+    const bool cache_order = ggml_get_op_params_i32(dst, 1) != 0;
     for (int c = 0; c < max_chunks; ++c) {
         exl3_routed_input<<<dim3(k / 128, input_blocks), 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(args, chunks + c);
         switch (args.bits_x2) {
-            case 7:  exl3_routed_gemm_decode<7,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
-            case 8:  exl3_routed_gemm_decode<8,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
-            case 10: exl3_routed_gemm_decode<10, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
-            case 12: exl3_routed_gemm_decode<12, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
-            case 14: exl3_routed_gemm_decode<14, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k); break;
+            case 7:  exl3_routed_gemm_decode<7,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, cache_order); break;
+            case 8:  exl3_routed_gemm_decode<8,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, cache_order); break;
+            case 10: exl3_routed_gemm_decode<10, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, cache_order); break;
+            case 12: exl3_routed_gemm_decode<12, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, cache_order); break;
+            case 14: exl3_routed_gemm_decode<14, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, cache_order); break;
             default: GGML_ABORT("Unsupported EXL3 rate");
         }
     }

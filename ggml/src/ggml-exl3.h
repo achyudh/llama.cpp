@@ -46,6 +46,8 @@ struct ggml_exl3_bundle {
 GGML_API bool ggml_exl3_load_bundle(const struct gguf_context * metadata, struct ggml_context * tensors,
                                    struct ggml_exl3_bundle * bundle);
 GGML_API bool ggml_exl3_op_supported(const struct ggml_tensor * op);
+// Routed projections of cached banks: the accumulation order does not depend on the slots the experts occupy.
+GGML_API bool ggml_exl3_set_cache_order(struct ggml_tensor * op);
 GGML_API bool ggml_exl3_compute_forward(struct ggml_tensor * op);
 // Thread ith of nth computes its share of the output; results do not depend on nth.
 GGML_API bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth);

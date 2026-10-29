@@ -279,10 +279,17 @@ struct ggml_tensor * ggml_mul_mat_exl3(struct ggml_context * ctx, struct ggml_te
 }
 
 bool ggml_exl3_op_supported(const struct ggml_tensor * op) {
-    return op && op->op == GGML_OP_MUL_MAT_EXL3 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+    return op && op->op == GGML_OP_MUL_MAT_EXL3 &&
+        (ggml_get_op_params_i32(op, 1) == 0 || ggml_get_op_params_i32(op, 1) == 1) && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
         ggml_exl3_inputs_valid(op->src[0], op->src[2], op->src[3], op->src[1], op->src[4], ggml_get_op_params_i32(op, 0)) &&
         op->ne[0] == op->src[3]->ne[0] && op->ne[1] == (op->src[4] ? op->src[4]->ne[0] : op->src[1]->ne[1]) &&
         op->ne[2] == (op->src[4] ? op->src[4]->ne[1] : 1) && op->ne[3] == 1;
+}
+
+bool ggml_exl3_set_cache_order(struct ggml_tensor * op) {
+    if (!ggml_exl3_op_supported(op) || !op->src[4]) { return false; }
+    ggml_set_op_params_i32(op, 1, 1);
+    return true;
 }
 
 bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth) {

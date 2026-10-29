@@ -4,6 +4,7 @@
 
 #undef NDEBUG
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -176,6 +177,74 @@ static void projection(const char * bank, const char * input, const char * prefi
     gguf_free(meta); gguf_free(data); ggml_free(weights); ggml_free(inputs);
 }
 
+// A cached expert's routed projection must not depend on its slot: the same experts in reversed slots, read through
+// remapped IDs, give the same bytes (K 640/2560 give the GEMM nonzero K starts; above 8 rows it is the routed GEMM).
+static void slot_order() {
+    auto * backend = ggml_backend_cuda_init(0);
+    assert(backend);
+    const int experts = 12, used = 10;
+    for (int k : {640, 2560}) {
+        for (int rate : {7, 8}) {
+            for (int rows : {8, 16, 32}) {
+                auto * ctx = ggml_init({4*1024*1024, nullptr, true});
+                auto make_bank = [&]() {
+                    ggml_exl3_bundle b{};
+                    b.packed = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, k/16*(256/16)*ggml_exl3_tile_size(rate)/2, 1, experts);
+                    b.suh = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k, 1, experts);
+                    b.svh = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 256, 1, experts);
+                    return b;
+                };
+                auto bank = make_bank(), reversed = make_bank();
+                auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, used, rows);
+                auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, rows);
+                auto * mapped_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, rows);
+                auto * ordinary = ggml_mul_mat_exl3(ctx, bank.packed, bank.suh, bank.svh, x, ids, rate);
+                auto * moved = ggml_mul_mat_exl3(ctx, reversed.packed, reversed.suh, reversed.svh, x, mapped_ids, rate);
+                assert(ggml_exl3_set_cache_order(ordinary) && ggml_exl3_set_cache_order(moved));
+                auto * g0 = ggml_new_graph(ctx), * g1 = ggml_new_graph(ctx);
+                ggml_build_forward_expand(g0, ordinary); ggml_build_forward_expand(g1, moved);
+                auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+                assert(buffer && ggml_backend_dev_supports_op(ggml_backend_get_device(backend), moved));
+                for (auto pair : {std::array<ggml_tensor *, 2>{bank.packed, reversed.packed}, std::array<ggml_tensor *, 2>{bank.suh, reversed.suh},
+                                  std::array<ggml_tensor *, 2>{bank.svh, reversed.svh}}) {
+                    std::vector<uint8_t> raw(ggml_nbytes(pair[0])), flipped(raw.size());
+                    if (pair[0]->type == GGML_TYPE_I16) {
+                        for (size_t i = 0; i < raw.size(); ++i) { raw[i] = uint8_t(i*23+i/317); }
+                    } else {
+                        for (size_t i = 0; i < raw.size()/2; ++i) {
+                            const auto v = ggml_fp32_to_fp16(float(int(i%11)-5)/8);
+                            std::memcpy(raw.data()+i*2, &v, 2);
+                        }
+                    }
+                    for (int e = 0; e < experts; ++e) {
+                        std::memcpy(flipped.data() + (experts-1-e)*pair[0]->nb[2], raw.data() + e*pair[0]->nb[2], pair[0]->nb[2]);
+                    }
+                    ggml_backend_tensor_set(pair[0], raw.data(), 0, raw.size());
+                    ggml_backend_tensor_set(pair[1], flipped.data(), 0, flipped.size());
+                }
+                std::vector<float> input(ggml_nelements(x)), expected(ggml_nelements(ordinary)), actual(expected.size());
+                std::vector<int32_t> selected(ggml_nelements(ids)), mapped(selected.size());
+                for (int pass = 0; pass < 4; ++pass) {
+                    for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int((i+pass)%19)-9)/16; }
+                    for (size_t i = 0; i < selected.size(); ++i) { selected[i] = pass == 1 ? 0 : pass == 2 ? experts-1 : int((i*7+pass)%experts); }
+                    for (size_t i = 0; i < selected.size(); ++i) { mapped[i] = experts-1-selected[i]; }
+                    ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+                    ggml_backend_tensor_set(ids, selected.data(), 0, ggml_nbytes(ids));
+                    ggml_backend_tensor_set(mapped_ids, mapped.data(), 0, ggml_nbytes(mapped_ids));
+                    assert(ggml_backend_graph_compute(backend, g0) == GGML_STATUS_SUCCESS);
+                    assert(ggml_backend_graph_compute(backend, g1) == GGML_STATUS_SUCCESS);
+                    ggml_backend_tensor_get(ordinary, expected.data(), 0, ggml_nbytes(ordinary));
+                    ggml_backend_tensor_get(moved, actual.data(), 0, ggml_nbytes(moved));
+                    assert(std::memcmp(expected.data(), actual.data(), ggml_nbytes(moved)) == 0);
+                }
+                ggml_backend_buffer_free(buffer); ggml_free(ctx);
+            }
+        }
+    }
+    ggml_backend_free(backend);
+    std::puts("slot order: cached routed projections give the same bytes with the experts in other slots");
+}
+
 static void auxiliary_upload() {
     auto * backend = ggml_backend_cuda_init(0);
     auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
@@ -249,9 +318,10 @@ int main(int argc, char ** argv) {
     hipDeviceProp_t prop;
     CUDA_CHECK(hipGetDeviceProperties(&prop, 0));
     assert(std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
-    if (argc == 2 && std::strcmp(argv[1], "--aux-upload") == 0) { auxiliary_upload(); }
+    if (argc == 2 && std::strcmp(argv[1], "--slot-order") == 0) { slot_order(); }
+    else if (argc == 2 && std::strcmp(argv[1], "--aux-upload") == 0) { auxiliary_upload(); }
     else if (argc == 3 && std::strcmp(argv[1], "--codec") == 0) { codec(argv[2]); }
     else if (argc == 5) { projection(argv[2], argv[3], argv[4]); }
-    else { std::fprintf(stderr, "usage: %s --aux-upload | --codec FIXTURE | --bundle BANK INPUT OUTPUT_PREFIX\n", argv[0]); return 1; }
+    else { std::fprintf(stderr, "usage: %s --slot-order | --aux-upload | --codec FIXTURE | --bundle BANK INPUT OUTPUT_PREFIX\n", argv[0]); return 1; }
     return 0;
 }

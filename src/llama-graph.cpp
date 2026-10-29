@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "ggml-exl3.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1826,6 +1827,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         res = ggml_mul_mat_exl3(ctx0, slots ? moe_cache->get_experts(w) : w,
             slots ? moe_cache->get_experts(b.suh) : b.suh,
             slots ? moe_cache->get_experts(b.svh) : b.svh, x, selected, b.bits_x2);
+        if (res && slots && !ggml_exl3_set_cache_order(res)) {
+            throw std::runtime_error("invalid EXL3 cache projection: " + std::string(w->name));
+        }
         if (!res) {
             auto * packed = slots ? moe_cache->get_experts(w) : w;
             auto shape = [](const ggml_tensor * t) {
