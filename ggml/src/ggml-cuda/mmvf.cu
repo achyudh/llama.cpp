@@ -51,6 +51,79 @@ static __global__ void mul_mat_vec_hc_warp(
     }
 }
 
+// For 10240 columns the block kernel uses 256 threads, each accumulating 20 half2 products, and reduces 8 warp sums.
+// Here each of the 128 threads carries two of those streams: a 16-thread subgroup holds one original warp.
+template<int ncols_dst>
+static __global__ void mul_mat_vec_hc_reduce(
+        const half * weights, const float * input, float * dst,
+        int stride_row, int stride_col_input, int stride_col_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int streams = 2;
+    static_assert(streams == 2, "one uint2 weight load and one float4 input load per step");
+    if constexpr (warp_size == 32) {
+#ifdef FP16_AVAILABLE
+        __shared__ float partial[ncols_dst][warp_size];
+        const int tid = threadIdx.x, lane = tid % warp_size;
+        const half2 * w = (const half2 *) (weights + int64_t(blockIdx.x)*stride_row);
+        half2 sum[ncols_dst][streams];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int r = 0; r < streams; ++r) { sum[j][r] = make_half2(0.0f, 0.0f); }
+        }
+#pragma unroll 1
+        for (int col = tid*streams; col < 5120; col += 256) {
+            uint32_t words[streams];
+            {
+                const uint2 v = ((const uint2 *) w)[col/2];
+                words[0] = v.x; words[1] = v.y;
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                half2 values[streams];
+                {
+#pragma unroll
+                    for (int r = 0; r < streams/2; ++r) {
+                        const float4 v = ((const float4 *) (input + int64_t(j)*stride_col_input))[col/2 + r];
+                        values[2*r] = make_half2(v.x, v.y);
+                        values[2*r + 1] = make_half2(v.z, v.w);
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < streams; ++r) {
+                    const half2 weight = __halves2half2(__ushort_as_half(words[r] & 0xffff), __ushort_as_half(words[r] >> 16));
+                    sum[j][r] += weight * values[r];
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float v[streams];
+#pragma unroll
+            for (int r = 0; r < streams; ++r) {
+                v[r] = warp_reduce_sum<warp_size/streams>(__low2float(sum[j][r]) + __high2float(sum[j][r]));
+            }
+            // The subgroup keeps XOR steps 16/8/4/2; the local sum keeps the final XOR 1 step.
+            const float value = v[0] + v[1];
+            if (lane % (warp_size/streams) == 0) { partial[j][tid/(warp_size/streams)] = value; }
+            if (tid >= 8 && tid < warp_size) { partial[j][tid] = 0.0f; }
+        }
+        __syncthreads();
+        if (tid < warp_size) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float value = warp_reduce_sum<warp_size>(partial[j][lane]);
+                if (lane == j) { dst[int64_t(j)*stride_col_dst + blockIdx.x] = value; }
+            }
+        }
+#else
+        NO_DEVICE_CODE;
+#endif
+    } else {
+        NO_DEVICE_CODE;
+    }
+}
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -514,6 +587,27 @@ void launch_mul_mat_vec_f_cuda(
             if (hc_warp) {
                 mul_mat_vec_hc_warp<ncols_dst><<<dim3(nrows), dim3(warp_size, 1), 0, stream>>>(
                     x, y, dst, stride_row, stride_col_y, stride_col_dst);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
+    }
+
+    // Flash-Next hyper-connection reduction: the hard-coded 5120 half2 columns and 128 threads keep the block kernel's
+    // 256 streams and reduction order (see mul_mat_vec_hc_reduce). GGML_CUDA_MMV_HC_REDUCE=0 selects the block kernel
+    if constexpr (std::is_same_v<T, half> && std::is_same_v<type_acc, half> && ncols_dst <= 5) {
+        if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) && warp_size == 32 &&
+                ncols == 10240 && nrows == 320 && !has_fusion && !ids &&
+                stride_row % 8 == 0 && stride_col_y % 4 == 0 && uintptr_t(x) % 16 == 0 && uintptr_t(y) % 16 == 0 &&
+                nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1 && nsamples_or_ntokens == 1) {
+            static const bool hc_reduce = [] {
+                const char * value = std::getenv("GGML_CUDA_MMV_HC_REDUCE");
+                GGML_ASSERT(!value || !strcmp(value, "0") || !strcmp(value, "1"));
+                return !value || !strcmp(value, "1");
+            }();
+            if (hc_reduce) {
+                mul_mat_vec_hc_reduce<ncols_dst><<<dim3(nrows), 128, 0, stream>>>(x, y, dst, stride_row, stride_col_y, stride_col_dst);
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }
