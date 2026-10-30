@@ -24,10 +24,9 @@ struct ggml_cuda_exl3_args {
     float * yh;
     int k, n, experts, assignments, used, input_slots, bits_x2;
     const int32_t * perm; // input transform only: row i of xh takes assignment perm[i]
-    const uint32_t * packed_extra = nullptr;
-    const half * suh_extra = nullptr;
-    const half * svh_extra = nullptr;
-    int base_experts = 0;
+    // cache slots: expert e reads its packed weights, suh and svh at the addresses slots[e*slot_stride + 0..2]
+    const int64_t * slots = nullptr;
+    int slot_stride = 0;
 };
 
 // Internal launch interface shared with the projection benchmark. Scratch is supplied by the caller.

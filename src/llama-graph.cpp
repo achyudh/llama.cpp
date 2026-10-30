@@ -1828,7 +1828,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             slots ? moe_cache->get_experts(b.suh) : b.suh,
             slots ? moe_cache->get_experts(b.svh) : b.svh, x, selected, b.bits_x2);
         if (res && slots && (!ggml_exl3_set_cache_order(res) ||
-                (moe_cache->get_extra_experts(w) && !ggml_exl3_set_extra(res, moe_cache->get_extra_experts(w), moe_cache->get_extra_experts(b.suh), moe_cache->get_extra_experts(b.svh))))) {
+                (moe_cache->get_slot_table(w) && !ggml_exl3_set_slots(res, moe_cache->get_slot_table(w))))) {
             throw std::runtime_error("invalid EXL3 cache projection: " + std::string(w->name));
         }
         if (!res) {

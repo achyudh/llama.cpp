@@ -22,14 +22,14 @@ bool ggml_cuda_supports_exl3(const ggml_tensor * op, int cc) {
     const int64_t k = op->src[2]->ne[0], n = op->ne[0];
     // Widths cover the 248320-column vocabulary head with int column indices.
     if (!(bits == 7 || bits == 8 || bits == 10 || bits == 12 || bits == 14) || k > 262144 || n > 262144 ||
-            op->src[0]->ne[2] > INT_MAX - (op->src[5] ? op->src[5]->ne[2] : 0)) {
+            (op->src[5] && op->src[5]->ne[1] > INT_MAX)) {
         return false;
     }
     // Banks above 8 rows go through an FP16 GEMM whose input copy is bounded (a transform block row per 4 rows); a
     // routed one counts its experts in LDS.
     if (rows > 8) {
         return assignments <= 4 * 65535 && assignments * k <= 256 * 1024 * 1024 &&
-            (!op->src[4] || op->src[0]->ne[2] + (op->src[5] ? op->src[5]->ne[2] : 0) <= EXL3_ROUTE_MAX_EXPERTS);
+            (!op->src[4] || (op->src[5] ? op->src[5]->ne[1] : op->src[0]->ne[2]) <= EXL3_ROUTE_MAX_EXPERTS);
     }
     // Bound the decode workspace and grid.
     return rows <= 8 && assignments <= 512 && assignments * (k + n) <= 16 * 1024 * 1024;
@@ -47,19 +47,18 @@ struct exl3_aux_scatter_args {
     size_t widths[GGML_EXL3_AUX_BANKS];
     int32_t slots[GGML_EXL3_AUX_MAX_FILLS];
     int32_t count;
-    uint4 * extra_banks[GGML_EXL3_AUX_BANKS];
-    int32_t base_slots;
+    const int64_t * table;
+    int32_t table_stride;
+    int32_t table_cols[GGML_EXL3_AUX_BANKS];
 };
 
 static __global__ void exl3_aux_scatter(exl3_aux_scatter_args a) {
     const int bank = blockIdx.z, fill = blockIdx.y;
     const size_t col = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (bank < GGML_EXL3_AUX_BANKS && fill < a.count && col < a.widths[bank]) {
-        const bool extra = a.extra_banks[bank] && a.slots[fill] >= a.base_slots;
-        uint4 * dst = extra ? a.extra_banks[bank] : a.banks[bank];
-        const int slot = a.slots[fill] - (extra ? a.base_slots : 0);
-        dst[size_t(slot)*a.widths[bank] + col] =
-            a.src[a.offsets[bank] + size_t(fill)*a.widths[bank] + col];
+        uint4 * dst = a.table ? (uint4 *) a.table[size_t(a.slots[fill])*a.table_stride + a.table_cols[bank]]
+                              : a.banks[bank] + size_t(a.slots[fill])*a.widths[bank];
+        dst[col] = a.src[a.offsets[bank] + size_t(fill)*a.widths[bank] + col];
     }
 }
 
@@ -67,11 +66,14 @@ void ggml_cuda_exl3_aux_scatter(ggml_backend_cuda_context & ctx, const ggml_tens
     exl3_aux_scatter_args a{};
     a.src = (const uint4 *) scratch->data;
     a.count = batch.count;
-    a.base_slots = batch.base_slots;
+    if (batch.slot_table) {
+        a.table = (const int64_t *) batch.slot_table->data;
+        a.table_stride = int32_t(batch.slot_table->nb[1]/sizeof(int64_t));
+        std::copy(batch.table_cols, batch.table_cols + GGML_EXL3_AUX_BANKS, a.table_cols);
+    }
     size_t offset = 0, width = 0;
     for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
         a.banks[i] = (uint4 *) batch.banks[i]->data;
-        a.extra_banks[i] = batch.extra_banks[i] ? (uint4 *) batch.extra_banks[i]->data : nullptr;
         a.widths[i] = batch.banks[i]->nb[2]/sizeof(uint4);
         a.offsets[i] = offset;
         offset += a.widths[i]*batch.count;
@@ -87,11 +89,12 @@ static __device__ __forceinline__ int exl3_expert(const ggml_cuda_exl3_args & a,
 }
 
 static __device__ __forceinline__ ggml_cuda_exl3_args exl3_bank(ggml_cuda_exl3_args a, int & expert) {
-    if (a.packed_extra && expert >= a.base_experts) {
-        a.packed = a.packed_extra;
-        a.suh = a.suh_extra;
-        a.svh = a.svh_extra;
-        expert -= a.base_experts;
+    if (a.slots && expert >= 0 && expert < a.experts) {
+        const int64_t * slot = a.slots + size_t(expert)*a.slot_stride;
+        a.packed = (const uint32_t *) slot[0];
+        a.suh = (const half *) slot[1];
+        a.svh = (const half *) slot[2];
+        expert = 0;
     }
     return a;
 }
@@ -671,7 +674,7 @@ static __global__ void exl3_routed_gemm_decode(const half * __restrict__ xh, con
                                                const half * __restrict__ svh, float * __restrict__ dst,
                                                const int4 * __restrict__ tiles, const int32_t * __restrict__ perm,
                                                const ggml_cuda_routed_chunk * __restrict__ chunk, int n, int k,
-                                               const uint32_t * packed_extra, const half * svh_extra, int base_experts, bool cache_order) {
+                                               const int64_t * slots, int slot_stride, bool cache_order) {
 #ifdef GGML_CUDA_GEMM_WMMA
     using namespace gemm_wmma;
     __shared__ __attribute__((aligned(16))) char smem[exl3_gemm_smem<bits_x2, BM>()];
@@ -680,29 +683,25 @@ static __global__ void exl3_routed_gemm_decode(const half * __restrict__ xh, con
     const size_t bank_words = size_t(k / 16) * (n / 16) * (4 * bits_x2);
     for (int t = blockIdx.x / n_cb; t < n_tiles; t += gridDim.x / n_cb) {
         const int4 tile = tiles[tile0 + t];
-        const bool extra = packed_extra && tile.w >= base_experts;
-        const int expert = tile.w - (extra ? base_experts : 0);
-        const uint32_t * bank = extra ? packed_extra : packed;
-        const half * scales = extra ? svh_extra : svh;
+        const int64_t * slot = slots ? slots + size_t(tile.w)*slot_stride : nullptr;
+        const uint32_t * bank = slot ? (const uint32_t *) slot[0] : packed + size_t(tile.w) * bank_words;
+        const half * scales = slot ? (const half *) slot[2] : svh + size_t(tile.w) * n;
         // Cache slots must not change the K accumulation order.
-        exl3_gemm_tile<bits_x2, BM, NT>(smem, xh + size_t(tile.x - row0) * k, bank + size_t(expert) * bank_words,
-                                        scales + size_t(expert) * n, dst, perm + tile.x, tile.y, n, k, cb * BN,
+        exl3_gemm_tile<bits_x2, BM, NT>(smem, xh + size_t(tile.x - row0) * k, bank, scales, dst, perm + tile.x, tile.y, n, k, cb * BN,
                                         cache_order ? cb : (tile0 + t) * n_cb + cb);
         gemm_wmma_lds_barrier();
     }
 #else
-    GGML_UNUSED_VARS(xh, packed, svh, dst, tiles, perm, chunk, n, k, packed_extra, svh_extra, base_experts, cache_order);
+    GGML_UNUSED_VARS(xh, packed, svh, dst, tiles, perm, chunk, n, k, slots, slot_stride, cache_order);
     NO_DEVICE_CODE;
 #endif
 }
 
-static void exl3_extra_args(ggml_cuda_exl3_args & a, const ggml_tensor * dst) {
+static void exl3_slot_args(ggml_cuda_exl3_args & a, const ggml_tensor * dst) {
     if (dst->src[5]) {
-        a.packed_extra = (const uint32_t *) dst->src[5]->data;
-        a.suh_extra = (const half *) dst->src[6]->data;
-        a.svh_extra = (const half *) dst->src[7]->data;
-        a.base_experts = dst->src[0]->ne[2];
-        a.experts = a.base_experts + dst->src[5]->ne[2];
+        a.slots = (const int64_t *) dst->src[5]->data;
+        a.slot_stride = int(dst->src[5]->nb[1]/sizeof(int64_t));
+        a.experts = int(dst->src[5]->ne[1]);
     }
 }
 
@@ -713,7 +712,7 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     using gemm_wmma::BN;
     constexpr int BM = 128, NT = 256;
     const int k = dst->src[2]->ne[0], n = dst->ne[0], used = dst->ne[1], assignments = dst->ne[1] * dst->ne[2];
-    const int experts = dst->src[0]->ne[2] + (dst->src[5] ? dst->src[5]->ne[2] : 0);
+    const int experts = dst->src[5] ? dst->src[5]->ne[1] : dst->src[0]->ne[2];
     cudaStream_t stream = ctx.stream();
 
     // a chunk's rotated rows take at most 32 MiB, so they stay in the Infinity Cache for its column blocks
@@ -744,7 +743,7 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         (const uint32_t *) dst->src[0]->data, (const half *) dst->src[2]->data, (const half *) dst->src[3]->data,
         (const float *) dst->src[1]->data, ids, (float *) dst->data, xh.get(), nullptr,
         k, n, experts, assignments, used, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0), ws.get() + o_perm};
-    exl3_extra_args(args, dst);
+    exl3_slot_args(args, dst);
     const int input_blocks = (xh_rows + EXL3_TRANSFORM_ROWS - 1) / EXL3_TRANSFORM_ROWS;
     // the GEMM blocks loop over the chunk's tiles, about 16 blocks per WGP (nsm counts WGPs; 4 were 2-7% slower, 32
     // no faster)
@@ -753,11 +752,11 @@ static void exl3_routed_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     for (int c = 0; c < max_chunks; ++c) {
         exl3_routed_input<<<dim3(k / 128, input_blocks), 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(args, chunks + c);
         switch (args.bits_x2) {
-            case 7:  exl3_routed_gemm_decode<7,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.packed_extra, args.svh_extra, args.base_experts, ggml_get_op_params_i32(dst, 1) != 0); break;
-            case 8:  exl3_routed_gemm_decode<8,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.packed_extra, args.svh_extra, args.base_experts, ggml_get_op_params_i32(dst, 1) != 0); break;
-            case 10: exl3_routed_gemm_decode<10, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.packed_extra, args.svh_extra, args.base_experts, ggml_get_op_params_i32(dst, 1) != 0); break;
-            case 12: exl3_routed_gemm_decode<12, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.packed_extra, args.svh_extra, args.base_experts, ggml_get_op_params_i32(dst, 1) != 0); break;
-            case 14: exl3_routed_gemm_decode<14, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.packed_extra, args.svh_extra, args.base_experts, ggml_get_op_params_i32(dst, 1) != 0); break;
+            case 7:  exl3_routed_gemm_decode<7,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.slots, args.slot_stride, ggml_get_op_params_i32(dst, 1) != 0); break;
+            case 8:  exl3_routed_gemm_decode<8,  BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.slots, args.slot_stride, ggml_get_op_params_i32(dst, 1) != 0); break;
+            case 10: exl3_routed_gemm_decode<10, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.slots, args.slot_stride, ggml_get_op_params_i32(dst, 1) != 0); break;
+            case 12: exl3_routed_gemm_decode<12, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.slots, args.slot_stride, ggml_get_op_params_i32(dst, 1) != 0); break;
+            case 14: exl3_routed_gemm_decode<14, BM, NT><<<blocks, NT, 0, stream>>>(xh.get(), args.packed, args.svh, args.dst, tiles, args.perm, chunks + c, n, k, args.slots, args.slot_stride, ggml_get_op_params_i32(dst, 1) != 0); break;
             default: GGML_ABORT("Unsupported EXL3 rate");
         }
     }
@@ -805,7 +804,7 @@ void ggml_cuda_op_mul_mat_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         (const float *) dst->src[1]->data, dst->src[4] ? (const int32_t *) dst->src[4]->data : nullptr,
         (float *) dst->data, xh.get(), yh.get(), k, n, int(dst->src[0]->ne[2]), assignments,
         dst->src[4] ? int(dst->ne[1]) : 1, int(dst->src[1]->ne[1]), ggml_get_op_params_i32(dst, 0)};
-    exl3_extra_args(args, dst);
+    exl3_slot_args(args, dst);
     ggml_cuda_exl3_launch(args, args.ids ? GGML_EXL3_F32_FRAGMENT : GGML_EXL3_F32_ROWS, GGML_EXL3_ALL, ctx.stream());
 #else
     GGML_UNUSED(ctx); GGML_UNUSED(dst);

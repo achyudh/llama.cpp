@@ -55,7 +55,8 @@ public:
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
-    ggml_tensor * get_extra_experts(const ggml_tensor * w) const;
+    // EXL3: the slot table of the packed weights w (I64 [3, n_slots], see ggml_exl3_set_slots), nullptr if w is not cached
+    ggml_tensor * get_slot_table(const ggml_tensor * w) const;
 
     bool wants_staging() const;
     void attach_staging(ggml_backend_t backend, ggml_backend_buffer_t buffer);

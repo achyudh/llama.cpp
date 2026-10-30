@@ -278,12 +278,16 @@ struct ggml_tensor * ggml_mul_mat_exl3(struct ggml_context * ctx, struct ggml_te
     return out;
 }
 
+static bool ggml_exl3_slots_valid(const struct ggml_tensor * slots) {
+    return slots->type == GGML_TYPE_I64 && slots->ne[0] == 3 && slots->ne[1] >= 1 && slots->ne[1] <= INT32_MAX &&
+        slots->ne[2] == 1 && slots->ne[3] == 1 && slots->nb[0] == sizeof(int64_t) &&
+        slots->nb[1] % sizeof(int64_t) == 0 && slots->nb[1] >= 3*sizeof(int64_t);
+}
+
 bool ggml_exl3_op_supported(const struct ggml_tensor * op) {
     if (op && (op->src[5] || op->src[6] || op->src[7])) {
-        if (!op->src[0] || !op->src[2] || !op->src[3] || !op->src[4] ||
-            !ggml_exl3_bank_valid(op->src[5], op->src[6], op->src[7], ggml_get_op_params_i32(op, 0)) ||
-            op->src[6]->ne[0] != op->src[2]->ne[0] || op->src[7]->ne[0] != op->src[3]->ne[0] ||
-            op->src[0]->ne[2] > INT32_MAX - op->src[5]->ne[2]) {
+        if (!op->src[0] || !op->src[2] || !op->src[3] || !op->src[4] || !op->src[5] || op->src[6] || op->src[7] ||
+            !ggml_exl3_slots_valid(op->src[5])) {
             return false;
         }
     }
@@ -300,17 +304,13 @@ bool ggml_exl3_set_cache_order(struct ggml_tensor * op) {
     return true;
 }
 
-bool ggml_exl3_set_extra(struct ggml_tensor * op, struct ggml_tensor * packed,
-                        struct ggml_tensor * suh, struct ggml_tensor * svh) {
-    if (!ggml_exl3_op_supported(op) || !op->src[4] || op->src[5] || op->src[6] || op->src[7] ||
-        !ggml_exl3_bank_valid(packed, suh, svh, ggml_get_op_params_i32(op, 0)) ||
-        suh->ne[0] != op->src[2]->ne[0] || svh->ne[0] != op->src[3]->ne[0] ||
-        op->src[0]->ne[2] > INT32_MAX - packed->ne[2]) {
+bool ggml_exl3_set_slots(struct ggml_tensor * op, struct ggml_tensor * slots) {
+    if (!ggml_exl3_op_supported(op) || !op->src[4] || op->src[5] || !slots || slots->type != GGML_TYPE_I64 ||
+        slots->ne[0] != 3 || slots->ne[1] < 1 || slots->ne[1] > INT32_MAX || slots->ne[2] != 1 || slots->ne[3] != 1 ||
+        slots->nb[0] != sizeof(int64_t) || slots->nb[1] % sizeof(int64_t) || slots->nb[1] < 3*sizeof(int64_t)) {
         return false;
     }
-    op->src[5] = packed;
-    op->src[6] = suh;
-    op->src[7] = svh;
+    op->src[5] = slots;
     return true;
 }
 
@@ -341,7 +341,8 @@ bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth) {
     }
     const int32_t * selected = ids->data;
     const size_t slots = ids->ne[0], total = (size_t) ids->ne[0] * ids->ne[1];
-    const int64_t experts = p->ne[2] + (op->src[5] ? op->src[5]->ne[2] : 0);
+    const struct ggml_tensor * table = op->src[5];
+    const int64_t experts = table ? table->ne[1] : p->ne[2];
     for (size_t i = 0; i < total; ++i) {
         if (selected[i] < 0 || selected[i] >= experts) {
             return false;
@@ -377,14 +378,16 @@ bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth) {
             const size_t input = i / slots * x->ne[1] + i % slots % x->ne[1];
             memcpy(gathered + row++ * matrix.ne0, (const float *) x->data + input * matrix.ne0, matrix.ne0 * sizeof(float));
         }
-        const bool extra = expert >= p->ne[2];
-        const struct ggml_tensor * bp = extra ? op->src[5] : p;
-        const struct ggml_tensor * bs = extra ? op->src[6] : su;
-        const struct ggml_tensor * bv = extra ? op->src[7] : sv;
-        const int64_t local = extra ? expert - p->ne[2] : expert;
-        matrix.packed = (const uint8_t *) bp->data + local * bp->nb[2];
-        matrix.suh = (const ggml_fp16_t *) bs->data + local * matrix.ne0;
-        matrix.svh = (const ggml_fp16_t *) bv->data + local * matrix.ne1;
+        if (table) {
+            const int64_t * slot = (const int64_t *) ((const char *) table->data + expert * table->nb[1]);
+            matrix.packed = (const void *) (intptr_t) slot[0];
+            matrix.suh = (const ggml_fp16_t *) (intptr_t) slot[1];
+            matrix.svh = (const ggml_fp16_t *) (intptr_t) slot[2];
+        } else {
+            matrix.packed = (const uint8_t *) p->data + expert * p->nb[2];
+            matrix.suh = (const ggml_fp16_t *) su->data + expert * matrix.ne0;
+            matrix.svh = (const ggml_fp16_t *) sv->data + expert * matrix.ne1;
+        }
         ok = ggml_exl3_mul_mat_cols(&matrix, count, gathered, nx, result, ny, b0 * 128, b1 * 128);
         if (ok) {
             row = 0;

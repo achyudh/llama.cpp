@@ -303,7 +303,15 @@ struct llama_moe_cache::impl {
         int exl3_bits_x2 = 0;
         int64_t max_tokens = max_batch;
         moe_cache_slru slru;
+        // EXL3 groups: I64 [ref.size(), table_rows], each slot's address of every expert tensor's storage; the ops read
+        // their slots through it (ggml_exl3_set_slots), so slots can live in any buffer
+        ggml_tensor * table = nullptr;
+        int32_t table_rows = 0;
+        std::vector<int64_t> table_host;
+        std::vector<ggml_tensor *> table_views; // I64 [3, n_slots] per expert tensor, then [ref.size(), n_slots] for the aux scatter
     };
+
+    bool has_table(const group & g) const { return g.exl3_bits_x2 && !g.ref.empty() && g.ref.size() % 3 == 0; }
 
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
@@ -363,6 +371,7 @@ struct llama_moe_cache::impl {
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
+    ggml_context_ptr ctx_tables;
     ggml_context_ptr ctx_extra;
     enum staging_mode { STAGING_OFF, STAGING_ON, STAGING_RESERVE } staging = STAGING_OFF;
     bool staging_active = false;
@@ -541,7 +550,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (has_table(g) ? 1 : 0);
             n_tensors_host  += g.layers.size()*(shared ? 2 : 1);
         }
         if (n_tensors_host == 0) {
@@ -573,6 +582,7 @@ struct llama_moe_cache::impl {
         }
         ctx_host  = init_ctx(n_tensors_host);
         ctx_views = init_ctx(2);
+        ctx_tables = init_ctx(groups.size()*12); // views of up to three table builds
 
         ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
         const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
@@ -588,6 +598,11 @@ struct llama_moe_cache::impl {
                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
+            }
+            if (has_table(g)) {
+                g.table_rows = (int32_t) std::min<int64_t>(16384, int64_t(g.layers.size())*g.slru.n_expert);
+                g.table = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, (int64_t) g.ref.size(), g.table_rows);
+                ggml_format_name(g.table, "moe_cache.%zu.slot_table", ig);
             }
             for (int32_t il : g.layers) {
                 layer & l = layers[il];
@@ -653,6 +668,7 @@ struct llama_moe_cache::impl {
                         g.slru.slot_map[il] = (int32_t *) layers[il].slot_map->data;
                     }
                 }
+                build_table(g);
             }
         }
 
@@ -757,6 +773,36 @@ struct llama_moe_cache::impl {
 
     uint32_t trace_ms() const { return (uint32_t) ((ggml_time_us() - trace_t0)/1000); }
 
+    // the address of every slot's storage of each expert tensor: base slots in the banks, then the borrowed extension
+    void build_table(group & g) {
+        if (!g.table || !g.n_slots) {
+            return;
+        }
+        GGML_ASSERT(g.n_slots <= g.table_rows);
+        const size_t cols = g.ref.size();
+        g.table_host.assign((size_t) g.table_rows*cols, 0);
+        const int32_t base = g.base_slots ? g.base_slots : g.n_slots;
+        for (int32_t s = 0; s < g.n_slots; ++s) {
+            for (size_t c = 0; c < cols; ++c) {
+                const ggml_tensor * bank = s < base ? g.banks[c] : g.extra_banks[c];
+                const int32_t local = s < base ? s : s - base;
+                g.table_host[(size_t) s*cols + c] = (int64_t) (intptr_t) ((const char *) bank->data + (size_t) local*bank->nb[2]);
+            }
+        }
+        ggml_backend_tensor_set(g.table, g.table_host.data(), 0, (size_t) g.n_slots*cols*sizeof(int64_t));
+        g.table_views.clear();
+        for (size_t t = 0; t < cols/3; ++t) {
+            ggml_tensor * view = ggml_view_2d(ctx_tables.get(), g.table, 3, g.n_slots, g.table->nb[1], t*3*sizeof(int64_t));
+            ggml_format_name(view, "%s.%zu", g.table->name, t);
+            ggml_backend_view_init(view);
+            g.table_views.push_back(view);
+        }
+        ggml_tensor * all = ggml_view_2d(ctx_tables.get(), g.table, (int64_t) cols, g.n_slots, g.table->nb[1], 0);
+        ggml_format_name(all, "%s.aux", g.table->name);
+        ggml_backend_view_init(all);
+        g.table_views.push_back(all);
+    }
+
     // pinned (registered) host experts: their uploads are DMA from host memory, and their pages cannot be evicted
     void pin_host_experts(const llama_model & model, size_t pin) {
         if (pin == 0) {
@@ -854,6 +900,7 @@ struct llama_moe_cache::impl {
                 g.extra_views.push_back(view);
             }
             g.n_slots += count;
+            build_table(g);
             g.slru.init(layers.size(), g.slru.n_expert, g.n_slots);
             for (int32_t il : g.layers) { g.slru.slot_map[il] = (int32_t *) layers[il].slot_map->data; }
             g.slru.set_active(g.base_slots);
@@ -1028,11 +1075,11 @@ struct llama_moe_cache::impl {
             }
             bytes += w->nb[2]*fills.size();
             batch.banks[i] = bank;
-            batch.extra_banks[i] = g.base_slots ? g.extra_banks[indices[i]] : nullptr;
+            batch.table_cols[i] = indices[i];
         }
         batch.count = (int32_t) fills.size();
         batch.n_slots = g.n_slots;
-        batch.base_slots = g.base_slots;
+        batch.slot_table = g.table_views.empty() ? nullptr : g.table_views.back();
         for (size_t i = 0; i < fills.size(); ++i) { batch.slots[i] = fills[i].slot; }
         auto * out = (uint8_t *) ggml_backend_buffer_get_base(d.aux_host.get());
         if (!out) { return false; }
@@ -1271,11 +1318,12 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
 }
 
-ggml_tensor * llama_moe_cache::get_extra_experts(const ggml_tensor * w) const {
+ggml_tensor * llama_moe_cache::get_slot_table(const ggml_tensor * w) const {
     const auto it = pimpl->bindings.find(w);
-    if (it == pimpl->bindings.end()) { return nullptr; }
+    if (it == pimpl->bindings.end() || it->second.ip % 3) { return nullptr; }
     const auto & g = pimpl->groups[pimpl->layers[it->second.il].ig];
-    return g.extra_views.empty() ? nullptr : g.extra_views[it->second.ip];
+    const size_t t = it->second.ip/3;
+    return t + 1 < g.table_views.size() ? g.table_views[t] : nullptr;
 }
 
 bool llama_moe_cache::wants_staging() const {

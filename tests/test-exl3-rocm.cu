@@ -201,12 +201,24 @@ static void split_bank_projection(bool slot_order = false) {
                 auto * mapped_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, rows);
                 auto * permuted = ggml_mul_mat_exl3(ctx, rebased.packed, rebased.suh, rebased.svh, x, mapped_ids, rate);
                 auto * split = ggml_mul_mat_exl3(ctx, base.packed, base.suh, base.svh, x, mapped_ids, rate);
-                assert(ggml_exl3_set_extra(split, extra.packed, extra.suh, extra.svh));
+                // the base and extension banks behind one slot table, as a MoE cache with a borrowed extension
+                auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 3, experts);
+                assert(ggml_exl3_set_slots(split, table));
                 for (auto * op : {ordinary, permuted, split}) { assert(ggml_exl3_set_cache_order(op)); }
                 auto * gfull = ggml_new_graph(ctx), * gsplit = ggml_new_graph(ctx), * gmapped = ggml_new_graph(ctx);
                 ggml_build_forward_expand(gfull, ordinary); ggml_build_forward_expand(gmapped, permuted); ggml_build_forward_expand(gsplit, split);
                 auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
                 assert(buffer && ggml_backend_dev_supports_op(ggml_backend_get_device(backend), split));
+                {
+                    std::vector<int64_t> addresses(3*experts);
+                    for (int s = 0; s < experts; ++s) {
+                        const auto & b = s < base_count ? base : extra;
+                        const int local = s < base_count ? s : s - base_count;
+                        const ggml_tensor * parts[3] = {b.packed, b.suh, b.svh};
+                        for (int c = 0; c < 3; ++c) { addresses[3*s + c] = (int64_t) (intptr_t) ((const char *) parts[c]->data + size_t(local)*parts[c]->nb[2]); }
+                    }
+                    ggml_backend_tensor_set(table, addresses.data(), 0, ggml_nbytes(table));
+                }
                 for (auto banks : {std::array<ggml_tensor *, 4>{full.packed, base.packed, extra.packed, rebased.packed},
                                    std::array<ggml_tensor *, 4>{full.suh, base.suh, extra.suh, rebased.suh},
                                    std::array<ggml_tensor *, 4>{full.svh, base.svh, extra.svh, rebased.svh}}) {
@@ -278,26 +290,45 @@ static void auxiliary_upload() {
         auto * ctx = ggml_init({1024*1024, nullptr, true});
         auto * scratch = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, GGML_EXL3_AUX_SCRATCH_BYTES);
         ggml_exl3_aux_batch batch{};
-        batch.n_slots = 83; batch.base_slots = base_slots;
+        batch.n_slots = 83;
         const int widths[] = {2560, 640, 2560, 640, 640, 2560};
         std::vector<ggml_tensor *> banks;
         for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
             batch.banks[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, widths[i], 1, (base_slots ? base_slots : batch.n_slots)+1);
             banks.push_back(batch.banks[i]);
         }
+        std::vector<ggml_tensor *> extra_banks;
+        ggml_tensor * table = nullptr;
         if (base_slots) {
             for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
-                batch.extra_banks[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, widths[i], 1, batch.n_slots-base_slots+1);
-                banks.push_back(batch.extra_banks[i]);
+                extra_banks.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_F16, widths[i], 1, batch.n_slots-base_slots+1));
+                banks.push_back(extra_banks.back());
             }
+            // columns in reverse bank order, so a column/bank mix-up shows
+            table = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, GGML_EXL3_AUX_BANKS, batch.n_slots);
+            batch.slot_table = table;
+            for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) { batch.table_cols[i] = GGML_EXL3_AUX_BANKS - 1 - i; }
         }
         auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        std::vector<int64_t> addresses;
+        if (table) {
+            addresses.resize(GGML_EXL3_AUX_BANKS*batch.n_slots);
+            for (int s = 0; s < batch.n_slots; ++s) {
+                for (int i = 0; i < GGML_EXL3_AUX_BANKS; ++i) {
+                    const auto * bank = s < base_slots ? batch.banks[i] : extra_banks[i];
+                    const int local = s < base_slots ? s : s - base_slots;
+                    addresses[size_t(s)*GGML_EXL3_AUX_BANKS + batch.table_cols[i]] = (int64_t) (intptr_t) ((const char *) bank->data + size_t(local)*bank->nb[2]);
+                }
+            }
+            ggml_backend_tensor_set(table, addresses.data(), 0, ggml_nbytes(table));
+        }
         auto * host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
         auto * host = ggml_backend_buft_alloc_buffer(host_buft, GGML_EXL3_AUX_SCRATCH_BYTES);
         assert(buffer && host && ggml_backend_buffer_get_type(host) == host_buft);
         auto * payload = (uint16_t *) ggml_backend_buffer_get_base(host);
         for (int count : {0, 1, 3, 10, 80}) {
             ggml_backend_buffer_clear(buffer, 0x5a);
+            if (table) { ggml_backend_tensor_set(table, addresses.data(), 0, ggml_nbytes(table)); } // the clear overwrote it
             batch.count = count;
             for (int i = 0; i < count; ++i) { batch.slots[i] = (i*17+3)%batch.n_slots; }
             std::vector<std::vector<uint16_t>> expected;
@@ -342,9 +373,11 @@ static void auxiliary_upload() {
                     assert(!upload(backend, scratch, payload, words*2, &invalid));
                 }
                 if (base_slots) {
-                    invalid = batch; invalid.extra_banks[0] = nullptr;
+                    invalid = batch; invalid.table_cols[1] = invalid.table_cols[0];
                     assert(!upload(backend, scratch, payload, words*2, &invalid));
-                    invalid = batch; invalid.extra_banks[1] = invalid.extra_banks[0];
+                    invalid = batch; invalid.table_cols[0] = GGML_EXL3_AUX_BANKS;
+                    assert(!upload(backend, scratch, payload, words*2, &invalid));
+                    invalid = batch; invalid.n_slots = batch.n_slots - 1;
                     assert(!upload(backend, scratch, payload, words*2, &invalid));
                 }
                 ggml_backend_synchronize(backend); check();

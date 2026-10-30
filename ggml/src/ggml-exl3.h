@@ -48,9 +48,10 @@ GGML_API bool ggml_exl3_load_bundle(const struct gguf_context * metadata, struct
 GGML_API bool ggml_exl3_op_supported(const struct ggml_tensor * op);
 // Cache projections keep K order independent of physical slot placement.
 GGML_API bool ggml_exl3_set_cache_order(struct ggml_tensor * op);
-// Optional second expert bank; slot IDs continue after the base bank. No allocation.
-GGML_API bool ggml_exl3_set_extra(struct ggml_tensor * op, struct ggml_tensor * packed,
-                                struct ggml_tensor * suh, struct ggml_tensor * svh);
+// Cache slots anywhere in memory: an I64 table [3, n_slots] of each slot's byte addresses of its packed weights, suh and
+// svh, in the layout of the base bank src[0] (a view with a row stride is allowed). Expert IDs index the table. No
+// allocation; the addresses must stay valid while the op may run.
+GGML_API bool ggml_exl3_set_slots(struct ggml_tensor * op, struct ggml_tensor * slots);
 GGML_API bool ggml_exl3_compute_forward(struct ggml_tensor * op);
 // Thread ith of nth computes its share of the output; results do not depend on nth.
 GGML_API bool ggml_exl3_compute_forward_part(struct ggml_tensor * op, int ith, int nth);
@@ -65,8 +66,10 @@ struct ggml_exl3_aux_batch {
     int32_t slots[GGML_EXL3_AUX_MAX_FILLS];
     int32_t count;
     int32_t n_slots;
-    struct ggml_tensor * extra_banks[GGML_EXL3_AUX_BANKS];
-    int32_t base_slots;
+    // optional I64 [n_cols, n_slots] (a view may have a row stride): bank i of slot s is written at the address in
+    // column table_cols[i] of row s instead of banks[i]; banks[] then only give the row widths
+    struct ggml_tensor * slot_table;
+    int32_t table_cols[GGML_EXL3_AUX_BANKS];
 };
 
 // Internal backend extension. Payload is bank-major, then fill-major; the caller keeps it alive until completion.

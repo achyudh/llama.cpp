@@ -6248,13 +6248,12 @@ struct test_mul_mat_exl3 : public test_case {
     const int experts; // routed only
     const int used;
     const int slots;   // input rows per token: 1 (gate/up) or used (down)
-    const bool split;
 
-    test_mul_mat_exl3(int bits_x2, int rows, bool routed, int n = 256, int k = 128, int experts = 2, int used = 4, int slots = 1, bool split = false)
-        : bits_x2(bits_x2), rows(rows), routed(routed), n(n), k(k), experts(routed ? experts : 1), used(used), slots(slots), split(split) {}
+    test_mul_mat_exl3(int bits_x2, int rows, bool routed, int n = 256, int k = 128, int experts = 2, int used = 4, int slots = 1)
+        : bits_x2(bits_x2), rows(rows), routed(routed), n(n), k(k), experts(routed ? experts : 1), used(used), slots(slots) {}
 
     std::string vars() override {
-        return VARS_TO_STR8(bits_x2, rows, routed, n, k, experts, used, slots) + (split ? ",split=1" : "");
+        return VARS_TO_STR8(bits_x2, rows, routed, n, k, experts, used, slots);
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -6263,7 +6262,7 @@ struct test_mul_mat_exl3 : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int count = split ? experts/2 : experts;
+        const int count = experts;
         auto * p = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, (int64_t) (k / 16) * (n / 16) * 8 * bits_x2, 1, count);
         auto * su = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, count);
         auto * sv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, count);
@@ -6271,13 +6270,7 @@ struct test_mul_mat_exl3 : public test_case {
         auto * ids = routed ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, rows) : nullptr;
         if (ids) { ggml_set_name(ids, "exl3_test_ids"); }
         auto * out = ggml_mul_mat_exl3(ctx, p, su, sv, x, ids, bits_x2);
-        if (split) {
-            auto * ep = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, p->ne[0], 1, experts-count);
-            auto * es = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, experts-count);
-            auto * ev = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, experts-count);
-            GGML_ASSERT(ggml_exl3_set_extra(out, ep, es, ev));
-            GGML_ASSERT(ggml_exl3_set_cache_order(out));
-        }
+
         return out;
     }
 
@@ -11023,18 +11016,8 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
-    for (int bits_x2 : {7, 8}) {
-        for (int k : {640, 2560}) {
-            for (int slots : {1, 10}) {
-                test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 16, true, 256, k, 12, 10, slots, true));
-            }
-        }
-        for (int rows : {1, 4, 8, 16}) {
-            for (int slots : {1, 4}) {
-                test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, true, 256, 128, 4, 4, slots, true));
-            }
-        }
-    }
+    // Slot tables contain backend addresses. Test them against banks in test-exl3 and test-exl3-rocm;
+    // the generic graph comparer copies tensor bytes and cannot relocate those addresses.
     for (int bits_x2 : {7, 8, 10, 12, 14}) {
         for (int rows : {1, 4, 5}) {
             for (bool routed : {false, true}) {

@@ -242,42 +242,64 @@ static void test_dispatch(ggml_backend_t backend) {
     }
 }
 
-static void test_split_bank(ggml_backend_t backend) {
+// Slots anywhere in memory through a slot table: permuted experts, one of them in a separate copy, must reproduce the
+// bank's result byte for byte.
+static void test_slot_table(ggml_backend_t backend) {
     for (int rate : {7, 8, 14}) {
         for (int rows : {1, 4, 8, 16}) {
             auto * ctx = ggml_init({8*1024*1024, nullptr, false});
             auto b = bank(ctx, 4, rate);
-            auto * bp = ggml_view_3d(ctx, b.packed, b.packed->ne[0], 1, 1, b.packed->nb[1], b.packed->nb[2], 0);
-            auto * ep = ggml_view_3d(ctx, b.packed, b.packed->ne[0], 1, 3, b.packed->nb[1], b.packed->nb[2], b.packed->nb[2]);
-            auto * bs = ggml_view_2d(ctx, b.suh, 128, 1, b.suh->nb[1], 0);
-            auto * es = ggml_view_2d(ctx, b.suh, 128, 3, b.suh->nb[1], b.suh->nb[1]);
-            auto * bv = ggml_view_2d(ctx, b.svh, 256, 1, b.svh->nb[1], 0);
-            auto * ev = ggml_view_2d(ctx, b.svh, 256, 3, b.svh->nb[1], b.svh->nb[1]);
+            auto * cp = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, b.packed->ne[0], 1, 1);
+            auto * cs = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 128);
+            auto * cv = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 256);
+            std::memcpy(cp->data, (const char *) b.packed->data + 2*b.packed->nb[2], b.packed->nb[2]);
+            std::memcpy(cs->data, (const char *) b.suh->data + 2*b.suh->nb[1], b.suh->nb[1]);
+            std::memcpy(cv->data, (const char *) b.svh->data + 2*b.svh->nb[1], b.svh->nb[1]);
+            // slot -> expert {3, 0, 2 (the copy), 1, 2}
+            const int expert_of[5] = {3, 0, 2, 1, 2};
+            auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 3, 5);
+            for (int s = 0; s < 5; ++s) {
+                const int e = expert_of[s];
+                int64_t * row = (int64_t *) table->data + 3*s;
+                row[0] = (int64_t) (intptr_t) (s == 2 ? cp->data : (char *) b.packed->data + e*b.packed->nb[2]);
+                row[1] = (int64_t) (intptr_t) (s == 2 ? cs->data : (char *) b.suh->data + e*b.suh->nb[1]);
+                row[2] = (int64_t) (intptr_t) (s == 2 ? cv->data : (char *) b.svh->data + e*b.svh->nb[1]);
+            }
             auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 4, rows);
             auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, rows);
+            auto * sids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, rows);
+            const int slot_of[4][2] = {{1, 1}, {3, 3}, {2, 4}, {0, 0}};
             for (int64_t i = 0; i < ggml_nelements(x); ++i) { ((float *) x->data)[i] = float(i%19 - 9)/16; }
-            for (int i = 0; i < 4*rows; ++i) { ((int32_t *) ids->data)[i] = (i%4 == 3 ? 1 : (i + i/4)%4); }
+            for (int i = 0; i < 4*rows; ++i) {
+                const int e = (i%4 == 3 ? 1 : (i + i/4)%4);
+                ((int32_t *) ids->data)[i] = e;
+                ((int32_t *) sids->data)[i] = slot_of[e][i%2];
+            }
             auto * full = ggml_mul_mat_exl3(ctx, b.packed, b.suh, b.svh, x, ids, rate);
-            auto * split = ggml_mul_mat_exl3(ctx, bp, bs, bv, x, ids, rate);
-            assert(ggml_exl3_set_extra(split, ep, es, ev));
+            auto * slotted = ggml_mul_mat_exl3(ctx, b.packed, b.suh, b.svh, x, sids, rate);
+            assert(ggml_exl3_set_slots(slotted, table));
+            assert(!ggml_exl3_set_slots(slotted, table));
             compute(ctx, full, backend);
-            compute(ctx, split, backend);
-            assert(std::memcmp(full->data, split->data, ggml_nbytes(full)) == 0);
-            for (int thread = 0; thread < 3; ++thread) { assert(ggml_exl3_compute_forward_part(split, thread, 3)); }
-            assert(std::memcmp(full->data, split->data, ggml_nbytes(full)) == 0);
-            split->src[7] = nullptr;
-            assert(!ggml_exl3_op_supported(split));
-            split->src[7] = ev;
-            auto malformed = *ep; malformed.type = GGML_TYPE_F32;
-            auto * fresh = ggml_mul_mat_exl3(ctx, bp, bs, bv, x, ids, rate);
-            assert(!ggml_exl3_set_extra(fresh, &malformed, es, ev));
-            assert(!fresh->src[5] && !fresh->src[6] && !fresh->src[7]);
-            assert(!ggml_exl3_set_extra(fresh, ep, es, nullptr));
-            for (int invalid : {-1, 4}) {
-                std::memset(split->data, 0x5a, ggml_nbytes(split));
-                ((int32_t *) ids->data)[0] = invalid;
-                assert(!ggml_exl3_compute_forward(split));
-                for (size_t i = 0; i < ggml_nbytes(split); ++i) { assert(((uint8_t *) split->data)[i] == 0x5a); }
+            compute(ctx, slotted, backend);
+            assert(std::memcmp(full->data, slotted->data, ggml_nbytes(full)) == 0);
+            for (int thread = 0; thread < 3; ++thread) { assert(ggml_exl3_compute_forward_part(slotted, thread, 3)); }
+            assert(std::memcmp(full->data, slotted->data, ggml_nbytes(full)) == 0);
+            slotted->src[6] = x;
+            assert(!ggml_exl3_op_supported(slotted));
+            slotted->src[6] = nullptr;
+            auto malformed = *table; malformed.type = GGML_TYPE_I32;
+            auto * fresh = ggml_mul_mat_exl3(ctx, b.packed, b.suh, b.svh, x, sids, rate);
+            assert(!ggml_exl3_set_slots(fresh, &malformed));
+            malformed = *table; malformed.ne[0] = 2;
+            assert(!ggml_exl3_set_slots(fresh, &malformed));
+            assert(!fresh->src[5]);
+            auto * dense = ggml_mul_mat_exl3(ctx, b.packed, b.suh, b.svh, x, nullptr, rate);
+            assert(!dense || !ggml_exl3_set_slots(dense, table));
+            for (int invalid : {-1, 5}) {
+                std::memset(slotted->data, 0x5a, ggml_nbytes(slotted));
+                ((int32_t *) sids->data)[0] = invalid;
+                assert(!ggml_exl3_compute_forward(slotted));
+                for (size_t i = 0; i < ggml_nbytes(slotted); ++i) { assert(((uint8_t *) slotted->data)[i] == 0x5a); }
             }
             ggml_free(ctx);
         }
@@ -457,7 +479,7 @@ int main(int argc, char ** argv) {
     test_threads();
     if (backend) {
         test_dispatch(backend);
-        test_split_bank(backend);
+        test_slot_table(backend);
         ggml_backend_free(backend);
     }
     if (argc == 2) {
