@@ -5,6 +5,52 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
+template<int ncols_dst>
+static __global__ void mul_mat_vec_hc_warp(
+        const half * weights, const float * input, float * dst,
+        int stride_row, int stride_col_input, int stride_col_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    if constexpr (warp_size == 32) {
+#ifdef FP16_AVAILABLE
+        const int lane = threadIdx.x;
+        const int row = blockIdx.x * blockDim.y + threadIdx.y;
+        const half2 * w = (const half2 *) (weights + int64_t(row)*stride_row);
+        float sum[ncols_dst] = {0.0f};
+#pragma unroll
+        for (int group = 0; group < 5; ++group) {
+            const int col = group*warp_size + lane;
+            const half2 weight = w[col];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float2 value = ((const float2 *) (input + int64_t(j)*stride_col_input))[col];
+                half2 product = {0.0f, 0.0f};
+                product += weight * make_half2(value.x, value.y);
+                float partial = __low2float(product) + __high2float(product);
+                partial = warp_reduce_sum<warp_size>(partial);
+                // Keep the five original warp sums in the same padded reduction lanes.
+                if (lane == group) {
+                    sum[j] = partial;
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float value = warp_reduce_sum<warp_size>(sum[j]);
+            if (lane == j) {
+                dst[int64_t(j)*stride_col_dst + row] = value;
+            }
+        }
+#else
+        NO_DEVICE_CODE;
+#endif
+    } else {
+        NO_DEVICE_CODE;
+    }
+}
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -451,6 +497,28 @@ void launch_mul_mat_vec_f_cuda(
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+    // The block size loop below picks 160 threads for 320 columns, one half2 product per thread and five warp sums; one warp per
+    // output reproduces those sums and their padded reduction without block barriers (Flash-Next hyper-connection expansion).
+    // GGML_CUDA_MMV_HC_WARPS=0 selects the block kernel, for comparisons
+    if constexpr (std::is_same_v<T, half> && std::is_same_v<type_acc, half> && ncols_dst <= 5) {
+        if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) && warp_size == 32 &&
+                ncols == 320 && nrows == 10240 && !has_fusion && !ids &&
+                nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1 && nsamples_or_ntokens == 1) {
+            static const bool hc_warp = [] {
+                const char * value = std::getenv("GGML_CUDA_MMV_HC_WARPS");
+                GGML_ASSERT(!value || !strcmp(value, "0") || !strcmp(value, "1"));
+                return !value || !strcmp(value, "1");
+            }();
+            if (hc_warp) {
+                mul_mat_vec_hc_warp<ncols_dst><<<dim3(nrows), dim3(warp_size, 1), 0, stream>>>(
+                    x, y, dst, stride_row, stride_col_y, stride_col_dst);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
+    }
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);

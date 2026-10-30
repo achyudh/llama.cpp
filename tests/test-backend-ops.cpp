@@ -11065,7 +11065,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 320, n, 640, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 200, n, 320, {1, 1}, {1, 1}));
     }
-    for (int64_t n : {1, 4, 5, 8}) {
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 10240, n, 320, {1, 1}, {1, 1}));
     }
     // narrow outputs of long K: the Flash-Next hyper-connection and gate projections
