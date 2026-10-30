@@ -63,7 +63,7 @@ static __device__ __forceinline__ half ggml_cuda_exl3_weight(const uint32_t * ti
 // Four adjacent K3.5/K4 state windows fit in 32 bits. Adapted from ExLlamaV3 dq8_half/dq8.
 // Copyright (c) 2025 Turboderp. See licenses/LICENSE-exllamav3.
 // The lane's eight weights as pairs w[j] = (2j, 2j + 1).
-template<int bits_x2>
+template<int bits_x2, bool pair = false>
 static __device__ __forceinline__ void ggml_cuda_exl3_fragment2(const uint32_t * tile, int lane, half2 w[4]) {
     if constexpr (bits_x2 == 7 || bits_x2 == 8) {
         constexpr int words = 4 * bits_x2;
@@ -82,6 +82,19 @@ static __device__ __forceinline__ void ggml_cuda_exl3_fragment2(const uint32_t *
                 w[group * 2 + j / 2] = ggml_cuda_exl3_mul1x2(uint16_t(window >> d0), uint16_t(window >> d1));
             }
         }
+    } else if constexpr ((bits_x2 == 10 || bits_x2 == 12 || bits_x2 == 14) && pair) {
+        // Two adjacent K5/K6/K7 windows span 21/22/23 bits, so one word pair supplies both states.
+#pragma unroll
+        for (int j = 0; j < 8; j += 2) {
+            constexpr int words = 4*bits_x2, step = bits_x2/2;
+            const int end = (lane*8 + j + 2)*step;
+            const int start = end - (16 + step);
+            const int lo = (start < 0 ? start + words*32 : start)/32;
+            const int hi = (end - 1)/32;
+            const int shift = (hi + 1)*32 - end;
+            const uint32_t window = uint32_t(((uint64_t(tile[lo]) << 32) | tile[hi]) >> shift);
+            w[j/2] = ggml_cuda_exl3_mul1x2(uint16_t(window >> step), uint16_t(window));
+        }
     } else {
 #pragma unroll
         for (int j = 0; j < 8; j += 2) {
@@ -90,10 +103,10 @@ static __device__ __forceinline__ void ggml_cuda_exl3_fragment2(const uint32_t *
     }
 }
 
-template<int bits_x2>
+template<int bits_x2, bool pair = false>
 static __device__ __forceinline__ void ggml_cuda_exl3_fragment(const uint32_t * tile, int lane, half w[8]) {
     half2 w2[4];
-    ggml_cuda_exl3_fragment2<bits_x2>(tile, lane, w2);
+    ggml_cuda_exl3_fragment2<bits_x2, pair>(tile, lane, w2);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         w[2 * j] = __low2half(w2[j]);

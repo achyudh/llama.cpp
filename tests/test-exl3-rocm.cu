@@ -26,11 +26,11 @@ static __global__ void tile_kernel(const uint32_t * p, uint16_t * dst) {
     dst[row * 16 + col] = __half_as_ushort(ggml_cuda_exl3_weight<bits>(p, i));
 }
 
-template<int bits>
+template<int bits, bool pair = false>
 static __global__ void fragment_kernel(const uint32_t * p, uint16_t * dst) {
     const int lane = threadIdx.x;
     half w[8];
-    ggml_cuda_exl3_fragment<bits>(p, lane, w);
+    ggml_cuda_exl3_fragment<bits, pair>(p, lane, w);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int row = (lane & 3) * 2 + (j & 1) + ((j & 2) ? 8 : 0);
@@ -52,7 +52,7 @@ static void codec(const char * path) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpy(actual.data(), device, 65536 * 2, cudaMemcpyDeviceToHost));
     assert(actual == expected);
-    unsigned bits, length, count = 0;
+    unsigned bits, length, count = 0, pairs10 = 0, pairs12 = 0, pairs14 = 0;
     while (in.read((char *) &bits, 4)) {
         assert(in.read((char *) &length, 4));
         assert(length == ggml_exl3_tile_size(bits) && length <= 256);
@@ -67,15 +67,19 @@ static void codec(const char * path) {
             default: assert(false);
         }
 #undef TILE_CASE
+        if (bits == 10) { fragment_kernel<10, true><<<1, 32>>>(packed, device + 512); ++pairs10; }
+        if (bits == 12) { fragment_kernel<12, true><<<1, 32>>>(packed, device + 512); ++pairs12; }
+        if (bits == 14) { fragment_kernel<14, true><<<1, 32>>>(packed, device + 512); ++pairs14; }
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpy(actual.data(), device, 1024, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(actual.data(), device, bits == 10 || bits == 12 || bits == 14 ? 1536 : 1024, cudaMemcpyDeviceToHost));
         assert(std::equal(actual.begin(), actual.begin() + 256, expected.begin()));
         assert(std::equal(actual.begin() + 256, actual.begin() + 512, expected.begin()));
+        if (bits == 10 || bits == 12 || bits == 14) { assert(std::equal(actual.begin() + 512, actual.begin() + 768, expected.begin())); }
         ++count;
     }
-    assert(in.eof() && in.gcount() == 0 && count > 0);
+    assert(in.eof() && in.gcount() == 0 && count > 0 && pairs10 > 0 && pairs12 > 0 && pairs14 > 0);
     CUDA_CHECK(cudaFree(packed)); CUDA_CHECK(cudaFree(device));
-    std::printf("{\"codebook_entries\":65536,\"exact_tiles\":%u,\"exact_fragments\":%u}\n", count, count);
+    std::printf("{\"codebook_entries\":65536,\"exact_tiles\":%u,\"exact_fragments\":%u,\"paired_k5_tiles\":%u,\"paired_k6_tiles\":%u,\"paired_k7_tiles\":%u}\n", count, count, pairs10, pairs12, pairs14);
 }
 
 static void save_output(const std::string & path, ggml_tensor * out) {

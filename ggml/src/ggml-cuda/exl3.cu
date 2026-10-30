@@ -182,7 +182,7 @@ static __global__ void exl3_matrix_f32(ggml_cuda_exl3_args a) {
 
 // The fragment layout and quad reduction follow ExLlamaV3's MIT-licensed RDNA direct GEMV core.
 // Copyright (c) 2025 Turboderp. See licenses/LICENSE-exllamav3.
-template<int bits_x2, bool fp16>
+template<int bits_x2, bool fp16, bool pair = false>
 static __global__ void exl3_matrix_fragment(ggml_cuda_exl3_args a) {
     __shared__ float partial[4][16];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -196,7 +196,7 @@ static __global__ void exl3_matrix_fragment(ggml_cuda_exl3_args a) {
         for (int kt = warp; kt < a.k / 16; kt += 4) {
             const uint32_t * tile = bank.packed + expert * bank_words + (size_t(kt) * (a.n / 16) + blockIdx.x) * (4 * bits_x2);
             half w[8];
-            ggml_cuda_exl3_fragment<bits_x2>(tile, lane, w);
+            ggml_cuda_exl3_fragment<bits_x2, pair>(tile, lane, w);
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
             if constexpr (fp16) {
                 const half2 * x = (const half2 *) ((const half *) a.xh + size_t(assignment) * a.k + kt * 16);
@@ -237,7 +237,7 @@ static __global__ void exl3_matrix_fragment(ggml_cuda_exl3_args a) {
 
 // A dense bank is shared by every row, so decode each fragment once and apply it to all rows. Per-row accumulation
 // and reduction follow exl3_matrix_fragment<bits_x2, false> exactly, so each row's result is bit-identical to it.
-template<int bits_x2, int rows>
+template<int bits_x2, int rows, bool pair = false>
 static __global__ void exl3_matrix_rows(ggml_cuda_exl3_args a) {
     __shared__ float partial[4][rows][16];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -248,7 +248,7 @@ static __global__ void exl3_matrix_rows(ggml_cuda_exl3_args a) {
     for (int kt = warp; kt < a.k / 16; kt += 4) {
         const uint32_t * tile = a.packed + (size_t(kt) * (a.n / 16) + blockIdx.x) * (4 * bits_x2);
         half w[8];
-        ggml_cuda_exl3_fragment<bits_x2>(tile, lane, w);
+        ggml_cuda_exl3_fragment<bits_x2, pair>(tile, lane, w);
 #pragma unroll
         for (int r = 0; r < rows; ++r) {
 #pragma unroll
@@ -317,24 +317,24 @@ static void exl3_decode_f16_launch(const ggml_cuda_exl3_args & a, half * w, int 
     }
 }
 
-template<int bits_x2>
+template<int bits_x2, bool pair = false>
 static void exl3_matrix_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mode mode, cudaStream_t stream) {
     if (mode == GGML_EXL3_F32_ROWS && !a.ids && a.experts >= 1 && a.assignments <= 8) {
         switch (a.assignments) {
-            case 1: exl3_matrix_rows<bits_x2, 1><<<a.n / 16, 128, 0, stream>>>(a); return;
-            case 2: exl3_matrix_rows<bits_x2, 2><<<a.n / 16, 128, 0, stream>>>(a); return;
-            case 3: exl3_matrix_rows<bits_x2, 3><<<a.n / 16, 128, 0, stream>>>(a); return;
-            case 4: exl3_matrix_rows<bits_x2, 4><<<a.n / 16, 128, 0, stream>>>(a); return;
-            case 5: exl3_matrix_rows<bits_x2, 5><<<a.n / 16, 128, 0, stream>>>(a); return;
-            case 6: exl3_matrix_rows<bits_x2, 6><<<a.n / 16, 128, 0, stream>>>(a); return;
-            case 7: exl3_matrix_rows<bits_x2, 7><<<a.n / 16, 128, 0, stream>>>(a); return;
-            case 8: exl3_matrix_rows<bits_x2, 8><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 1: exl3_matrix_rows<bits_x2, 1, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 2: exl3_matrix_rows<bits_x2, 2, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 3: exl3_matrix_rows<bits_x2, 3, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 4: exl3_matrix_rows<bits_x2, 4, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 5: exl3_matrix_rows<bits_x2, 5, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 6: exl3_matrix_rows<bits_x2, 6, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 7: exl3_matrix_rows<bits_x2, 7, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
+            case 8: exl3_matrix_rows<bits_x2, 8, pair><<<a.n / 16, 128, 0, stream>>>(a); return;
             default: break;
         }
     }
     const dim3 grid(a.n / 16, a.assignments);
-    if (mode == GGML_EXL3_F16_DOT) { exl3_matrix_fragment<bits_x2, true><<<grid, 128, 0, stream>>>(a); }
-    else if (mode == GGML_EXL3_F32_FRAGMENT || mode == GGML_EXL3_F32_ROWS) { exl3_matrix_fragment<bits_x2, false><<<grid, 128, 0, stream>>>(a); }
+    if (mode == GGML_EXL3_F16_DOT) { exl3_matrix_fragment<bits_x2, true, pair><<<grid, 128, 0, stream>>>(a); }
+    else if (mode == GGML_EXL3_F32_FRAGMENT || mode == GGML_EXL3_F32_ROWS) { exl3_matrix_fragment<bits_x2, false, pair><<<grid, 128, 0, stream>>>(a); }
     else { exl3_matrix_f32<bits_x2><<<grid, 128, 0, stream>>>(a); }
 }
 
@@ -346,12 +346,19 @@ void ggml_cuda_exl3_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mode mo
         else { exl3_transform<float, true><<<grid, 32 * EXL3_TRANSFORM_ROWS, 0, stream>>>(a); }
     }
     if (stage == GGML_EXL3_MATRIX || stage == GGML_EXL3_ALL) {
+        // K5/K6/K7 decode two adjacent weights from one word-pair window, with the same arithmetic per weight;
+        // GGML_CUDA_EXL3_PAIRED=0 selects the per-weight decoder, for comparisons
+        static const bool paired = [] {
+            const char * value = getenv("GGML_CUDA_EXL3_PAIRED");
+            GGML_ASSERT(!value || !strcmp(value, "0") || !strcmp(value, "1"));
+            return !value || !strcmp(value, "1");
+        }();
         switch (a.bits_x2) {
             case 7:  exl3_matrix_launch<7 >(a, mode, stream); break;
             case 8:  exl3_matrix_launch<8 >(a, mode, stream); break;
-            case 10: exl3_matrix_launch<10>(a, mode, stream); break;
-            case 12: exl3_matrix_launch<12>(a, mode, stream); break;
-            case 14: exl3_matrix_launch<14>(a, mode, stream); break;
+            case 10: if (paired) { exl3_matrix_launch<10, true>(a, mode, stream); } else { exl3_matrix_launch<10>(a, mode, stream); } break;
+            case 12: if (paired) { exl3_matrix_launch<12, true>(a, mode, stream); } else { exl3_matrix_launch<12>(a, mode, stream); } break;
+            case 14: if (paired) { exl3_matrix_launch<14, true>(a, mode, stream); } else { exl3_matrix_launch<14>(a, mode, stream); } break;
             default: GGML_ABORT("Unsupported EXL3 rate");
         }
     }
