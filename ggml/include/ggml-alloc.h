@@ -74,6 +74,8 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 // bytes of the buffer used by the last planned graph (its high-water mark), at most the buffer size
 GGML_API size_t ggml_gallocr_get_planned_size(ggml_gallocr_t galloc, int buffer_id);
+// the backend buffer behind buffer_id if it is a single chunk, else NULL; valid until the next reallocation
+GGML_API ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

@@ -359,6 +359,8 @@ extern "C" {
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
     // bytes of the backend's compute buffer used by the last allocated graph
     GGML_API size_t                     ggml_backend_sched_get_planned_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // the backend's compute buffer if it is a single allocation, else NULL; graphs use it from offset 0 up to the planned size
+    GGML_API ggml_backend_buffer_t      ggml_backend_sched_get_buffer(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

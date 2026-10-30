@@ -55,6 +55,15 @@ public:
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
+    // lend the regions borrowed up to a level (0: base slots only, 1: staging and the top of the compute buffer, 2: also
+    // its middle); lowering the level invalidates the experts in the regions it gives back
+    void set_lend_level(int level);
+    // lend the scheduler's compute buffer above its decode use: [b_start, size) at level 1, [a_start, b_start) at level 2
+    void attach_compute(ggml_backend_buffer_t buffer, size_t a_start, size_t b_start);
+    bool lends_compute() const;
+    // before a graph runs: give back the regions its compute buffer use reaches; follow a reallocated compute buffer
+    void fit_compute(ggml_backend_buffer_t buffer, size_t planned_size);
+
     // EXL3: the slot table of the packed weights w (I64 [3, n_slots], see ggml_exl3_set_slots), nullptr if w is not cached
     ggml_tensor * get_slot_table(const ggml_tensor * w) const;
 

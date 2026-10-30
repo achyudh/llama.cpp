@@ -115,8 +115,12 @@ struct moe_cache_slru {
             prev[s] = s - 1;
             next[s] = s + 1 < n_slots ? s + 1 : -1;
         }
-        head[0] = 0;
+        head[0] = n_slots > 0 ? 0 : -1;
         tail[0] = n_slots - 1;
+        head[1] = tail[1] = -1;
+        n_protected = 0;
+        seen_gen = 0;
+        uniq.clear();
         is_protected.assign(n_slots, false);
         seen.assign(n_expert, 0);
     }
@@ -295,8 +299,16 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> ref;   // expert tensors of the first layer
         std::vector<int32_t> layers;
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
-        std::vector<ggml_tensor *> extra_banks;
-        std::vector<ggml_tensor *> extra_views;
+        // borrowed slot ranges after the base slots, in slot order and by level: level 1 (the staging buffer, the top of the
+        // compute buffer) is reclaimed for streamed batches, level 2 (the middle of the compute buffer) also for bypass ones
+        struct region {
+            std::vector<ggml_tensor *> banks; // one per expert tensor, count + 1 slots (the last is the zero padding slot)
+            int32_t first = 0;
+            int32_t count = 0;
+            int level = 1;
+            bool compute = false;
+        };
+        std::vector<region> regions;
         int32_t base_slots = 0;
         size_t host_bytes = 0;
         int32_t n_slots = 0;
@@ -371,10 +383,13 @@ struct llama_moe_cache::impl {
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
-    ggml_context_ptr ctx_tables;
+    // the views of each table build; earlier builds stay alive, graphs built before a rebuild may still use them
+    std::vector<ggml_context_ptr> ctx_tables;
     ggml_context_ptr ctx_extra;
     enum staging_mode { STAGING_OFF, STAGING_ON, STAGING_RESERVE } staging = STAGING_OFF;
     bool staging_active = false;
+    int lend_level = 0;              // regions lent up to this level are in use (0: base slots only)
+    ggml_context_ptr ctx_compute;    // banks lent from the scheduler's compute buffer
     size_t staging_used = 0;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin, bool aux_allowed, bool mtp) :
@@ -582,7 +597,7 @@ struct llama_moe_cache::impl {
         }
         ctx_host  = init_ctx(n_tensors_host);
         ctx_views = init_ctx(2);
-        ctx_tables = init_ctx(groups.size()*12); // views of up to three table builds
+
 
         ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
         const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
@@ -736,7 +751,9 @@ struct llama_moe_cache::impl {
     // header: "MOERT001", u32 n_layer, u32 n_expert, u32 n_groups, per group u32 slots, u32 bytes per expert, u32 n_layers, u32 layers[]
     // records: u8 type, then 1 = route: u8 0, u16 layer, u32 ms, u16 n_ids, u16 ids[n_ids] (n_expert_used per row, rows in order)
     //                        2 = staging attached: u8 0, u16 group, u32 base slots, u32 total slots
-    //                        3 = staging active: u8 active, u16 0, u32 ms
+    //                        3 = lending level: u8 level, u16 0, u32 ms
+    //                        4 = compute region: u8 level, u16 group, u32 first slot, u32 count
+    //                        5 = compute detached and cache reset: u8 0, u16 0, u32 ms
     void open_trace() {
         const char * path = std::getenv("LLAMA_MOE_ROUTE_TRACE");
         if (!path || !*path || groups.empty()) {
@@ -773,7 +790,37 @@ struct llama_moe_cache::impl {
 
     uint32_t trace_ms() const { return (uint32_t) ((ggml_time_us() - trace_t0)/1000); }
 
-    // the address of every slot's storage of each expert tensor: base slots in the banks, then the borrowed extension
+    // the bank holding slot s of expert tensor ip, the slot's index in it and the slots from s to the end of that bank
+    ggml_tensor * locate(const group & g, int32_t s, size_t ip, int32_t & local, int32_t & room) const {
+        const int32_t base = g.base_slots ? g.base_slots : g.n_slots;
+        if (s < base) {
+            local = s;
+            room = base - s;
+            return g.banks[ip];
+        }
+        for (const auto & r : g.regions) {
+            if (s >= r.first && s < r.first + r.count) {
+                local = s - r.first;
+                room = r.first + r.count - s;
+                return r.banks[ip];
+            }
+        }
+        GGML_ABORT("MoE cache slot %d is outside the banks", s);
+    }
+
+    // the slots in use at a lending level: the base slots and the regions lent at that level or below
+    int32_t level_slots(const group & g, int level) const {
+        if (!g.base_slots || staging != STAGING_ON) {
+            return g.base_slots ? g.base_slots : g.n_slots;
+        }
+        int32_t n = g.base_slots;
+        for (const auto & r : g.regions) {
+            if (r.level <= level) { n = r.first + r.count; }
+        }
+        return n;
+    }
+
+    // the address of every slot's storage of each expert tensor: base slots in the banks, then the borrowed regions
     void build_table(group & g) {
         if (!g.table || !g.n_slots) {
             return;
@@ -781,23 +828,25 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(g.n_slots <= g.table_rows);
         const size_t cols = g.ref.size();
         g.table_host.assign((size_t) g.table_rows*cols, 0);
-        const int32_t base = g.base_slots ? g.base_slots : g.n_slots;
         for (int32_t s = 0; s < g.n_slots; ++s) {
             for (size_t c = 0; c < cols; ++c) {
-                const ggml_tensor * bank = s < base ? g.banks[c] : g.extra_banks[c];
-                const int32_t local = s < base ? s : s - base;
+                int32_t local, room;
+                const ggml_tensor * bank = locate(g, s, c, local, room);
                 g.table_host[(size_t) s*cols + c] = (int64_t) (intptr_t) ((const char *) bank->data + (size_t) local*bank->nb[2]);
             }
         }
         ggml_backend_tensor_set(g.table, g.table_host.data(), 0, (size_t) g.n_slots*cols*sizeof(int64_t));
+        ctx_tables.emplace_back(ggml_init({(cols/3 + 1)*ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx_tables.back()) { throw std::runtime_error("failed to create the MoE cache table context"); }
+        ggml_context * ctx_table = ctx_tables.back().get();
         g.table_views.clear();
         for (size_t t = 0; t < cols/3; ++t) {
-            ggml_tensor * view = ggml_view_2d(ctx_tables.get(), g.table, 3, g.n_slots, g.table->nb[1], t*3*sizeof(int64_t));
+            ggml_tensor * view = ggml_view_2d(ctx_table, g.table, 3, g.n_slots, g.table->nb[1], t*3*sizeof(int64_t));
             ggml_format_name(view, "%s.%zu", g.table->name, t);
             ggml_backend_view_init(view);
             g.table_views.push_back(view);
         }
-        ggml_tensor * all = ggml_view_2d(ctx_tables.get(), g.table, (int64_t) cols, g.n_slots, g.table->nb[1], 0);
+        ggml_tensor * all = ggml_view_2d(ctx_table, g.table, (int64_t) cols, g.n_slots, g.table->nb[1], 0);
         ggml_format_name(all, "%s.aux", g.table->name);
         ggml_backend_view_init(all);
         g.table_views.push_back(all);
@@ -882,6 +931,10 @@ struct llama_moe_cache::impl {
             group & g = groups[i];
             const int32_t count = counts[i];
             g.base_slots = g.n_slots;
+            group::region r;
+            r.first = g.n_slots;
+            r.count = count;
+            r.level = 1;
             for (auto * t : g.ref) {
                 auto * bank = ggml_new_tensor_3d(ctx_extra.get(), t->type, t->ne[0], t->ne[1], count + 1);
                 const size_t size = GGML_PAD(ggml_backend_buft_get_alloc_size(devices[0].buft, bank), align);
@@ -893,12 +946,9 @@ struct llama_moe_cache::impl {
                     throw std::runtime_error("failed to bind a MoE staging cache bank");
                 }
                 staging_used += size;
-                auto * view = ggml_view_3d(ctx_extra.get(), bank, bank->ne[0], bank->ne[1], count, bank->nb[1], bank->nb[2], 0);
-                ggml_format_name(view, "moe_cache.extra_view.%zu.%s", i, t->name);
-                ggml_backend_view_init(view);
-                g.extra_banks.push_back(bank);
-                g.extra_views.push_back(view);
+                r.banks.push_back(bank);
             }
+            g.regions.push_back(std::move(r));
             g.n_slots += count;
             build_table(g);
             g.slru.init(layers.size(), g.slru.n_expert, g.n_slots);
@@ -916,33 +966,203 @@ struct llama_moe_cache::impl {
             staging_used, available, staging == STAGING_ON ? "enabled" : "reserve");
     }
 
-    void set_staging_active(bool active) {
-        if (!ctx_extra || staging_active == active) { return; }
+    // lend the borrowed regions up to a level (0: base slots only); lowering it invalidates the experts in the regions
+    // it gives back, raising it clears the padding slots of the regions it adds
+    void set_level(int level) {
+        if (!ctx_extra) { return; }
+        level = std::max(0, std::min(level, max_level()));
+        if (level == lend_level) { return; }
         const int64_t start = ggml_time_us();
         ggml_backend_synchronize(devices[0].backend);
         pending_il = -1;
         pending_sel = nullptr;
         size_t invalidated = 0;
         for (auto & g : groups) {
-            if (!active) {
-                for (int32_t s = g.base_slots; s < g.slru.active_slots; ++s) {
+            const int32_t count = level_slots(g, level);
+            if (count < g.slru.active_slots) {
+                for (int32_t s = count; s < g.slru.active_slots; ++s) {
                     const int32_t key = g.slru.key_of[s];
                     if (key >= 0) { layers[key/g.slru.n_expert].perf.values[llama_moe_perf_data::extra_invalidated]++; }
                 }
-                invalidated += g.slru.set_active(g.base_slots);
-            } else {
-                for (auto * bank : g.extra_banks) {
-                    ggml_backend_tensor_memset(bank, 0, (bank->ne[2] - 1)*bank->nb[2], bank->nb[2]);
+                invalidated += g.slru.set_active(count);
+            } else if (count > g.slru.active_slots) {
+                for (const auto & r : g.regions) {
+                    if (r.first >= g.slru.active_slots && r.first < count) {
+                        for (auto * bank : r.banks) {
+                            ggml_backend_tensor_memset(bank, 0, (bank->ne[2] - 1)*bank->nb[2], bank->nb[2]);
+                        }
+                    }
                 }
-                g.slru.set_active(staging == STAGING_ON ? g.n_slots : g.base_slots);
+                g.slru.set_active(count);
             }
         }
-        staging_active = active;
+        lend_level = level;
+        staging_active = level > 0;
         if (trace) {
-            trace_record(3, active, 0, trace_ms());
+            trace_record(3, (uint8_t) level, 0, trace_ms());
             std::fflush(trace);
         }
-        LLAMA_LOG_INFO("moe_staging: active=%d invalidated=%zu transition_us=%" PRId64 "\n", active, invalidated, ggml_time_us() - start);
+        LLAMA_LOG_INFO("moe_staging: active=%d level=%d invalidated=%zu transition_us=%" PRId64 "\n", level > 0 ? 1 : 0, level, invalidated,
+            ggml_time_us() - start);
+    }
+
+    int max_level() const {
+        int level = 0;
+        for (const auto & g : groups) {
+            for (const auto & r : g.regions) { level = std::max(level, r.level); }
+        }
+        return level;
+    }
+
+    void set_staging_active(bool active) {
+        set_level(active ? max_level() : 0);
+    }
+
+    // bytes of n slots of the group's banks, each bank padded and with its zero padding slot
+    size_t bank_bytes(const group & g, int32_t n, size_t align) const {
+        size_t total = 0;
+        for (auto * t : g.ref) {
+            if (!t->nb[2] || size_t(n) + 1 > (SIZE_MAX - (align - 1))/t->nb[2]) {
+                throw std::runtime_error("MoE cache bank size overflow");
+            }
+            const size_t bytes = GGML_PAD((size_t(n) + 1)*t->nb[2], align);
+            if (bytes > SIZE_MAX - total) { throw std::runtime_error("MoE cache size overflow"); }
+            total += bytes;
+        }
+        return total;
+    }
+
+    // lend the scheduler's compute buffer above its decode use: [b_start, size) at level 1, [a_start, b_start) at level 2.
+    // Requires the staging extension (split banks, slot tables, pinned auxiliary batching). Clears the cache.
+    struct compute_lend {
+        ggml_backend_buffer_t buffer = nullptr;
+        void * base = nullptr;
+        size_t size = 0, a_start = 0, b_start = 0;
+    } lent;
+
+    // give back the compute buffer: drop its regions and every cached expert (the slots of the others are renumbered)
+    void drop_compute() {
+        if (!lent.buffer) { return; }
+        set_level(0);
+        for (size_t i = 0; i < groups.size(); ++i) {
+            group & g = groups[i];
+            while (!g.regions.empty() && g.regions.back().compute) {
+                g.n_slots -= g.regions.back().count;
+                g.regions.pop_back();
+            }
+            reset_group(g);
+        }
+        ctx_compute.reset();
+        lent = {};
+        if (trace) { trace_record(5, 0, 0, trace_ms()); }
+    }
+
+    void reset_group(group & g) {
+        build_table(g);
+        g.slru.init(layers.size(), g.slru.n_expert, g.n_slots);
+        for (int32_t il : g.layers) {
+            int32_t * map = (int32_t *) layers[il].slot_map->data;
+            std::fill(map, map + g.slru.n_expert, -1);
+            g.slru.slot_map[il] = map;
+        }
+        g.slru.set_active(g.base_slots ? g.base_slots : g.n_slots);
+    }
+
+    void attach_compute(ggml_backend_buffer_t buffer, size_t a_start, size_t b_start) {
+        // the regions of an earlier buffer go first: it may be freed already
+        drop_compute();
+        if (!ctx_extra || staging != STAGING_ON || devices.size() != 1 || !buffer ||
+                ggml_backend_buffer_get_type(buffer) != devices[0].buft) {
+            return;
+        }
+        const size_t align = ggml_backend_buft_get_alignment(devices[0].buft);
+        const size_t size = ggml_backend_buffer_get_size(buffer);
+        if (!align || !ggml_backend_buffer_get_base(buffer) || a_start > SIZE_MAX - (align - 1) ||
+                b_start > SIZE_MAX - (align - 1)) {
+            throw std::invalid_argument("invalid MoE compute lending range");
+        }
+        a_start = std::min(GGML_PAD(a_start, align), size);
+        b_start = std::min(GGML_PAD(std::max(a_start, b_start), align), size);
+        lent = {buffer, ggml_backend_buffer_get_base(buffer), size, a_start, b_start};
+        const size_t host_bytes = devices[0].host_bytes;
+        ctx_compute.reset(ggml_init({groups.size()*2*g_ref_max()*ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx_compute) { throw std::runtime_error("failed to create the MoE compute lending context"); }
+        char * base = (char *) lent.base;
+        size_t lent_bytes[3] = {0, 0, 0};
+        for (const auto & [level, begin, end] : { std::tuple<int, size_t, size_t>{1, b_start, size}, std::tuple<int, size_t, size_t>{2, a_start, b_start} }) {
+            if (begin >= end || !host_bytes) { continue; }
+            size_t used = begin;
+            for (size_t i = 0; i < groups.size(); ++i) {
+                group & g = groups[i];
+                if (!g.base_slots) { continue; }
+                const size_t budget = (size_t) ((long double) (end - begin)*g.host_bytes/host_bytes);
+                const int32_t limit = std::min<int64_t>(g.table_rows - g.n_slots, int64_t(g.layers.size())*g.slru.n_expert - g.n_slots);
+                int32_t count = 0;
+                while (count < limit && bank_bytes(g, count + 1, align) <= budget) { count++; }
+                if (!count || used > end || bank_bytes(g, count, align) > end - used) { continue; }
+                group::region r;
+                r.first = g.n_slots;
+                r.count = count;
+                r.level = level;
+                r.compute = true;
+                for (auto * t : g.ref) {
+                    auto * bank = ggml_new_tensor_3d(ctx_compute.get(), t->type, t->ne[0], t->ne[1], count + 1);
+                    GGML_ASSERT(bank->nb[2] == t->nb[2]);
+                    ggml_format_name(bank, "moe_cache.lend%d.%zu.%s", level, i, t->name);
+                    if (ggml_backend_tensor_alloc(buffer, bank, base + used) != GGML_STATUS_SUCCESS) {
+                        throw std::runtime_error("failed to bind a MoE cache bank in the compute buffer");
+                    }
+                    used += GGML_PAD(ggml_nbytes(bank), align);
+                    r.banks.push_back(bank);
+                }
+                lent_bytes[level] += bank_bytes(g, count, align);
+                g.regions.push_back(std::move(r));
+                g.n_slots += count;
+            }
+        }
+        for (size_t i = 0; i < groups.size(); ++i) {
+            group & g = groups[i];
+            if (!g.base_slots) { continue; }
+            reset_group(g);
+            for (const auto & r : g.regions) {
+                if (r.compute) {
+                    LLAMA_LOG_INFO("moe_lend: group=%zu level=%d first=%d slots=%d\n", i, r.level, r.first, r.count);
+                    if (trace) {
+                        trace_record(4, (uint8_t) r.level, (uint16_t) i, r.first);
+                        std::fwrite(&r.count, 4, 1, trace);
+                    }
+                }
+            }
+        }
+        lend_level = 0;
+        staging_active = false;
+        LLAMA_LOG_INFO("moe_lend: compute buffer %.2f MiB, level 1 [%.2f, %.2f) MiB lends %.2f MiB, level 2 [%.2f, %.2f) MiB lends %.2f MiB\n",
+            size/1048576.0, b_start/1048576.0, size/1048576.0, lent_bytes[1]/1048576.0, a_start/1048576.0, b_start/1048576.0,
+            lent_bytes[2]/1048576.0);
+    }
+
+    size_t g_ref_max() const {
+        size_t n = 0;
+        for (const auto & g : groups) { n = std::max(n, g.ref.size()); }
+        return n;
+    }
+
+    // before a graph runs: give back what its compute buffer use reaches, and follow a reallocated compute buffer
+    void fit_compute(ggml_backend_buffer_t buffer, size_t peak) {
+        if (!lent.buffer) { return; }
+        if (!buffer || buffer != lent.buffer || ggml_backend_buffer_get_base(buffer) != lent.base ||
+                ggml_backend_buffer_get_size(buffer) != lent.size) {
+            // the graph about to run was built for this buffer: give back the old one now (the MoE cache restarts empty),
+            // the next scheduler reserve lends the new one
+            LLAMA_LOG_WARN("moe_lend: the compute buffer changed under a graph, no longer lending it until the next reserve\n");
+            drop_compute();
+            return;
+        }
+        if (peak > lent.b_start) {
+            set_level(0);
+        } else if (peak > lent.a_start) {
+            set_level(std::min(lend_level, 1));
+        }
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -1031,10 +1251,9 @@ struct llama_moe_cache::impl {
             n++;
         }
 
-        const bool extra = g.base_slots && slots[e] >= g.base_slots;
-        ggml_tensor * bank = extra ? g.extra_banks[b.ip] : g.banks[b.ip];
-        if (!extra && g.base_slots) { n = std::min<int64_t>(n, g.base_slots - slots[e]); }
-        const int32_t local = slots[e] - (extra ? g.base_slots : 0);
+        int32_t local, room;
+        ggml_tensor * bank = locate(g, slots[e], b.ip, local, room);
+        n = std::min<int64_t>(n, room);
         ggml_reset(ctx_views.get());
         ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], local*bank->nb[2]);
         ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
@@ -1197,12 +1416,11 @@ struct llama_moe_cache::impl {
             const ggml_tensor * w    = l.experts[ip];
             const size_t expert_size = w->nb[2];
             for (size_t i = 0; i < fills.size();) {
-                const bool extra = g.base_slots && fills[i].slot >= g.base_slots;
-                ggml_tensor * bank = extra ? g.extra_banks[ip] : g.banks[ip];
-                const int32_t local = fills[i].slot - (extra ? g.base_slots : 0);
+                int32_t local, room;
+                ggml_tensor * bank = locate(g, fills[i].slot, ip, local, room);
                 size_t n = 1;
-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
-                    if (!extra && g.base_slots && fills[i + n].slot >= g.base_slots) { break; }
+                while (i + n < fills.size() && (int32_t) n < room && fills[i + n].expert == fills[i].expert + (int32_t) n &&
+                        fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
                 const int64_t t_copy = observe ? ggml_time_us() : 0;
@@ -1336,6 +1554,22 @@ void llama_moe_cache::attach_staging(ggml_backend_t backend, ggml_backend_buffer
 
 void llama_moe_cache::set_staging_active(bool active) {
     pimpl->set_staging_active(active);
+}
+
+void llama_moe_cache::set_lend_level(int level) {
+    pimpl->set_level(level);
+}
+
+void llama_moe_cache::attach_compute(ggml_backend_buffer_t buffer, size_t a_start, size_t b_start) {
+    pimpl->attach_compute(buffer, a_start, b_start);
+}
+
+bool llama_moe_cache::lends_compute() const {
+    return pimpl->lent.buffer != nullptr;
+}
+
+void llama_moe_cache::fit_compute(ggml_backend_buffer_t buffer, size_t planned_size) {
+    pimpl->fit_compute(buffer, planned_size);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {

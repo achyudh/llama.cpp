@@ -59,6 +59,8 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve(bool quiet = false); // quiet: log at debug level (a phase switch, on every prompt)
+    // LLAMA_MOE_CACHE_LEND: lend the compute buffer of the current scheduler to the MoE cache
+    void moe_lend_attach();
 
     void synchronize();
 
@@ -463,6 +465,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    bool moe_lend = false;
+    size_t moe_lend_a = 0, moe_lend_b = 0;
 
     // LLAMA_MOE_PERF: the largest compute buffer use logged so far per ubatch size
     std::map<uint32_t, size_t> graph_peaks;

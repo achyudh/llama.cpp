@@ -1111,6 +1111,16 @@ size_t ggml_gallocr_get_planned_size(ggml_gallocr_t galloc, int buffer_id) {
     return size;
 }
 
+ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    const struct vbuffer * buf = galloc->buffers[buffer_id];
+    if (buf == NULL || buf->chunks[0] == NULL || (GGML_VBUFFER_MAX_CHUNKS > 1 && buf->chunks[1] != NULL)) {
+        return NULL;
+    }
+    return buf->chunks[0];
+}
+
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 

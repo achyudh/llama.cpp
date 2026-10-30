@@ -18,8 +18,10 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <future>
 #include <limits>
 #include <stdexcept>
@@ -632,6 +634,29 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // experimental: lend the compute buffer above its decode use to the MoE cache (needs LLAMA_MOE_CACHE_STAGING=1);
+        // graphs give back what they reach (fit_compute), streamed batches all of it
+        if (const char * lend = std::getenv("LLAMA_MOE_CACHE_LEND"); lend && std::strcmp(lend, "0") != 0 && moe_cache && moe_cache->wants_staging()) {
+            if (std::strcmp(lend, "1") != 0) {
+                throw std::runtime_error("LLAMA_MOE_CACHE_LEND must be 0 or 1");
+            }
+            auto mib = [](const char * name, size_t def) {
+                const char * v = std::getenv(name);
+                if (!v) { return def << 20; }
+                char * end = nullptr;
+                errno = 0;
+                const auto value = std::strtoull(v, &end, 10);
+                if (*v < '0' || *v > '9' || *end || errno == ERANGE || value > (SIZE_MAX >> 20)) {
+                    throw std::invalid_argument(std::string("invalid MiB value for ") + name);
+                }
+                return (size_t) value << 20;
+            };
+            moe_lend = true;
+            moe_lend_a = mib("LLAMA_MOE_CACHE_LEND_A_MIB", 64);
+            moe_lend_b = mib("LLAMA_MOE_CACHE_LEND_B_MIB", 704);
+            moe_lend_attach();
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -805,6 +830,9 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
+    if (moe_cache && moe_cache->lends_compute()) {
+        moe_cache->attach_compute(nullptr, 0, 0);
+    }
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
@@ -914,6 +942,7 @@ void llama_context::sched_reserve(bool quiet) {
             }
         }
         llama_log_internal(log_level, "%s: reserve took %.2f ms\n", __func__, (ggml_time_us() - t_start_us)/1000.0);
+        moe_lend_attach();
         return;
     }
 
@@ -1027,6 +1056,21 @@ void llama_context::sched_reserve(bool quiet) {
 
     llama_log_internal(log_level, "%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    // a new scheduler has a new compute buffer: lend that one (the old one is freed with the old scheduler)
+    moe_lend_attach();
+}
+
+void llama_context::moe_lend_attach() {
+    if (!moe_lend || !moe_cache) {
+        return;
+    }
+    for (auto & backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            moe_cache->attach_compute(ggml_backend_sched_get_buffer(sched.get(), backend.get()), moe_lend_a, moe_lend_b);
+            return;
+        }
+    }
 }
 
 void llama_context::synchronize() {
@@ -1670,7 +1714,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const bool borrow = !expert_stream->streams(ubatch.n_tokens);
         if (borrow) {
             expert_stream->set_borrowed(true);
-            moe_cache->set_staging_active(true);
+            // up to 32 rows the graph takes the cache path and stays below the middle of the compute buffer; fit_compute
+            // below gives back whatever the allocated graph reaches
+            moe_cache->set_lend_level(ubatch.n_tokens <= 32 ? 2 : 1);
         } else {
             moe_cache->set_staging_active(false);
             expert_stream->set_borrowed(false);
@@ -1744,6 +1790,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+    }
+
+    // the graph (new or reused) uses its compute buffer up to the planned size: the MoE cache must not lend that part
+    if (moe_cache && moe_cache->lends_compute()) {
+        for (auto & backend : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                moe_cache->fit_compute(ggml_backend_sched_get_buffer(sched.get(), backend.get()),
+                    ggml_backend_sched_get_planned_size(sched.get(), backend.get()));
+                break;
+            }
+        }
     }
 
     // set the input data for the input tensors
