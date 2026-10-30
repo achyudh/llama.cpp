@@ -2494,9 +2494,9 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
-// First device buffer type in the list whose device runs a dense compressed projection of this shape, or null when the
+// First device buffer type in the list whose device runs a compressed projection of this shape, or null when the
 // list reaches host memory first.
-static ggml_backend_buffer_type_t exl3_device_buft(const buft_list_t * list, int64_t k, int64_t n, int bits_x2) {
+static ggml_backend_buffer_type_t exl3_device_buft(const buft_list_t * list, int64_t k, int64_t n, int bits_x2, int64_t experts = 1) {
     // LLAMA_EXL3_DENSE_HOST=1 keeps dense banks host-backed, to compare placements
     static const bool host = getenv("LLAMA_EXL3_DENSE_HOST") && atoi(getenv("LLAMA_EXL3_DENSE_HOST"));
     if (!list || host) {
@@ -2508,11 +2508,12 @@ static ggml_backend_buffer_type_t exl3_device_buft(const buft_list_t * list, int
         throw std::runtime_error("failed to create ggml context");
     }
     const int64_t words = (k/16)*(n/16)*(ggml_exl3_tile_size(bits_x2)/2);
-    ggml_tensor * w  = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I16, words, 1, 1);
-    ggml_tensor * su = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, k, 1, 1);
-    ggml_tensor * sv = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n, 1, 1);
+    ggml_tensor * w  = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I16, words, 1, experts);
+    ggml_tensor * su = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, k, 1, experts);
+    ggml_tensor * sv = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, n, 1, experts);
     ggml_tensor * x  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, 1);
-    ggml_tensor * op = ggml_mul_mat_exl3(ctx.get(), w, su, sv, x, nullptr, bits_x2);
+    ggml_tensor * ids = experts > 1 ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1) : nullptr;
+    ggml_tensor * op = ggml_mul_mat_exl3(ctx.get(), w, su, sv, x, ids, bits_x2);
     if (!op) {
         return nullptr;
     }
@@ -2580,15 +2581,26 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 throw std::runtime_error(format("invalid EXL3 tensor type: %s", entry.first.c_str()));
             }
         }
-        // A dense bank and its auxiliaries follow their layer onto a device that runs the compressed projection.
-        // Expert banks stay host-backed behind the expert cache.
+        // Dense banks and optional MTP experts use the compressed device kernels.
+        // Trunk experts stay host-backed behind the cache.
+        static const bool mtp_device = [] {
+            const char * value = getenv("LLAMA_EXL3_MTP_DEVICE");
+            if (value && strcmp(value, "0") && strcmp(value, "1")) {
+                throw std::invalid_argument("LLAMA_EXL3_MTP_DEVICE must be 0 or 1");
+            }
+            return value && !strcmp(value, "1");
+        }();
+        const bool mtp_experts = mtp_device && e > 1 && !(flags & TENSOR_SKIP) &&
+            tn.bid >= (int32_t) hparams.n_layer() && tn.bid < (int32_t) hparams.n_layer_all;
         buft_list_t device_list;
-        if (e == 1) {
+        if (e == 1 || mtp_experts) {
             const llm_tensor_layer layer = llm_tensor_info_for(tn.tensor).layer;
             const buft_list_t * list = layer == LLM_TENSOR_LAYER_INPUT ? pimpl->dev_input.buft_list :
                 layer == LLM_TENSOR_LAYER_OUTPUT ? pimpl->dev_output.buft_list : buft_list_layer;
-            if (auto * buft = exl3_device_buft(list, k, n, int(rate))) {
+            if (auto * buft = exl3_device_buft(list, k, n, int(rate), e)) {
                 device_list.emplace_back(ggml_backend_buft_get_device(buft), buft);
+            } else if (mtp_experts) {
+                throw std::runtime_error("no device supports the resident EXL3 MTP bank: " + tn.str());
             }
         }
         auto load = [&](const LLM_TN_IMPL & name, std::initializer_list<int64_t> shape) {

@@ -361,7 +361,7 @@ struct llama_moe_cache::impl {
     bool staging_active = false;
     size_t staging_used = 0;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin, bool aux_allowed) :
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin, bool aux_allowed, bool mtp) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -382,7 +382,9 @@ struct llama_moe_cache::impl {
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
-        for (size_t il = 0; il < model.layers.size(); ++il) {
+        const size_t begin = mtp ? model.hparams.n_layer() : 0;
+        const size_t end = mtp ? model.layers.size() : model.hparams.n_layer();
+        for (size_t il = begin; il < end; ++il) {
             auto experts = llama_moe_cache_layer_experts(model, model.layers[il]);
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
@@ -1172,8 +1174,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin, bool aux_allowed) :
-    pimpl(new impl(model, backends, bufts, size, pin, aux_allowed)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin, bool aux_allowed, bool mtp) :
+    pimpl(new impl(model, backends, bufts, size, pin, aux_allowed, mtp)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

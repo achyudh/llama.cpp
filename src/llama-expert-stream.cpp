@@ -29,7 +29,7 @@ llama_expert_stream::llama_expert_stream(const llama_model & model, ggml_backend
     std::vector<std::vector<size_t>> offsets(n_layer); // of each tensor in its group's slot
     std::vector<size_t> group_bytes;
     size_t n_tensors = 0;
-    for (size_t il = 0; il < n_layer; ++il) {
+    for (size_t il = 0; il < model.hparams.n_layer(); ++il) {
         auto experts = llama_moe_cache_layer_experts(model, model.layers[il]);
         if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_expert_stream_is_host_weight)) {
             continue;

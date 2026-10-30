@@ -182,6 +182,7 @@ struct common_speculative_impl {
     uint32_t n_seq;
     int32_t n_max; // maximum draft length after implementation-specific limits
 
+    size_t n_call_process = 0;
     size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
     size_t n_call_draft  = 0; // number of times this implementation was called for generation.
     size_t n_call_accept = 0; // number of times this implementation was called for accumulation.
@@ -196,6 +197,7 @@ struct common_speculative_impl {
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
+    int64_t t_process_us = 0;
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
@@ -3013,7 +3015,11 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        if (result) {
+            common_time_meas tm(impl->t_process_us, !impl->gen_perf);
+            impl->n_call_process++;
+            result = impl->process(batch);
+        }
     }
 
     return result;
@@ -3182,6 +3188,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
+            oss << " ms, process = " << impl->n_call_process << " calls / " << impl->t_process_us / 1000.0;
             str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
         } else {
             str_perf = "";

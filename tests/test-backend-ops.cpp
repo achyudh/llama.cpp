@@ -12158,6 +12158,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_conv_state(10240, T, 4));
     }
     test_cases.emplace_back(new test_gdn_conv_state(512, 4, 1));
+    for (int64_t T : {1, 4, 5}) {
+        test_cases.emplace_back(new test_gdn_conv_state(10240, T, 5));
+        test_cases.emplace_back(new test_gdn_conv_state(10240, T, 5, 3));
+    }
     // the PLE conv of Qwen4Exp: dilation 3
     for (int64_t T : {1, 4, 16, 256, 300}) {
         test_cases.emplace_back(new test_gdn_conv_state(10240, T, 4, 3));
@@ -13714,6 +13718,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4, 32, 4, 4, 1));
+    // MTP4 keeps five snapshots, including the oldest row read after four rejected drafts.
+    for (int64_t n_seq_tokens : {1, 4, 5}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_seq_tokens, 1, 3, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128, n_seq_tokens, 1, 5));
+        for (int32_t src_row : {0, 4}) {
+            test_cases.emplace_back(new test_gated_delta_net_state_rows(48, 128, n_seq_tokens, 5, src_row));
+        }
+    }
     // 16 key heads and >= 64 tokens: the RDNA4 MMA path reads the cache row itself (a full and a partial last chunk)
     test_cases.emplace_back(new test_gated_delta_net_state_rows(16, 128,  64, 1, 0));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(16, 128, 100, 1, 0));
