@@ -188,7 +188,7 @@ static void split_bank_projection(bool slot_order = false) {
     bool exact = true;
     for (int k : slot_order ? std::vector<int>{640, 2560} : std::vector<int>{128}) {
         for (int rate : {7, 8}) {
-            for (int rows : slot_order ? std::vector<int>{8, 16, 32} : std::vector<int>{1, 4, 8, 16, 32}) {
+            for (int rows : slot_order ? std::vector<int>{1, 2, 3, 4, 5, 6, 8, 16, 32} : std::vector<int>{1, 2, 3, 4, 5, 8, 16, 32}) {
                 const int experts = slot_order ? 12 : 5, used = slot_order ? 10 : 4, base_count = slot_order ? 5 : 2;
                 auto * ctx = ggml_init({4*1024*1024, nullptr, true});
                 auto make_bank = [&](int count) {
@@ -247,11 +247,13 @@ static void split_bank_projection(bool slot_order = false) {
                 }
                 std::vector<float> input(ggml_nelements(x)), expected(ggml_nelements(ordinary)), actual(expected.size());
                 std::vector<int32_t> selected(ggml_nelements(ids)), mapped(selected.size());
-                for (int pass = 0; pass < 6; ++pass) {
+                for (int pass = 0; pass < 8; ++pass) {
                     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int((i+pass)%19)-9)/16; }
                     for (size_t i = 0; i < selected.size(); ++i) { selected[i] = pass == 1 ? 0 : pass == 2 ? experts - 1 : int((i*7+pass)%experts); }
                     if (pass == 4) { selected[0] = -1; }
                     if (pass == 5) { selected[0] = experts; }
+                    if (pass == 6) { std::fill(selected.begin(), selected.end(), -1); }
+                    if (pass == 7) { std::fill(selected.begin(), selected.end(), experts); }
                     for (size_t i = 0; i < selected.size(); ++i) { mapped[i] = slot_order && selected[i] >= 0 && selected[i] < experts ? experts - 1 - selected[i] : selected[i]; }
                     ggml_backend_tensor_set(mapped_ids, mapped.data(), 0, ggml_nbytes(mapped_ids));
                     ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));

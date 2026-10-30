@@ -183,10 +183,9 @@ static __global__ void exl3_matrix_f32(ggml_cuda_exl3_args a) {
 // The fragment layout and quad reduction follow ExLlamaV3's MIT-licensed RDNA direct GEMV core.
 // Copyright (c) 2025 Turboderp. See licenses/LICENSE-exllamav3.
 template<int bits_x2, bool fp16, bool pair = false>
-static __global__ void exl3_matrix_fragment(ggml_cuda_exl3_args a) {
+static __device__ __forceinline__ void exl3_matrix_fragment_body(ggml_cuda_exl3_args a, int assignment) {
     __shared__ float partial[4][16];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int assignment = blockIdx.y;
     int expert = exl3_expert(a, assignment);
     const bool valid = expert >= 0 && expert < a.experts;
     const auto bank = exl3_bank(a, expert);
@@ -232,6 +231,81 @@ static __global__ void exl3_matrix_fragment(ggml_cuda_exl3_args a) {
         float sum = partial[0][lane];
         for (int w = 1; w < 4; ++w) { sum += partial[w][lane]; }
         a.yh[size_t(assignment) * a.n + blockIdx.x * 16 + lane] = sum;
+    }
+}
+
+template<int bits_x2, bool fp16, bool pair = false>
+static __global__ void exl3_matrix_fragment(ggml_cuda_exl3_args a) {
+    exl3_matrix_fragment_body<bits_x2, fp16, pair>(a, blockIdx.y);
+}
+
+// Matching assignments share fragment decoding, with each row keeping the original FMA and reduction order.
+template<int bits_x2, int rows>
+static __global__ void exl3_matrix_routed_rows(ggml_cuda_exl3_args a) {
+    __shared__ float partial[4][rows][16];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int assignment = blockIdx.y;
+    int expert = a.ids[assignment];
+    const uint64_t low = __ballot_sync(0xffffffffULL, lane < a.assignments && a.ids[lane] == expert);
+    const uint64_t high = __ballot_sync(0xffffffffULL, lane + 32 < a.assignments && a.ids[lane + 32] == expert);
+    uint64_t matches = low | (high << 32);
+    const uint64_t before = (uint64_t(1) << assignment) - 1;
+    if (__popcll(matches & before) % rows) { return; }
+    matches &= ~before;
+    int assignments[rows];
+    int count = 0;
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        assignments[r] = matches ? __ffsll((unsigned long long) matches) - 1 : assignment;
+        count += matches != 0;
+        matches &= matches - 1;
+    }
+    if (count == 1) {
+        exl3_matrix_fragment_body<bits_x2, false>(a, assignment);
+        return;
+    }
+    const bool valid = expert >= 0 && expert < a.experts;
+    const auto bank = exl3_bank(a, expert);
+    float lo[rows], hi[rows];
+#pragma unroll
+    for (int r = 0; r < rows; ++r) { lo[r] = 0; hi[r] = 0; }
+    if (valid) {
+        const size_t bank_words = size_t(a.k / 16) * (a.n / 16) * (4 * bits_x2);
+        for (int kt = warp; kt < a.k / 16; kt += 4) {
+            const uint32_t * tile = bank.packed + expert * bank_words + (size_t(kt) * (a.n / 16) + blockIdx.x) * (4 * bits_x2);
+            half w[8];
+            ggml_cuda_exl3_fragment<bits_x2>(tile, lane, w);
+#pragma unroll
+            for (int r = 0; r < rows; ++r) {
+                if (r < count) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const size_t offset = size_t(assignments[r]) * a.k + kt * 16 + (lane & 3) * 2 + (j & 1) + (j / 2) * 8;
+                        const float v = ((const float *) a.xh)[offset];
+                        lo[r] = fmaf(v, __half2float(w[j]), lo[r]);
+                        hi[r] = fmaf(v, __half2float(w[j + 4]), hi[r]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        lo[r] += __shfl_xor(lo[r], 1, 32); lo[r] += __shfl_xor(lo[r], 2, 32);
+        hi[r] += __shfl_xor(hi[r], 1, 32); hi[r] += __shfl_xor(hi[r], 2, 32);
+        const float vlo = __shfl(lo[r], (lane & 7) * 4, 32), vhi = __shfl(hi[r], (lane & 7) * 4, 32);
+        if (lane < 16) { partial[warp][r][lane] = (lane & 8) ? vhi : vlo; }
+    }
+    __syncthreads();
+    if (warp == 0 && lane < 16) {
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            if (r < count) {
+                float sum = partial[0][r][lane];
+                for (int w = 1; w < 4; ++w) { sum += partial[w][r][lane]; }
+                a.yh[size_t(assignments[r]) * a.n + blockIdx.x * 16 + lane] = sum;
+            }
+        }
     }
 }
 
@@ -333,6 +407,17 @@ static void exl3_matrix_launch(const ggml_cuda_exl3_args & a, ggml_cuda_exl3_mod
         }
     }
     const dim3 grid(a.n / 16, a.assignments);
+    if constexpr (bits_x2 == 7 || bits_x2 == 8) {
+        if (a.ids && a.assignments > a.used && a.assignments <= 64 &&
+                (mode == GGML_EXL3_F32_FRAGMENT || mode == GGML_EXL3_F32_ROWS)) {
+            static const bool reuse = [] {
+                const char * value = getenv("GGML_CUDA_EXL3_ROUTED_REUSE");
+                GGML_ASSERT(!value || !strcmp(value, "0") || !strcmp(value, "1"));
+                return !value || !strcmp(value, "1");
+            }();
+            if (reuse) { exl3_matrix_routed_rows<bits_x2, 4><<<grid, 128, 0, stream>>>(a); return; }
+        }
+    }
     if (mode == GGML_EXL3_F16_DOT) { exl3_matrix_fragment<bits_x2, true, pair><<<grid, 128, 0, stream>>>(a); }
     else if (mode == GGML_EXL3_F32_FRAGMENT || mode == GGML_EXL3_F32_ROWS) { exl3_matrix_fragment<bits_x2, false, pair><<<grid, 128, 0, stream>>>(a); }
     else { exl3_matrix_f32<bits_x2><<<grid, 128, 0, stream>>>(a); }

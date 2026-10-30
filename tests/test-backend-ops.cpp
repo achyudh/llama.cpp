@@ -11026,6 +11026,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 8, false));
     }
+    // Small routed groups, including the 64-assignment dispatch boundary and its fallback.
+    for (int bits_x2 : {7, 8}) {
+        for (int rows : {2, 3, 6}) {
+            test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, rows, true));
+        }
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 5, true, 640, 2560, 16, 10, 1));
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 5, true, 2560, 640, 16, 10, 10));
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 8, true, 256, 128, 16, 8, 1));
+        test_cases.emplace_back(new test_mul_mat_exl3(bits_x2, 5, true, 256, 128, 16, 13, 13));
+    }
     for (int rows : {1, 4, 5, 8}) {
         test_cases.emplace_back(new test_mul_mat_exl3(10, rows, false, 2560, 2560));
     }
