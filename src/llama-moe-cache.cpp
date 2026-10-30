@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -348,6 +349,12 @@ struct llama_moe_cache::impl {
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
+
+    // LLAMA_MOE_ROUTE_TRACE=path: the selected experts of every cached layer, for replaying the cache policy offline
+    // (expert ids only; little-endian records, see open_trace)
+    FILE * trace = nullptr;
+    int64_t trace_t0 = 0;
+    std::vector<uint16_t> trace_ids;
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -705,7 +712,50 @@ struct llama_moe_cache::impl {
             }
         }
         pin_host_experts(model, pin);
+        if (!mtp) {
+            open_trace();
+        }
     }
+
+    // header: "MOERT001", u32 n_layer, u32 n_expert, u32 n_groups, per group u32 slots, u32 bytes per expert, u32 n_layers, u32 layers[]
+    // records: u8 type, then 1 = route: u8 0, u16 layer, u32 ms, u16 n_ids, u16 ids[n_ids] (n_expert_used per row, rows in order)
+    //                        2 = staging attached: u8 0, u16 group, u32 base slots, u32 total slots
+    //                        3 = staging active: u8 active, u16 0, u32 ms
+    void open_trace() {
+        const char * path = std::getenv("LLAMA_MOE_ROUTE_TRACE");
+        if (!path || !*path || groups.empty()) {
+            return;
+        }
+        trace = std::fopen(path, "wb");
+        if (!trace) {
+            throw std::runtime_error(std::string("LLAMA_MOE_ROUTE_TRACE: cannot open ") + path + ": " + std::strerror(errno));
+        }
+        std::setvbuf(trace, nullptr, _IOFBF, 1 << 20);
+        trace_t0 = ggml_time_us();
+        auto put = [&](uint32_t v) { std::fwrite(&v, sizeof(v), 1, trace); };
+        std::fwrite("MOERT001", 1, 8, trace);
+        put(layers.size());
+        put(groups[0].slru.n_expert);
+        put(groups.size());
+        for (const group & g : groups) {
+            size_t expert_bytes = 0;
+            for (const auto * w : layers[g.layers[0]].experts) { expert_bytes += w->nb[2]; }
+            put(g.n_slots);
+            put(expert_bytes);
+            put(g.layers.size());
+            for (int32_t il : g.layers) { put(il); }
+        }
+        LLAMA_LOG_INFO("%s: recording the selected experts of cached layers to %s\n", __func__, path);
+    }
+
+    void trace_record(uint8_t type, uint8_t flag, uint16_t field, uint32_t value) {
+        std::fwrite(&type, 1, 1, trace);
+        std::fwrite(&flag, 1, 1, trace);
+        std::fwrite(&field, 2, 1, trace);
+        std::fwrite(&value, 4, 1, trace);
+    }
+
+    uint32_t trace_ms() const { return (uint32_t) ((ggml_time_us() - trace_t0)/1000); }
 
     // pinned (registered) host experts: their uploads are DMA from host memory, and their pages cannot be evicted
     void pin_host_experts(const llama_model & model, size_t pin) {
@@ -735,6 +785,7 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (trace) { std::fclose(trace); }
         log_stats();
         for (auto & d : devices) {
             if (d.aux_host || d.ids_host) { ggml_backend_synchronize(d.backend); }
@@ -808,6 +859,10 @@ struct llama_moe_cache::impl {
             g.slru.set_active(g.base_slots);
             LLAMA_LOG_INFO("moe_staging: group=%zu base_slots=%d extra_slots=%d total_slots=%d bits_x2=%d\n",
                 i, g.base_slots, count, g.n_slots, g.exl3_bits_x2);
+            if (trace) {
+                trace_record(2, 0, (uint16_t) i, g.base_slots);
+                std::fwrite(&g.n_slots, 4, 1, trace);
+            }
         }
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         LLAMA_LOG_INFO("moe_staging: borrowed_bytes=%zu buffer_bytes=%zu device_payload_added=0 mode=%s\n",
@@ -836,6 +891,10 @@ struct llama_moe_cache::impl {
             }
         }
         staging_active = active;
+        if (trace) {
+            trace_record(3, active, 0, trace_ms());
+            std::fflush(trace);
+        }
         LLAMA_LOG_INFO("moe_staging: active=%d invalidated=%zu transition_us=%" PRId64 "\n", active, invalidated, ggml_time_us() - start);
     }
 
@@ -1039,6 +1098,14 @@ struct llama_moe_cache::impl {
         pending_il  = -1;
         pending_sel = nullptr;
         const int64_t t_plan = observe ? ggml_time_us() : 0;
+
+        if (trace) {
+            trace_ids.assign(ids.begin(), ids.end());
+            trace_record(1, 0, (uint16_t) il, trace_ms());
+            const uint16_t n_ids = (uint16_t) trace_ids.size();
+            std::fwrite(&n_ids, 2, 1, trace);
+            std::fwrite(trace_ids.data(), 2, trace_ids.size(), trace);
+        }
 
         size_t n_hit = 0, n_evicted = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit, n_evicted)) {

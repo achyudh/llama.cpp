@@ -464,6 +464,9 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // LLAMA_MOE_PERF: the largest compute buffer use logged so far per ubatch size
+    std::map<uint32_t, size_t> graph_peaks;
+
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 

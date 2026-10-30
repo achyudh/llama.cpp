@@ -1725,6 +1725,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // how much of each GPU compute buffer this graph uses, logged per ubatch size when it is new or grows
+        if (llama_moe_perf_enabled()) {
+            size_t peak = 0, size = 0;
+            for (auto & backend : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    peak += ggml_backend_sched_get_planned_size(sched.get(), backend.get());
+                    size += ggml_backend_sched_get_buffer_size(sched.get(), backend.get());
+                }
+            }
+            auto & logged = graph_peaks[ubatch.n_tokens];
+            if (peak > logged) {
+                logged = peak;
+                LLAMA_LOG_INFO("graph_peak: ctx_type=%d n_tokens=%u n_outputs=%d nodes=%d splits=%d peak_mib=%.2f buffer_mib=%.2f\n",
+                    (int) cparams.ctx_type, ubatch.n_tokens, n_outputs, ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched.get()),
+                    peak/1048576.0, size/1048576.0);
+            }
+        }
+
         gf_res_prev_active = res;
     }
 

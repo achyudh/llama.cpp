@@ -1097,6 +1097,20 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     return true;
 }
 
+size_t ggml_gallocr_get_planned_size(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    const struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
+    if (alloc == NULL) {
+        return 0;
+    }
+    size_t size = 0;
+    for (int c = 0; c < alloc->n_chunks; c++) {
+        size += alloc->chunks[c]->max_size;
+    }
+    return size;
+}
+
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 
