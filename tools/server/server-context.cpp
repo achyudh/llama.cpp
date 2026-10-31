@@ -4487,8 +4487,9 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // Keep short prefixes in the first ubatch; prompt-tail checkpoints still cover short prompts.
+                        // Break at later user messages when the last message or checkpoint spacing requires it.
+                        if (do_checkpoint && slot.prompt.n_tokens() >= n_ubatch && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 

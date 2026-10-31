@@ -691,6 +691,49 @@ def test_completion_prompt_cache():
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
 
 
+@pytest.mark.parametrize("n_ubatch", [64, 128])
+def test_checkpoint_short_chat_prefix(n_ubatch):
+    global server
+    server = ServerPreset.tinygemma3()
+    server.n_slots = 1
+    server.n_batch = 2 * n_ubatch
+    server.n_ubatch = n_ubatch
+    server.cache_ram = 0
+    server.jinja = True
+    server.start()
+
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hello"},
+        {"role": "user", "content": "The quick brown fox jumps over the lazy dog. " * 40},
+    ]
+    progress = []
+    for chunk in server.make_stream_request("POST", "/chat/completions", data={
+        "messages": messages,
+        "max_tokens": 1,
+        "stream": True,
+        "return_progress": True,
+    }):
+        if "prompt_progress" in chunk:
+            progress.append(chunk["prompt_progress"])
+
+    processed = [p["processed"] for p in progress if p["processed"] > 0]
+    assert processed and processed[0] >= n_ubatch
+    assert processed[-1] == progress[-1]["total"]
+
+    messages.extend([
+        {"role": "assistant", "content": "Understood"},
+        {"role": "user", "content": "Continue"},
+    ])
+    result = server.make_request("POST", "/chat/completions", data={
+        "messages": messages,
+        "max_tokens": 1,
+        "cache_prompt": True,
+    })
+    assert result.status_code == 200
+    assert result.body["timings"]["cache_n"] > 0
+
+
 # a slot that switched to an unrelated prompt must not restore a context checkpoint of the previous one
 def test_completion_checkpoint_after_unrelated_prompt():
     global server
