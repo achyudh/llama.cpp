@@ -1140,7 +1140,53 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+static void test_buffer_reallocation_and_measurement() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    auto [small_ctx, small_graph, small_storage] = make_context();
+    auto * input = make_input_with_size(small_ctx, 32);
+    auto * output = ggml_dup(small_ctx, input);
+    auto galloc = allocate_graph(small_graph, output, &backend.buffer_type);
+    auto * original = ggml_gallocr_get_buffer(galloc.get(), 0);
+    const size_t original_size = backend.context->allocated_total();
+    struct observer {
+        dummy_backend_context * backend;
+        ggml_backend_buffer_t expected;
+        int calls = 0;
+    } state{backend.context.get(), original, 0};
+    ggml_gallocr_set_buffer_realloc_callback(galloc.get(), [](ggml_backend_buffer_t buffer, void * data) {
+        auto & state = *static_cast<observer *>(data);
+        GGML_ASSERT(buffer == state.expected);
+        GGML_ASSERT(std::find(state.backend->buffers.begin(), state.backend->buffers.end(), buffer) != state.backend->buffers.end());
+        GGML_ASSERT(ggml_backend_buffer_get_size(buffer) > 0);
+        state.calls++;
+    }, &state);
+
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), small_graph));
+    GGML_ASSERT(state.calls == 0 && ggml_gallocr_get_buffer(galloc.get(), 0) == original);
+    auto [large_ctx, large_graph, large_storage] = make_context();
+    auto * large_input = make_input_with_size(large_ctx, 4096);
+    auto * large_output = ggml_dup(large_ctx, large_input);
+    ggml_set_output(large_output);
+    ggml_build_forward_expand(large_graph, large_output);
+    size_t measured = 0;
+    ggml_gallocr_reserve_n_size(galloc.get(), large_graph, nullptr, nullptr, &measured);
+    GGML_ASSERT(measured > original_size && state.calls == 0);
+    GGML_ASSERT(backend.context->allocated_total() == original_size);
+    GGML_ASSERT(ggml_gallocr_get_buffer(galloc.get(), 0) == original);
+    GGML_ASSERT(large_input->data == nullptr && large_output->data == nullptr);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), small_graph));
+    GGML_ASSERT(ggml_gallocr_get_buffer(galloc.get(), 0) == original && state.calls == 0);
+
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), large_graph));
+    GGML_ASSERT(state.calls == 1 && backend.context->allocated_total() == measured);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), large_graph));
+    GGML_ASSERT(state.calls == 1);
+    // Teardown is explicit: the owner returns its aliases before destroying its allocator.
+    ggml_gallocr_set_buffer_realloc_callback(galloc.get(), nullptr, nullptr);
+}
+
 int main() {
+    run("test_buffer_reallocation_and_measurement", test_buffer_reallocation_and_measurement);
     run("test_sched_host_weight_producer", []() { test_sched_host_weight(true, true, true); });
     run("test_sched_host_weight_first", []() { test_sched_host_weight(false, true, true); });
     run("test_sched_device_weight", []() { test_sched_host_weight(true, false, true); });

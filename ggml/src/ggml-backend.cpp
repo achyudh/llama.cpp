@@ -2212,6 +2212,10 @@ void ggml_backend_sched_set_alias_callback(ggml_backend_sched_t sched, ggml_back
     sched->callback_alias_user_data = user_data;
 }
 
+void ggml_backend_sched_set_buffer_realloc_callback(ggml_backend_sched_t sched, ggml_gallocr_buffer_realloc_callback callback, void * user_data) {
+    ggml_gallocr_set_buffer_realloc_callback(sched->galloc, callback, user_data);
+}
+
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     sched->callback_realloc = callback;

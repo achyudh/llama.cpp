@@ -395,6 +395,7 @@ extern "C" {
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_buffer_realloc_callback(ggml_backend_sched_t sched, ggml_gallocr_buffer_realloc_callback callback, void * user_data);
 
     //
     // Meta backend

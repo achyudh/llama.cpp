@@ -49,6 +49,10 @@ GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 
+// Called before replacing a backing buffer. Owners return aliases before allocator destruction themselves.
+typedef void (*ggml_gallocr_buffer_realloc_callback)(ggml_backend_buffer_t buffer, void * user_data);
+GGML_API void ggml_gallocr_set_buffer_realloc_callback(ggml_gallocr_t galloc, ggml_gallocr_buffer_realloc_callback callback, void * user_data);
+
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations
 // not strictly required for single buffer usage: ggml_gallocr_alloc_graph will reallocate the buffers automatically if needed

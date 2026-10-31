@@ -485,6 +485,9 @@ struct ggml_gallocr {
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
+    ggml_gallocr_buffer_realloc_callback callback_buffer_realloc;
+    void * callback_buffer_realloc_data;
+
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
 
@@ -533,6 +536,11 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+void ggml_gallocr_set_buffer_realloc_callback(ggml_gallocr_t galloc, ggml_gallocr_buffer_realloc_callback callback, void * user_data) {
+    galloc->callback_buffer_realloc = callback;
+    galloc->callback_buffer_realloc_data = user_data;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -932,6 +940,11 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            if (galloc->callback_buffer_realloc && galloc->buffers[i]) {
+                for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS && galloc->buffers[i]->chunks[c]; ++c) {
+                    galloc->callback_buffer_realloc(galloc->buffers[i]->chunks[c], galloc->callback_buffer_realloc_data);
+                }
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -950,13 +963,15 @@ static bool ggml_gallocr_reserve_n_impl(
 
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
-    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
-    for (int i = 0; i < galloc->n_buffers; i++) {
+    ggml_gallocr_t measure = ggml_gallocr_new_n(galloc->bufts, galloc->n_buffers);
+    GGML_ASSERT(ggml_gallocr_reserve_n_impl(measure, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
+    for (int i = 0; i < measure->n_buffers; i++) {
         sizes[i] = 0;
-        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-            sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
+        for (int c = 0; c < measure->buf_tallocs[i]->n_chunks; c++) {
+            sizes[i] += measure->buf_tallocs[i]->chunks[c]->max_size;
         }
     }
+    ggml_gallocr_free(measure);
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
