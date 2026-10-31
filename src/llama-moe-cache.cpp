@@ -1,6 +1,8 @@
 #include "llama-moe-cache.h"
 #include "llama-moe-cache-slru.h"
 #include "llama-memory-lending.h"
+#include "llama-moe-kv-plan.h"
+#include "llama-kv-cache.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -146,6 +148,15 @@ struct llama_moe_cache::impl {
             uint64_t lease = 0;
         };
         std::vector<region> regions;
+        struct kv_slot {
+            std::array<ggml_tensor *, 9> banks;
+            int32_t local;
+            uint32_t threshold;
+            uint64_t lease;
+        };
+        std::vector<kv_slot> kv_slots;
+        int32_t kv_first = 0;
+        size_t kv_safe = 0;
         int32_t base_slots = 0;
         size_t host_bytes = 0;
         int32_t n_slots = 0;
@@ -232,6 +243,26 @@ struct llama_moe_cache::impl {
     int lend_level = 0;              // regions lent up to this level are in use (0: base slots only)
     ggml_context_ptr ctx_compute;    // banks lent from the scheduler's compute buffer
     size_t staging_used = 0;
+
+    llama_kv_cache * kv_memory = nullptr;
+    ggml_context_ptr ctx_kv;
+    struct kv_owner {
+        llama_memory_lending::owner token;
+        ggml_tensor * bytes;
+    };
+    struct kv_padding {
+        std::array<ggml_tensor *, 9> banks;
+        uint64_t lease;
+        uint32_t threshold;
+    };
+    std::vector<kv_owner> kv_owners;
+    std::vector<kv_padding> kv_pads;
+    std::unordered_map<uint64_t, std::pair<size_t, size_t>> kv_locations;
+    uint32_t kv_bound = 0;
+    bool kv_active = false;
+    size_t kv_zero_bytes = 0, kv_zero_calls = 0, kv_invalidated = 0;
+    int64_t kv_zero_us = 0, kv_wait_us = 0;
+
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t pin, bool aux_allowed, bool mtp) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
@@ -607,7 +638,9 @@ struct llama_moe_cache::impl {
         std::setvbuf(trace, nullptr, _IOFBF, 1 << 20);
         trace_t0 = ggml_time_us();
         auto put = [&](uint32_t v) { std::fwrite(&v, sizeof(v), 1, trace); };
-        std::fwrite("MOERT001", 1, 8, trace);
+        const char * kv_mode = std::getenv("LLAMA_MOE_CACHE_KV_LEND");
+        const bool kv_trace = kv_mode && std::strcmp(kv_mode, "1") == 0;
+        std::fwrite(kv_trace ? "MOERT003" : "MOERT001", 1, 8, trace);
         put(layers.size());
         put(groups[0].slru.n_expert);
         put(groups.size());
@@ -627,7 +660,7 @@ struct llama_moe_cache::impl {
             throw std::runtime_error("cannot open MoE ownership trace " + lease_path);
         }
         std::setvbuf(lease_trace, nullptr, _IOFBF, 1 << 20);
-        std::fprintf(lease_trace, "MOELIF001\n");
+        std::fprintf(lease_trace, kv_trace ? "MOELIF002\n" : "MOELIF001\n");
         lending.observe = [this](const char * op, uint64_t region, const llama_memory_lending::span & span) {
             std::fprintf(lease_trace, "seq=%" PRIu64 " route=%" PRIu64 " op=%s owner=%" PRIu64 " generation=%" PRIu64 " kind=%d region=%" PRIu64 " offset=%zu bytes=%zu\n",
                 ++trace_sequence, trace_routes, op, span.allocation.id, span.allocation.generation,
@@ -653,12 +686,23 @@ struct llama_moe_cache::impl {
             room = base - s;
             return g.banks[ip];
         }
+        if (g.kv_first && s >= g.kv_first) {
+            const auto & slot = g.kv_slots.at(s - g.kv_first);
+            local = slot.local;
+            room = slot.banks[ip]->ne[2] - 1 - local;
+            return slot.banks[ip];
+        }
         for (const auto & r : g.regions) {
             if (s >= r.first && s < r.first + r.count) {
                 local = s - r.first;
                 room = r.first + r.count - s;
                 return r.banks[ip];
             }
+        }
+        if (g.kv_first) {
+            local = g.base_slots;
+            room = 1;
+            return g.banks[ip];
         }
         GGML_ABORT("MoE cache slot %d is outside the banks", s);
     }
@@ -723,6 +767,11 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (kv_memory) {
+            kv_memory->set_lending_claim({});
+            for (const auto & owner : kv_owners) { lending.retire(owner.token, return_hooks()); }
+            kv_memory = nullptr;
+        }
         drop_compute();
         if (staging_owner.id) { lending.retire(staging_owner, return_hooks()); }
         if (lease_trace) { std::fclose(lease_trace); }
@@ -734,11 +783,21 @@ struct llama_moe_cache::impl {
         }
     }
 
-    void trace_cache(const char * op, size_t ig, int32_t first, int32_t count, uint64_t region = 0) {
+    void trace_cache(const char * op, size_t ig, int32_t first, int32_t count, uint64_t region = 0, unsigned flags = 0) {
         if (lease_trace) {
-            std::fprintf(lease_trace, "seq=%" PRIu64 " route=%" PRIu64 " op=%s group=%zu first=%d count=%d region=%" PRIu64 "\n",
-                ++trace_sequence, trace_routes, op, ig, first, count, region);
+            std::fprintf(lease_trace, "seq=%" PRIu64 " route=%" PRIu64 " op=%s group=%zu first=%d count=%d region=%" PRIu64 " flags=%u\n",
+                ++trace_sequence, trace_routes, op, ig, first, count, region, flags);
         }
+    }
+
+    void set_range(group & g, int32_t first, int32_t count, bool active, bool valid) {
+        g.slru.set_range(first, count, active, valid);
+        if (g.kv_first) { trace_cache("activity", &g - groups.data(), first, count, 0, unsigned(active) | (unsigned(valid) << 1)); }
+    }
+
+    void rebalance(group & g) {
+        g.slru.rebalance();
+        if (g.kv_first) { trace_cache("balance", &g - groups.data(), 0, 0); }
     }
 
     uint64_t register_region(size_t ig, const group::region & r, llama_memory_lending::owner owner, ggml_backend_buffer_t buffer) {
@@ -754,14 +813,28 @@ struct llama_moe_cache::impl {
         return id;
     }
 
-    llama_memory_lending::hooks return_hooks(bool drained = false) {
-        return {
-            [this, drained] {
+    llama_memory_lending::hooks return_hooks(bool drained = false, bool restore_kv = false) {
+        llama_memory_lending::hooks hooks{
+            [this, drained, restore_kv] {
+                const int64_t start = restore_kv ? ggml_time_us() : 0;
                 if (!drained) { ggml_backend_synchronize(devices[0].backend); }
+                if (restore_kv) { kv_wait_us += ggml_time_us() - start; }
                 pending_il = -1;
                 pending_sel = nullptr;
             },
             [this](const std::vector<uint64_t> & ids) {
+                for (uint64_t id : ids) {
+                    const auto it = kv_locations.find(id);
+                    if (it == kv_locations.end()) { continue; }
+                    auto & g = groups[it->second.first];
+                    const int32_t slot = g.kv_first + it->second.second;
+                    const int32_t key = g.slru.key_of[slot];
+                    if (key >= 0) {
+                        layers[key/g.slru.n_expert].perf.values[llama_moe_perf_data::extra_invalidated]++;
+                        kv_invalidated++;
+                    }
+                    set_range(g, slot, 1, false, false);
+                }
                 for (auto & g : groups) {
                     for (const auto & r : g.regions) {
                         if (!std::binary_search(ids.begin(), ids.end(), r.lease)) { continue; }
@@ -769,13 +842,251 @@ struct llama_moe_cache::impl {
                             const int32_t key = g.slru.key_of[s];
                             if (key >= 0) { layers[key/g.slru.n_expert].perf.values[llama_moe_perf_data::extra_invalidated]++; }
                         }
-                        g.slru.set_range(r.first, r.count, false, false);
+                        set_range(g, r.first, r.count, false, false);
                     }
-                    g.slru.rebalance();
+                    rebalance(g);
                 }
             },
-            {} // Compute and expert staging overwrite their own bytes; they do not require KV zero-on-return.
+            {}
         };
+        if (restore_kv) {
+            hooks.restore = [this](const std::vector<llama_memory_lending::span> & spans) {
+                const int64_t start = ggml_time_us();
+                for (const auto & span : spans) {
+                    for (const auto & owner : kv_owners) {
+                        if (owner.token == span.allocation) {
+                            ggml_backend_tensor_memset(owner.bytes, 0, span.offset, span.bytes);
+                            kv_zero_bytes += span.bytes;
+                            kv_zero_calls++;
+                            break;
+                        }
+                    }
+                }
+                kv_zero_us += ggml_time_us() - start;
+            };
+        }
+        return hooks;
+    }
+
+    void attach_kv(llama_kv_cache & kv) {
+        if (kv_memory || !ctx_extra || staging != STAGING_ON || devices.size() != 1 || !lent.buffer) {
+            throw std::runtime_error("KV lending requires active EXL3 staging and compute lending on one GPU");
+        }
+        const auto tensors = kv.lending_storage();
+        const size_t align = ggml_backend_buft_get_alignment(devices[0].buft);
+        if (tensors.empty() || !align) { throw std::runtime_error("KV lending has no storage"); }
+        const size_t bytes = ggml_nbytes(tensors[0]);
+        const size_t row = tensors[0]->nb[1];
+        std::vector<llama_moe_kv_plan::group> geometry;
+        for (const auto & g : groups) {
+            if (!g.base_slots || g.ref.size() != 9 || (g.exl3_bits_x2 != 7 && g.exl3_bits_x2 != 8)) {
+                throw std::runtime_error("KV lending requires K3.5/K4 expert banks");
+            }
+            llama_moe_kv_plan::group shape{};
+            for (size_t ip = 0; ip < 9; ++ip) { shape.stride[ip] = g.ref[ip]->nb[2]; }
+            shape.layers = g.layers.size();
+            ggml_context_ptr probe(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
+            if (!probe) { throw std::runtime_error("failed to create the KV cache kernel probe"); }
+            auto supported = [&](int32_t slots) {
+                for (size_t ip : {0u,3u,6u}) {
+                    ggml_reset(probe.get());
+                    auto * x = ggml_new_tensor_3d(probe.get(), GGML_TYPE_F32, g.ref[ip+1]->ne[0], 1, g.max_tokens);
+                    auto * ids = ggml_new_tensor_2d(probe.get(), GGML_TYPE_I32, n_expert_used, g.max_tokens);
+                    auto * table = ggml_new_tensor_2d(probe.get(), GGML_TYPE_I64, 3, slots);
+                    auto * op = ggml_mul_mat_exl3(probe.get(), g.banks[ip], g.banks[ip+1], g.banks[ip+2], x, ids, g.exl3_bits_x2);
+                    if (!op || !ggml_exl3_set_cache_order(op) || !ggml_exl3_set_slots(op, table) ||
+                            !ggml_backend_supports_op(devices[0].backend, op)) { return false; }
+                }
+                return true;
+            };
+            int32_t low = g.n_slots, high = g.table_rows;
+            if (!supported(low)) { throw std::runtime_error("existing cache table exceeds the routed kernel limits"); }
+            while (low < high) {
+                const int32_t mid = low + (high - low + 1)/2;
+                if (supported(mid)) { low = mid; } else { high = mid - 1; }
+            }
+            shape.limit = low - g.n_slots;
+            geometry.push_back(shape);
+        }
+        for (auto * t : tensors) {
+            if (!t->buffer || !t->data || ggml_backend_buffer_get_type(t->buffer) != devices[0].buft ||
+                    ggml_nbytes(t) != bytes || t->nb[1] != row || !row) {
+                throw std::runtime_error("KV lending requires matching resident attention tensors on the cache GPU");
+            }
+        }
+        const auto plan = llama_moe_kv_plan::build(tensors.size(), bytes, align, geometry);
+        ctx_kv.reset(ggml_init({(plan.banks.size()*9 + tensors.size())*ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx_kv) { throw std::runtime_error("failed to create the KV lending views"); }
+        std::vector<llama_memory_lending::owner> owners;
+        std::vector<size_t> offsets;
+        std::map<ggml_backend_buffer_t, size_t> buffers;
+        for (auto * t : tensors) {
+            const size_t size = ggml_backend_buffer_get_size(t->buffer);
+            const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(t->buffer);
+            const uintptr_t address = (uintptr_t) t->data;
+            if (size > INT64_MAX || address < base || address - base > size || bytes > size - (address - base)) {
+                throw std::runtime_error("KV lending tensor exceeds its backing allocation");
+            }
+            if (!buffers.count(t->buffer)) {
+                const auto token = lending.bind(100 + buffers.size(), llama_memory_lending::kind::resident,
+                    devices[0].backend, base, size, align);
+                auto * view = ggml_new_tensor_1d(ctx_kv.get(), GGML_TYPE_I8, size);
+                if (ggml_backend_tensor_alloc(t->buffer, view, (void *) base) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("failed to bind KV owner storage");
+                }
+                buffers.emplace(t->buffer, kv_owners.size());
+                kv_owners.push_back({token, view});
+            }
+            owners.push_back(kv_owners[buffers.at(t->buffer)].token);
+            offsets.push_back(address - base);
+        }
+        // Owners remain resident; metadata views do not change the buffer's usage or allocate device bytes.
+        for (const auto & bank : plan.banks) {
+            auto & g = groups[bank.group];
+            std::array<ggml_tensor *, 9> views{};
+            std::vector<llama_memory_lending::span> padding;
+            uint32_t pad_threshold = kv.get_size();
+            for (size_t ip = 0; ip < 9; ++ip) {
+                const auto & part = bank.parts[ip];
+                auto * source = g.ref[ip];
+                auto * view = ggml_new_tensor_3d(ctx_kv.get(), source->type, source->ne[0], source->ne[1], bank.count + 1);
+                if (ggml_nbytes(view) != part.bytes || view->nb[2] != source->nb[2] ||
+                        part.offset > bytes || part.bytes > bytes - part.offset ||
+                        ggml_backend_tensor_alloc(tensors[part.tensor]->buffer, view,
+                            (char *) tensors[part.tensor]->data + part.offset) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("invalid KV expert bank placement");
+                }
+                ggml_format_name(view, "moe_kv.%zu.%zu.%zu", bank.group, kv_pads.size(), ip);
+                views[ip] = view;
+                const size_t pad = part.offset + bank.count*view->nb[2];
+                padding.push_back({owners[part.tensor], offsets[part.tensor] + pad, view->nb[2]});
+                pad_threshold = std::min<uint32_t>(pad_threshold, pad/row);
+            }
+            kv_pads.push_back({views, lending.add(padding), pad_threshold});
+            trace_cache("kv_padding", bank.group, pad_threshold, 0, kv_pads.back().lease);
+            for (size_t i = 0; i < bank.count; ++i) {
+                std::vector<llama_memory_lending::span> parts;
+                uint32_t threshold = kv.get_size();
+                for (size_t ip = 0; ip < 9; ++ip) {
+                    const auto & part = bank.parts[ip];
+                    const size_t begin = part.offset + i*views[ip]->nb[2];
+                    parts.push_back({owners[part.tensor], offsets[part.tensor] + begin, views[ip]->nb[2]});
+                    threshold = std::min<uint32_t>(threshold, begin/row);
+                }
+                g.kv_slots.push_back({views, (int32_t) i, threshold, lending.add(parts)});
+            }
+        }
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            auto & g = groups[ig];
+            g.kv_first = g.n_slots;
+            std::stable_sort(g.kv_slots.begin(), g.kv_slots.end(), [](const group::kv_slot & a, const group::kv_slot & b) {
+                return a.threshold > b.threshold;
+            });
+            if (g.kv_slots.size() > size_t(g.table_rows - g.n_slots)) { throw std::runtime_error("KV expert slot table is full"); }
+            g.n_slots += g.kv_slots.size();
+            for (size_t i = 0; i < g.kv_slots.size(); ++i) {
+                kv_locations.emplace(g.kv_slots[i].lease, std::make_pair(ig, i));
+                trace_cache("kv_slots", ig, g.kv_first + i, 1, g.kv_slots[i].lease);
+            }
+            reset_group(g);
+        }
+        kv_bound = std::min<uint32_t>(512, kv.get_size());
+        kv_memory = &kv;
+        kv.set_lending_claim([this](uint32_t end) { update_kv_bound(end); });
+        update_kv_bound(kv_bound, true);
+        LLAMA_LOG_INFO("moe_kv: enabled=1 tensors=%zu banks=%zu aux_reserve_bytes=%zu device_payload_added=0\n",
+            tensors.size(), plan.banks.size(), plan.auxiliary_reserve);
+    }
+
+    void publish_kv(uint64_t id) {
+        for (const auto & span : lending.get(id).spans) { lending.publish(span); }
+        lending.acquire(id, {});
+    }
+
+    void activate_kv() {
+        if (!kv_memory || !kv_active) { return; }
+        bool padding_drained = false;
+        for (const auto & pad : kv_pads) {
+            if (pad.threshold >= kv_bound && !lending.get(pad.lease).leased) {
+                if (!padding_drained) {
+                    // Memset uses the per-thread stream; finish queued backend readers first.
+                    ggml_backend_synchronize(devices[0].backend);
+                    padding_drained = true;
+                }
+                publish_kv(pad.lease);
+                for (auto * bank : pad.banks) {
+                    ggml_backend_tensor_memset(bank, 0, (bank->ne[2] - 1)*bank->nb[2], bank->nb[2]);
+                }
+            }
+        }
+        for (auto & g : groups) {
+            for (size_t i = 0; i < g.kv_safe; ++i) {
+                const auto & slot = g.kv_slots[i];
+                if (!lending.get(slot.lease).leased) { publish_kv(slot.lease); }
+                else { lending.admit(slot.lease, true); }
+            }
+            set_range(g, g.kv_first, g.kv_safe, true, true);
+            rebalance(g);
+        }
+    }
+
+    void set_kv_active(bool active) {
+        if (!kv_memory || active == kv_active) { return; }
+        kv_active = active;
+        if (active) { activate_kv(); }
+        else {
+            for (auto & g : groups) {
+                for (size_t i = 0; i < g.kv_safe; ++i) {
+                    const auto id = g.kv_slots[i].lease;
+                    if (lending.get(id).leased) { lending.admit(id, false); }
+                }
+                set_range(g, g.kv_first, g.kv_safe, false, true);
+                rebalance(g);
+            }
+        }
+        log_kv("phase", 0, 0);
+    }
+
+    void update_kv_bound(uint32_t end, bool initial = false) {
+        if (!kv_memory || (end == kv_bound && !initial)) { return; }
+        if (end > kv_memory->get_size()) { throw std::runtime_error("KV owner watermark exceeds storage"); }
+        const int64_t start = ggml_time_us();
+        std::vector<uint64_t> returned;
+        for (auto & g : groups) {
+            const size_t safe = std::partition_point(g.kv_slots.begin(), g.kv_slots.end(),
+                [end](const group::kv_slot & slot) { return slot.threshold >= end; }) - g.kv_slots.begin();
+            for (size_t i = safe; i < g.kv_safe; ++i) {
+                const auto id = g.kv_slots[i].lease;
+                if (lending.get(id).leased) { returned.push_back(id); }
+            }
+            g.kv_safe = safe;
+        }
+        for (const auto & pad : kv_pads) {
+            if (pad.threshold < end && lending.get(pad.lease).leased) { returned.push_back(pad.lease); }
+        }
+        for (uint64_t id : returned) {
+            for (const auto & span : lending.get(id).spans) { lending.withdraw(span); }
+        }
+        lending.release(returned, return_hooks(false, true));
+        const bool changed = end < kv_bound || initial;
+        kv_bound = end;
+        if (changed) { activate_kv(); }
+        if (!returned.empty() || initial || end == kv_memory->get_size()) {
+            log_kv("claim", returned.size(), ggml_time_us() - start);
+        }
+    }
+
+    void log_kv(const char * reason, size_t revoked, int64_t usec) {
+        size_t slots = 0, payload = 0, held = 0;
+        for (const auto & g : groups) {
+            slots += g.kv_safe;
+            size_t expert = 0;
+            for (auto * t : g.ref) { expert += t->nb[2]; }
+            payload += g.kv_safe*expert;
+            for (size_t i = 0; i < g.kv_safe; ++i) { held += lending.get(g.kv_slots[i].lease).leased ? expert : 0; }
+        }
+        LLAMA_LOG_INFO("moe_kv: reason=%s bound=%u active=%d safe_slots=%zu safe_payload_bytes=%zu held_payload_bytes=%zu revoked=%zu invalidated=%zu zero_bytes=%zu zero_calls=%zu zero_us=%" PRId64 " wait_us=%" PRId64 " transition_us=%" PRId64 "\n",
+            reason, kv_bound, kv_active ? 1 : 0, slots, payload, held, revoked, kv_invalidated, kv_zero_bytes, kv_zero_calls, kv_zero_us, kv_wait_us, usec);
     }
 
     void attach_staging(ggml_backend_t backend, ggml_backend_buffer_t buffer) {
@@ -891,9 +1202,9 @@ struct llama_moe_cache::impl {
                             ggml_backend_tensor_memset(bank, 0, (bank->ne[2] - 1)*bank->nb[2], bank->nb[2]);
                         }
                     });
-                    g.slru.set_range(r.first, r.count, true, true);
+                    set_range(g, r.first, r.count, true, true);
                 }
-                g.slru.rebalance();
+                rebalance(g);
             }
         }
         lend_level = level;
@@ -949,10 +1260,10 @@ struct llama_moe_cache::impl {
         for (size_t i = 0; i < groups.size(); ++i) {
             group & g = groups[i];
             while (!g.regions.empty() && g.regions.back().compute) {
-                g.n_slots -= g.regions.back().count;
+                if (!g.kv_first) { g.n_slots -= g.regions.back().count; }
                 g.regions.pop_back();
             }
-            reset_group(g);
+            if (g.kv_first) { build_table(g); } else { reset_group(g); }
         }
         ctx_compute.reset();
         lent = {};
@@ -995,6 +1306,8 @@ struct llama_moe_cache::impl {
         if (!ctx_compute) { throw std::runtime_error("failed to create the MoE compute lending context"); }
         char * base = (char *) lent.base;
         size_t lent_bytes[3] = {0, 0, 0};
+        std::vector<int32_t> next_slot;
+        for (const auto & g : groups) { next_slot.push_back(g.kv_first ? g.regions.front().first + g.regions.front().count : g.n_slots); }
         for (const auto & [level, begin, end] : { std::tuple<int, size_t, size_t>{1, b_start, size}, std::tuple<int, size_t, size_t>{2, a_start, b_start} }) {
             if (begin >= end || !host_bytes) { continue; }
             size_t used = begin;
@@ -1002,12 +1315,14 @@ struct llama_moe_cache::impl {
                 group & g = groups[i];
                 if (!g.base_slots) { continue; }
                 const size_t budget = (size_t) ((long double) (end - begin)*g.host_bytes/host_bytes);
-                const int32_t limit = std::min<int64_t>(g.table_rows - g.n_slots, int64_t(g.layers.size())*g.slru.n_expert - g.n_slots);
+                const int32_t first = next_slot[i];
+                const int32_t end_slot = g.kv_first ? g.kv_first : g.table_rows;
+                const int32_t limit = std::min<int64_t>(end_slot - first, int64_t(g.layers.size())*g.slru.n_expert - first);
                 int32_t count = 0;
                 while (count < limit && bank_bytes(g, count + 1, align) <= budget) { count++; }
                 if (!count || used > end || bank_bytes(g, count, align) > end - used) { continue; }
                 group::region r;
-                r.first = g.n_slots;
+                r.first = first;
                 r.count = count;
                 r.level = level;
                 r.compute = true;
@@ -1024,13 +1339,14 @@ struct llama_moe_cache::impl {
                 lent_bytes[level] += bank_bytes(g, count, align);
                 r.lease = register_region(i, r, compute_owner, buffer);
                 g.regions.push_back(std::move(r));
-                g.n_slots += count;
+                next_slot[i] += count;
+                if (!g.kv_first) { g.n_slots += count; }
             }
         }
         for (size_t i = 0; i < groups.size(); ++i) {
             group & g = groups[i];
             if (!g.base_slots) { continue; }
-            reset_group(g);
+            if (g.kv_first) { build_table(g); } else { reset_group(g); }
             for (const auto & r : g.regions) {
                 if (r.compute) {
                     LLAMA_LOG_INFO("moe_lend: group=%zu level=%d first=%d slots=%d\n", i, r.level, r.first, r.count);
@@ -1153,14 +1469,19 @@ struct llama_moe_cache::impl {
         if (slots == nullptr || slots[e] < 0) {
             return 0;
         }
-        int64_t n = 1;
-        while (e + n <= last && slots[e + n] == slots[e] + n) {
-            n++;
-        }
-
         int32_t local, room;
         ggml_tensor * bank = locate(g, slots[e], b.ip, local, room);
-        n = std::min<int64_t>(n, room);
+        int64_t n = 1;
+        while (e + n <= last && n < room && slots[e + n] >= 0) {
+            if (!g.kv_first) {
+                if (slots[e + n] != slots[e] + n) { break; }
+            } else {
+                int32_t next_local, next_room;
+                auto * next_bank = locate(g, slots[e + n], b.ip, next_local, next_room);
+                if (next_bank != bank || next_local != local + n) { break; }
+            }
+            n++;
+        }
         ggml_reset(ctx_views.get());
         ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], local*bank->nb[2]);
         ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
@@ -1327,8 +1648,14 @@ struct llama_moe_cache::impl {
                 int32_t local, room;
                 ggml_tensor * bank = locate(g, fills[i].slot, ip, local, room);
                 size_t n = 1;
-                while (i + n < fills.size() && (int32_t) n < room && fills[i + n].expert == fills[i].expert + (int32_t) n &&
-                        fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                while (i + n < fills.size() && (int32_t) n < room && fills[i + n].expert == fills[i].expert + (int32_t) n) {
+                    if (!g.kv_first) {
+                        if (fills[i + n].slot != fills[i].slot + (int32_t) n) { break; }
+                    } else {
+                        int32_t next_local, next_room;
+                        const auto * next_bank = locate(g, fills[i + n].slot, ip, next_local, next_room);
+                        if (next_bank != bank || next_local != local + (int32_t) n) { break; }
+                    }
                     n++;
                 }
                 const int64_t t_copy = observe ? ggml_time_us() : 0;
@@ -1378,6 +1705,7 @@ struct llama_moe_cache::impl {
     }
 
     void perf_flush(int64_t task, int slot, int phase, int role, bool final) {
+        if (kv_memory && final) { trace_cache("perf", 0, 0, 0); }
         std::map<int, llama_moe_perf_data> delta;
         for (size_t il = 0; il < layers.size(); ++il) {
             auto & l = layers[il];
@@ -1470,6 +1798,14 @@ void llama_moe_cache::set_lend_level(int level) {
 
 void llama_moe_cache::attach_compute(ggml_backend_buffer_t buffer, size_t a_start, size_t b_start) {
     pimpl->attach_compute(buffer, a_start, b_start);
+}
+
+void llama_moe_cache::set_kv_active(bool active) {
+    pimpl->set_kv_active(active);
+}
+
+void llama_moe_cache::attach_kv(llama_kv_cache & kv) {
+    pimpl->attach_kv(kv);
 }
 
 void llama_moe_cache::retire_compute(ggml_backend_buffer_t buffer) {

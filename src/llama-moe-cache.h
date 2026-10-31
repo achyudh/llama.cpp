@@ -10,6 +10,7 @@
 
 struct llama_model;
 struct llama_layer;
+class llama_kv_cache;
 
 bool llama_moe_perf_enabled();
 
@@ -62,6 +63,8 @@ public:
     void attach_compute(ggml_backend_buffer_t buffer, size_t a_start, size_t b_start);
     bool lends_compute() const;
     void retire_compute(ggml_backend_buffer_t buffer);
+    void attach_kv(llama_kv_cache & kv);
+    void set_kv_active(bool active);
     // before a graph runs: give back the regions its compute buffer use reaches; follow a reallocated compute buffer
     void fit_compute(ggml_backend_buffer_t buffer, size_t planned_size);
 

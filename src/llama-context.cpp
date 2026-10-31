@@ -657,6 +657,18 @@ llama_context::llama_context(
             moe_lend_attach();
         }
 
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            const char * lend = std::getenv("LLAMA_MOE_CACHE_KV_LEND");
+            if (lend && std::strcmp(lend, "0") != 0) {
+                if (std::strcmp(lend, "1") != 0 || model.arch != LLM_ARCH_QWEN4EXP || model.exl3.empty() || !moe_cache) {
+                    throw std::runtime_error("LLAMA_MOE_CACHE_KV_LEND requires 0 or 1 and an EXL3 Qwen4Exp MoE cache");
+                }
+                auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+                if (!hybrid) { throw std::runtime_error("KV lending requires resident hybrid attention"); }
+                moe_cache->attach_kv(*hybrid->get_mem_attn());
+            }
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -1714,8 +1726,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, const std::function<void()> & inputs_ready) {
+    bool kv_borrow = false;
     if (moe_cache && moe_cache->wants_staging()) {
         const bool borrow = !expert_stream->streams(ubatch.n_tokens);
+        kv_borrow = borrow;
+        if (!borrow) { moe_cache->set_kv_active(false); }
         if (borrow) {
             expert_stream->set_borrowed(true);
             // up to 32 rows the graph takes the cache path and stays below the middle of the compute buffer; fit_compute
@@ -1731,6 +1746,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    // Claim committed KV reads and writes before granting new expert loans.
+    if (moe_cache && kv_borrow) { moe_cache->set_kv_active(true); }
 
     auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();

@@ -1,5 +1,6 @@
 #include "../src/llama-memory-lending.h"
 #include "../src/llama-moe-cache-slru.h"
+#include "../src/llama-moe-kv-plan.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -289,7 +290,54 @@ static void test_composite_claim() {
     assert(ledger.get(r).leased && ledger.get(survivor).leased);
 }
 
+static void test_kv_geometry() {
+    using planner = llama_moe_kv_plan;
+    std::vector<planner::group> groups = {
+        {{819200,5120,1280,819200,5120,1280,819200,1280,5120}, 8, 1550},
+        {{716800,5120,1280,716800,5120,1280,716800,1280,5120}, 40, 13869}
+    };
+    for (size_t cells : {8192u,65536u,131072u,262144u}) {
+        const size_t bytes = cells*544;
+        auto plan = planner::build(24, bytes, 128, groups);
+        std::vector<std::vector<std::pair<size_t,size_t>>> ranges(24);
+        std::vector<size_t> counts(groups.size(), 0);
+        size_t payload_40k = 0;
+        for (const auto & bank : plan.banks) {
+            counts[bank.group] += bank.count;
+            for (size_t ip = 0; ip < 9; ++ip) {
+                auto p = bank.parts[ip];
+                assert(p.tensor < 24 && p.offset % 128 == 0 && p.offset <= bytes && p.bytes <= bytes-p.offset);
+                assert(p.bytes == (bank.count+1)*groups[bank.group].stride[ip]);
+                ranges[p.tensor].push_back({p.offset,p.offset+p.bytes});
+            }
+            for (size_t local = 0; local < bank.count; ++local) {
+                size_t threshold = cells, payload = 0;
+                for (size_t ip = 0; ip < 9; ++ip) {
+                    auto stride = groups[bank.group].stride[ip];
+                    threshold = std::min(threshold,(bank.parts[ip].offset+local*stride)/544);
+                    payload += stride;
+                }
+                if (threshold >= 40448) { payload_40k += payload; }
+            }
+        }
+        for (auto & spans : ranges) {
+            std::sort(spans.begin(),spans.end());
+            for (size_t i = 1; i < spans.size(); ++i) { assert(spans[i-1].second <= spans[i].first); }
+        }
+        for (size_t i = 0; i < groups.size(); ++i) { assert(counts[i] <= groups[i].limit); }
+        if (cells == 131072) {
+            assert(plan.banks.size() == 8 && plan.auxiliary_reserve == 15417600);
+            assert(payload_40k == 1149254400);
+        }
+    }
+    rejected([&] { planner::build(23,68*1024*1024,128,groups); });
+    rejected([&] { planner::build(24,SIZE_MAX,128,groups); });
+    groups[0].stride[1] = 5119;
+    rejected([&] { planner::build(24,68*1024*1024,128,groups); });
+}
+
 int main() {
+    test_kv_geometry();
     test_activity();
     test_independent_holes();
     test_composite_claim();

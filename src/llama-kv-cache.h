@@ -6,6 +6,7 @@
 #include "llama-kv-stream.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -177,6 +178,11 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+
+    std::vector<ggml_tensor *> lending_storage() const;
+    void set_lending_claim(std::function<void(uint32_t)> claim);
+    void prepare_lending(uint32_t n_kv);
+
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -361,6 +367,8 @@ private:
 
     // the cache's devices take KQ masks of the last columns (get_n_kv_mask); LLAMA_KQ_MASK_COMPACT=0 turns them off
     bool kq_mask_compact = false;
+
+    std::function<void(uint32_t)> lending_claim;
 
     size_t total_size() const;
 

@@ -3,6 +3,8 @@
 #include "../src/llama-model.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-moe-cache.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-io.h"
 #include "../src/llama-model-saver.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -521,6 +523,48 @@ static int test_actual_cache(const char * fixture, const char * directory, const
 }
 #endif
 
+static void test_kv_lending_hooks(llama_model & model) {
+    llama_kv_cache kv(model, model.hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true,
+        2048, 1, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr,
+        [&](int32_t il) { return !model.hparams.is_recr(il); }, nullptr, nullptr);
+    std::vector<uint32_t> claims;
+    kv.set_lending_claim([&](uint32_t end) { claims.push_back(end); });
+    llama_token token = 3;
+    llama_pos pos = 0;
+    llama_seq_id seq = 0;
+    llama_seq_id * seq_ptr = &seq;
+    int32_t n_seq = 1;
+    int8_t output = 1;
+    llama_ubatch batch{};
+    batch.b_equal_seqs = batch.n_tokens = batch.n_seq_tokens = batch.n_seqs = batch.n_seqs_unq = batch.n_pos = 1;
+    batch.token = &token; batch.pos = &pos; batch.n_seq_id = &n_seq; batch.seq_id = &seq_ptr;
+    batch.seq_id_unq = &seq; batch.output = &output;
+    auto slots = kv.prepare({batch});
+    assert(!slots.empty() && claims.empty() && kv.seq_pos_max(0) == -1);
+    llama_kv_cache_context committed(&kv, std::move(slots), {batch});
+    assert(committed.apply() && claims == std::vector<uint32_t>{512});
+    kv.seq_rm(0, -1, -1);
+    kv.clear(false);
+    kv.init_full();
+    assert(claims.size() == 1);
+    struct no_read : llama_io_read_i {
+        void read(void *, size_t) override { throw std::runtime_error("expected failed restore"); }
+        void read_tensor(ggml_tensor *, size_t, size_t) override { assert(false); }
+        size_t n_bytes() override { return 0; }
+    } reader;
+    kv.state_read(reader, -1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    assert(claims.size() == 1);
+    bool failed = false;
+    try { kv.state_read(reader); } catch (const std::runtime_error &) { failed = true; }
+    assert(failed && claims.back() == 2048 && claims.size() == 2);
+    kv.clear(true);
+    assert(claims.size() == 3 && claims.back() == 2048);
+    kv.set_lending_claim({});
+    kv.clear(true);
+    assert(claims.size() == 3);
+    puts("KV lending: committed bounds, pure preparation, metadata clear and partial restore hooks pass");
+}
+
 static int test_main(int argc, char ** argv) {
 #if defined(GGML_USE_HIP) && !defined(_WIN32)
     if (argc == 5 && !strcmp(argv[1], "--rocm-banks")) { return test_actual_cache(argv[2], argv[3], argv[4]); }
@@ -538,6 +582,7 @@ static int test_main(int argc, char ** argv) {
     cache_device = rocm ? ggml_backend_dev_by_name("ROCm0") : &test_device;
     assert(cache_device);
     auto * quant = load(argv[first], false);
+    test_kv_lending_hooks(*quant);
     auto * ref = load(argv[first+1], false);
     ngram_inputs = ngram_inputs || quant->exl3_ngram_bits != 0;
     auto load_params = llama_model_default_params();

@@ -447,7 +447,39 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+std::vector<ggml_tensor *> llama_kv_cache::lending_storage() const {
+    if (stream || other || n_stream != 1 || v_trans || n_swa || swa_type != LLAMA_SWA_TYPE_NONE) {
+        throw std::runtime_error("KV lending requires single-stream resident attention without SWA");
+    }
+    std::vector<ggml_tensor *> result;
+    for (const auto & layer : layers) {
+        for (auto * t : {layer.k, layer.v}) {
+            if (!t || t->view_src || t->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(t) ||
+                    t->ne[1] != get_size() || t->ne[2] != 1 || t->ne[3] != 1) {
+                throw std::runtime_error("KV lending requires separate contiguous Q8_0 K/V rows");
+            }
+            result.push_back(t);
+        }
+    }
+    return result;
+}
+
+void llama_kv_cache::set_lending_claim(std::function<void(uint32_t)> claim) {
+    if (claim && lending_claim) { throw std::runtime_error("KV storage already has a borrower"); }
+    lending_claim = std::move(claim);
+}
+
+void llama_kv_cache::prepare_lending(uint32_t n_kv) {
+    if (n_kv > get_size()) { throw std::invalid_argument("invalid KV lending watermark"); }
+    if (lending_claim) {
+        // The indexer can select sentinel row n_kv; protect it and padded attention reads.
+        const uint32_t guard = std::max(n_pad, 256u);
+        lending_claim(n_kv + std::min(guard, get_size() - n_kv));
+    }
+}
+
 void llama_kv_cache::clear(bool data) {
+    if (data && lending_claim) { lending_claim(get_size()); }
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -909,6 +941,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     bool updated = false;
+
+    if (lending_claim && (do_shift || !sc_info.empty())) { lending_claim(get_size()); }
 
     auto * sched = lctx->get_sched();
 
@@ -2548,6 +2582,8 @@ const slot_info_vec_t *   sinfos_in) {
         return;
     }
 
+    if (lending_claim) { lending_claim(get_size()); }
+
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -3154,6 +3190,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     if (sinfo.empty() || sinfo.size() == 0) {
         return;
     }
+    if (lending_claim) { lending_claim(get_size()); }
 
     const auto & cells = v_cells[strm];
 
@@ -3283,6 +3320,7 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    kv->prepare_lending(n_kv);
 
     // not in apply_ubatch: prepare() applies every ubatch of a batch to find their slots, then undoes them
     kv->prepare_stream(sinfos[i_cur]);
