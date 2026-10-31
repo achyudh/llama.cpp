@@ -228,8 +228,13 @@ static void test_eviction(llama_model & model) {
         }
         assert(!cache.get_slot_map(0, 33, 2));
         if (rocm) {
-            assert(cache.get_slot_map(1, 8, 2));
-            assert(!cache.get_slot_map(1, 9, 2));
+            assert(cache.get_slot_map(1, 1, 2));
+            assert(!cache.get_slot_map(1, 2, 2));
+            llama_moe_cache full_layer(model, {backend}, {buft}, 4*1024*1024);
+            assert(full_layer.get_slot_map(1, 8, 2));
+            assert(full_layer.get_slot_map(1, 9, 2));
+            assert(full_layer.get_slot_map(1, 32, 2));
+            assert(!full_layer.get_slot_map(1, 33, 2));
         }
         printf("EXL3 cache: coherent packed/suh/svh hits, evictions and refills pass\n");
     }

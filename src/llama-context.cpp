@@ -840,6 +840,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_alias_callback(sched.get(), sched_alias_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    ggml_backend_sched_set_buffer_realloc_callback(sched.get(), [](ggml_backend_buffer_t buffer, void * data) {
+        auto * ctx = static_cast<llama_context *>(data);
+        if (ctx->moe_cache) { ctx->moe_cache->retire_compute(buffer); }
+    }, this);
 }
 
 bool llama_context::switch_phase(bool decode, uint32_t n_tokens_next) {

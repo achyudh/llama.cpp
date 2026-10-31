@@ -1,4 +1,6 @@
 #include "llama-moe-cache.h"
+#include "llama-moe-cache-slru.h"
+#include "llama-memory-lending.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -82,172 +84,6 @@ std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_model & mod
 
 namespace {
 
-// SLRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
-struct moe_cache_slru {
-    int32_t n_expert = 0;
-    int32_t n_slots  = 0;
-    int32_t active_slots = 0;
-
-    std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
-    std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
-
-    // probation and protected LRU lists; hits promote slots to the protected half
-    std::vector<int32_t> prev;
-    std::vector<int32_t> next;
-    int32_t head[2] = { -1, -1 };
-    int32_t tail[2] = { -1, -1 };
-    std::vector<bool> is_protected;
-    int32_t n_protected = 0;
-
-    std::vector<uint32_t> seen; // [n_expert]
-    uint32_t seen_gen = 0;
-    std::vector<int32_t> uniq;
-
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
-        this->n_expert = n_expert;
-        this->n_slots  = n_slots;
-        active_slots = n_slots;
-        slot_map.assign(n_layer, nullptr);
-        key_of.assign(n_slots, -1);
-        prev.resize(n_slots);
-        next.resize(n_slots);
-        for (int32_t s = 0; s < n_slots; ++s) {
-            prev[s] = s - 1;
-            next[s] = s + 1 < n_slots ? s + 1 : -1;
-        }
-        head[0] = n_slots > 0 ? 0 : -1;
-        tail[0] = n_slots - 1;
-        head[1] = tail[1] = -1;
-        n_protected = 0;
-        seen_gen = 0;
-        uniq.clear();
-        is_protected.assign(n_slots, false);
-        seen.assign(n_expert, 0);
-    }
-
-    // move slot s to the most recently used end of a segment
-    void move(int32_t s, bool protect) {
-        const bool from = is_protected[s];
-        if (from == protect && s == tail[from]) {
-            return;
-        }
-        if (prev[s] >= 0) {
-            next[prev[s]] = next[s];
-        } else {
-            head[from] = next[s];
-        }
-        if (next[s] >= 0) {
-            prev[next[s]] = prev[s];
-        } else {
-            tail[from] = prev[s];
-        }
-
-        prev[s] = tail[protect];
-        next[s] = -1;
-        if (tail[protect] >= 0) {
-            next[tail[protect]] = s;
-        } else {
-            head[protect] = s;
-        }
-        tail[protect] = s;
-        is_protected[s] = protect;
-        n_protected += int(protect) - int(from);
-    }
-
-    void touch(int32_t s) {
-        move(s, true);
-        if (n_protected > active_slots/2) {
-            move(head[1], false);
-        }
-    }
-
-    int32_t victim(int32_t il) const {
-        for (int segment = 0; segment < 2; ++segment) {
-            for (int32_t s = head[segment]; s >= 0; s = next[s]) {
-                if (s >= active_slots) { continue; }
-                const int32_t key = key_of[s];
-                // keep every expert selected by this request, including earlier fills
-                if (key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen) {
-                    return s;
-                }
-            }
-        }
-        GGML_ABORT("no SLRU victim");
-    }
-
-    size_t set_active(int32_t count) {
-        GGML_ASSERT(count > 0 && count <= n_slots);
-        size_t removed = 0;
-        for (int32_t s = count; s < active_slots; ++s) {
-            const int32_t key = key_of[s];
-            if (key >= 0) {
-                slot_map[key / n_expert][key % n_expert] = -1;
-                key_of[s] = -1;
-                removed++;
-            }
-            move(s, false);
-        }
-        active_slots = count;
-        while (n_protected > active_slots/2) { move(head[1], false); }
-        return removed;
-    }
-
-    struct fill {
-        int32_t expert;
-        int32_t slot;
-    };
-
-    // give a slot to each expert selected by ids in layer il, evicting from probation first
-    // returns false if the ids select more distinct experts than there are slots
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, size_t & n_evicted) {
-        fills.clear();
-        n_hit = 0;
-        n_evicted = 0;
-
-        if (++seen_gen == 0) {
-            std::fill(seen.begin(), seen.end(), 0);
-            seen_gen = 1;
-        }
-        uniq.clear();
-        for (size_t i = 0; i < n_ids; ++i) {
-            GGML_ASSERT(ids[i] >= 0 && ids[i] < n_expert);
-            if (seen[ids[i]] != seen_gen) {
-                seen[ids[i]] = seen_gen;
-                uniq.push_back(ids[i]);
-            }
-        }
-        if (uniq.size() > (size_t) active_slots) {
-            return false;
-        }
-
-        int32_t * slots = slot_map[il];
-
-        // promote hits before choosing victims for misses
-        for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                touch(slots[e]);
-                n_hit++;
-            }
-        }
-        // sorted misses usually get consecutive slots, so the uploads can be merged
-        std::sort(uniq.begin(), uniq.end());
-        for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                continue;
-            }
-            const int32_t s = victim(il);
-            if (key_of[s] >= 0) {
-                n_evicted++;
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
-            }
-            key_of[s] = il*n_expert + e;
-            slots[e] = s;
-            move(s, false);
-            fills.push_back({ e, s });
-        }
-        return true;
-    }
-};
 
 static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, const std::vector<ggml_tensor *> & b) {
     if (a.size() != b.size()) {
@@ -307,6 +143,7 @@ struct llama_moe_cache::impl {
             int32_t count = 0;
             int level = 1;
             bool compute = false;
+            uint64_t lease = 0;
         };
         std::vector<region> regions;
         int32_t base_slots = 0;
@@ -314,7 +151,7 @@ struct llama_moe_cache::impl {
         int32_t n_slots = 0;
         int exl3_bits_x2 = 0;
         int64_t max_tokens = max_batch;
-        moe_cache_slru slru;
+        llama_moe_cache_slru slru;
         // EXL3 groups: I64 [ref.size(), table_rows], each slot's address of every expert tensor's storage; the ops read
         // their slots through it (ggml_exl3_set_slots), so slots can live in any buffer
         ggml_tensor * table = nullptr;
@@ -368,11 +205,15 @@ struct llama_moe_cache::impl {
     const ggml_tensor * pending_sel = nullptr;
 
     std::vector<int32_t> ids;
-    std::vector<moe_cache_slru::fill> fills;
+    std::vector<llama_moe_cache_slru::fill> fills;
 
     // LLAMA_MOE_ROUTE_TRACE=path: the selected experts of every cached layer, for replaying the cache policy offline
     // (expert ids only; little-endian records, see open_trace)
     FILE * trace = nullptr;
+    FILE * lease_trace = nullptr;
+    uint64_t trace_routes = 0, trace_sequence = 0;
+    llama_memory_lending lending;
+    llama_memory_lending::owner staging_owner, compute_owner;
     int64_t trace_t0 = 0;
     std::vector<uint16_t> trace_ids;
 
@@ -778,6 +619,20 @@ struct llama_moe_cache::impl {
             put(g.layers.size());
             for (int32_t il : g.layers) { put(il); }
         }
+        const std::string lease_path = std::string(path) + ".leases";
+        lease_trace = std::fopen(lease_path.c_str(), "wb");
+        if (!lease_trace) {
+            std::fclose(trace);
+            trace = nullptr;
+            throw std::runtime_error("cannot open MoE ownership trace " + lease_path);
+        }
+        std::setvbuf(lease_trace, nullptr, _IOFBF, 1 << 20);
+        std::fprintf(lease_trace, "MOELIF001\n");
+        lending.observe = [this](const char * op, uint64_t region, const llama_memory_lending::span & span) {
+            std::fprintf(lease_trace, "seq=%" PRIu64 " route=%" PRIu64 " op=%s owner=%" PRIu64 " generation=%" PRIu64 " kind=%d region=%" PRIu64 " offset=%zu bytes=%zu\n",
+                ++trace_sequence, trace_routes, op, span.allocation.id, span.allocation.generation,
+                int(lending.owner_kind(span.allocation)), region, span.offset, span.bytes);
+        };
         LLAMA_LOG_INFO("%s: recording the selected experts of cached layers to %s\n", __func__, path);
     }
 
@@ -806,18 +661,6 @@ struct llama_moe_cache::impl {
             }
         }
         GGML_ABORT("MoE cache slot %d is outside the banks", s);
-    }
-
-    // the slots in use at a lending level: the base slots and the regions lent at that level or below
-    int32_t level_slots(const group & g, int level) const {
-        if (!g.base_slots || staging != STAGING_ON) {
-            return g.base_slots ? g.base_slots : g.n_slots;
-        }
-        int32_t n = g.base_slots;
-        for (const auto & r : g.regions) {
-            if (r.level <= level) { n = r.first + r.count; }
-        }
-        return n;
     }
 
     // the address of every slot's storage of each expert tensor: base slots in the banks, then the borrowed regions
@@ -880,12 +723,59 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        drop_compute();
+        if (staging_owner.id) { lending.retire(staging_owner, return_hooks()); }
+        if (lease_trace) { std::fclose(lease_trace); }
         if (trace) { std::fclose(trace); }
         log_stats();
         for (auto & d : devices) {
             if (d.aux_host || d.ids_host) { ggml_backend_synchronize(d.backend); }
             if (d.ids_ready) { ggml_backend_event_free(d.ids_ready); }
         }
+    }
+
+    void trace_cache(const char * op, size_t ig, int32_t first, int32_t count, uint64_t region = 0) {
+        if (lease_trace) {
+            std::fprintf(lease_trace, "seq=%" PRIu64 " route=%" PRIu64 " op=%s group=%zu first=%d count=%d region=%" PRIu64 "\n",
+                ++trace_sequence, trace_routes, op, ig, first, count, region);
+        }
+    }
+
+    uint64_t register_region(size_t ig, const group::region & r, llama_memory_lending::owner owner, ggml_backend_buffer_t buffer) {
+        std::vector<llama_memory_lending::span> spans;
+        const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(buffer);
+        for (const auto * bank : r.banks) {
+            const uintptr_t address = (uintptr_t) bank->data;
+            if (address < base) { throw std::runtime_error("invalid MoE lending bank"); }
+            spans.push_back({owner, address - base, ggml_nbytes(bank)});
+        }
+        const uint64_t id = lending.add(spans);
+        trace_cache("slots", ig, r.first, r.count, id);
+        return id;
+    }
+
+    llama_memory_lending::hooks return_hooks(bool drained = false) {
+        return {
+            [this, drained] {
+                if (!drained) { ggml_backend_synchronize(devices[0].backend); }
+                pending_il = -1;
+                pending_sel = nullptr;
+            },
+            [this](const std::vector<uint64_t> & ids) {
+                for (auto & g : groups) {
+                    for (const auto & r : g.regions) {
+                        if (!std::binary_search(ids.begin(), ids.end(), r.lease)) { continue; }
+                        for (int32_t s = r.first; s < r.first + r.count; ++s) {
+                            const int32_t key = g.slru.key_of[s];
+                            if (key >= 0) { layers[key/g.slru.n_expert].perf.values[llama_moe_perf_data::extra_invalidated]++; }
+                        }
+                        g.slru.set_range(r.first, r.count, false, false);
+                    }
+                    g.slru.rebalance();
+                }
+            },
+            {} // Compute and expert staging overwrite their own bytes; they do not require KV zero-on-return.
+        };
     }
 
     void attach_staging(ggml_backend_t backend, ggml_backend_buffer_t buffer) {
@@ -926,6 +816,8 @@ struct llama_moe_cache::impl {
         }
         ctx_extra.reset(ggml_init({groups.size()*18*ggml_tensor_overhead(), nullptr, true}));
         if (!ctx_extra) { throw std::runtime_error("failed to create the MoE staging cache context"); }
+        staging_owner = lending.bind(1, llama_memory_lending::kind::staging, devices[0].backend,
+            (uintptr_t) ggml_backend_buffer_get_base(buffer), available, align);
         char * base = (char *) ggml_backend_buffer_get_base(buffer);
         for (size_t i = 0; i < groups.size(); ++i) {
             group & g = groups[i];
@@ -948,6 +840,7 @@ struct llama_moe_cache::impl {
                 staging_used += size;
                 r.banks.push_back(bank);
             }
+            r.lease = register_region(i, r, staging_owner, buffer);
             g.regions.push_back(std::move(r));
             g.n_slots += count;
             build_table(g);
@@ -977,23 +870,30 @@ struct llama_moe_cache::impl {
         pending_il = -1;
         pending_sel = nullptr;
         size_t invalidated = 0;
+        std::vector<uint64_t> returned;
         for (auto & g : groups) {
-            const int32_t count = level_slots(g, level);
-            if (count < g.slru.active_slots) {
-                for (int32_t s = count; s < g.slru.active_slots; ++s) {
-                    const int32_t key = g.slru.key_of[s];
-                    if (key >= 0) { layers[key/g.slru.n_expert].perf.values[llama_moe_perf_data::extra_invalidated]++; }
+            for (const auto & r : g.regions) {
+                if (r.level > level && lending.get(r.lease).leased) {
+                    for (const auto & span : lending.get(r.lease).spans) { lending.withdraw(span); }
+                    returned.push_back(r.lease);
+                    for (int32_t slot = r.first; slot < r.first + r.count; ++slot) { invalidated += g.slru.key_of[slot] >= 0; }
                 }
-                invalidated += g.slru.set_active(count);
-            } else if (count > g.slru.active_slots) {
+            }
+        }
+        lending.release(returned, return_hooks(true));
+        if (staging == STAGING_ON) {
+            for (auto & g : groups) {
                 for (const auto & r : g.regions) {
-                    if (r.first >= g.slru.active_slots && r.first < count) {
+                    if (r.level > level || lending.get(r.lease).leased) { continue; }
+                    for (const auto & span : lending.get(r.lease).spans) { lending.publish(span); }
+                    lending.acquire(r.lease, [&r] {
                         for (auto * bank : r.banks) {
                             ggml_backend_tensor_memset(bank, 0, (bank->ne[2] - 1)*bank->nb[2], bank->nb[2]);
                         }
-                    }
+                    });
+                    g.slru.set_range(r.first, r.count, true, true);
                 }
-                g.slru.set_active(count);
+                g.slru.rebalance();
             }
         }
         lend_level = level;
@@ -1044,6 +944,8 @@ struct llama_moe_cache::impl {
     void drop_compute() {
         if (!lent.buffer) { return; }
         set_level(0);
+        lending.retire(compute_owner, return_hooks());
+        compute_owner = {};
         for (size_t i = 0; i < groups.size(); ++i) {
             group & g = groups[i];
             while (!g.regions.empty() && g.regions.back().compute) {
@@ -1066,9 +968,11 @@ struct llama_moe_cache::impl {
             g.slru.slot_map[il] = map;
         }
         g.slru.set_active(g.base_slots ? g.base_slots : g.n_slots);
+        trace_cache("reset", &g - groups.data(), g.base_slots ? g.base_slots : g.n_slots, g.n_slots);
     }
 
     void attach_compute(ggml_backend_buffer_t buffer, size_t a_start, size_t b_start) {
+        set_level(0);
         // the regions of an earlier buffer go first: it may be freed already
         drop_compute();
         if (!ctx_extra || staging != STAGING_ON || devices.size() != 1 || !buffer ||
@@ -1083,6 +987,8 @@ struct llama_moe_cache::impl {
         }
         a_start = std::min(GGML_PAD(a_start, align), size);
         b_start = std::min(GGML_PAD(std::max(a_start, b_start), align), size);
+        compute_owner = lending.bind(2, llama_memory_lending::kind::compute, devices[0].backend,
+            (uintptr_t) ggml_backend_buffer_get_base(buffer), size, align);
         lent = {buffer, ggml_backend_buffer_get_base(buffer), size, a_start, b_start};
         const size_t host_bytes = devices[0].host_bytes;
         ctx_compute.reset(ggml_init({groups.size()*2*g_ref_max()*ggml_tensor_overhead(), nullptr, true}));
@@ -1116,6 +1022,7 @@ struct llama_moe_cache::impl {
                     r.banks.push_back(bank);
                 }
                 lent_bytes[level] += bank_bytes(g, count, align);
+                r.lease = register_region(i, r, compute_owner, buffer);
                 g.regions.push_back(std::move(r));
                 g.n_slots += count;
             }
@@ -1371,6 +1278,7 @@ struct llama_moe_cache::impl {
             const uint16_t n_ids = (uint16_t) trace_ids.size();
             std::fwrite(&n_ids, 2, 1, trace);
             std::fwrite(trace_ids.data(), 2, trace_ids.size(), trace);
+            trace_routes++;
         }
 
         size_t n_hit = 0, n_evicted = 0;
@@ -1562,6 +1470,10 @@ void llama_moe_cache::set_lend_level(int level) {
 
 void llama_moe_cache::attach_compute(ggml_backend_buffer_t buffer, size_t a_start, size_t b_start) {
     pimpl->attach_compute(buffer, a_start, b_start);
+}
+
+void llama_moe_cache::retire_compute(ggml_backend_buffer_t buffer) {
+    if (buffer == pimpl->lent.buffer) { pimpl->drop_compute(); }
 }
 
 bool llama_moe_cache::lends_compute() const {

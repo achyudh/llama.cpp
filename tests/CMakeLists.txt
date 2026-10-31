@@ -318,6 +318,8 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
+llama_build_and_test(test-moe-cache.cpp LINK ggml)
+
 llama_build_and_test(test-exl3.cpp LINK ggml)
 target_include_directories(test-exl3 PRIVATE ../ggml/src)
 
