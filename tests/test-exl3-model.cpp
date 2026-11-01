@@ -87,7 +87,7 @@ static void init_device() {
     test_buft.iface.is_host = buffer_host;
 }
 
-static llama_model * load(const char * file, bool device) {
+static llama_model * load(const char * file, bool device, bool host_embedding = false) {
     auto p = llama_model_default_params();
     ggml_backend_dev_t devices[] = { device ? cache_device : nullptr, nullptr };
     p.devices = devices;
@@ -95,6 +95,11 @@ static llama_model * load(const char * file, bool device) {
     p.load_mtp = true;
     p.load_mode = LLAMA_LOAD_MODE_MMAP;
     p.check_tensors = true;
+    const llama_model_tensor_buft_override overrides[] = {
+        {"token_embd\\.weight", ggml_backend_cpu_buffer_type()},
+        {nullptr, nullptr},
+    };
+    if (host_embedding) { p.tensor_buft_overrides = overrides; }
     if (ngram_inputs) { p.lazy_mode = LLAMA_LAZY_MODE_ON; }
     auto * m = llama_model_load_from_file(file, p);
     if (!m) { throw std::runtime_error("model load failed"); }
@@ -173,6 +178,95 @@ static void compare_tensors(const ggml_tensor * a, const ggml_tensor * b) {
     std::vector<uint8_t> bytes(ggml_nbytes(b));
     ggml_backend_tensor_get(b, bytes.data(), 0, bytes.size());
     assert(!memcmp(a->data, bytes.data(), bytes.size()));
+}
+
+static void test_mtp_history(llama_model * model, uint32_t n_ubatch = 4) {
+    struct counts {
+        int query = 0;
+        int indexer = 0;
+        int ffn = 0;
+    } seen[2];
+    llama_context * contexts[2];
+    for (int i = 0; i < 2; ++i) {
+        auto p = llama_context_default_params();
+        p.n_ctx = 512; p.n_batch = 512; p.n_ubatch = n_ubatch;
+        p.n_threads = p.n_threads_batch = 2;
+        p.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        p.type_k = p.type_v = GGML_TYPE_Q8_0;
+        p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        p.cb_eval_user_data = &seen[i];
+        p.cb_eval = [](ggml_tensor * tensor, bool ask, void * data) {
+            if (ask) {
+                auto & count = *static_cast<counts *>(data);
+                count.query += !strncmp(tensor->name, "Qcur", 4);
+                count.indexer += !strncmp(tensor->name, "indexer_score", 13);
+                count.ffn += strstr(tensor->name, "ffn") != nullptr;
+            }
+            return false;
+        };
+        contexts[i] = llama_init_from_model(model, p);
+        assert(contexts[i]);
+        // Unmasked hidden outputs require the full history graph and provide the reference.
+        llama_set_embeddings_nextn(contexts[i], true, i == 1);
+        seen[i] = {};
+    }
+    auto state = [](llama_context * ctx) {
+        std::vector<uint8_t> bytes(llama_state_seq_get_size_ext(ctx, 0, 0));
+        assert(llama_state_seq_get_data_ext(ctx, bytes.data(), bytes.size(), 0, 0) == bytes.size());
+        return bytes;
+    };
+    auto decode = [&](int start, int rows, bool output) {
+        const int n_embd = llama_model_n_embd_out(model);
+        std::vector<float> hidden(size_t(rows)*n_embd);
+        for (size_t j = 0; j < hidden.size(); ++j) {
+            hidden[j] = std::sin(float(j + size_t(start)*n_embd)*.03f)*.1f;
+        }
+        std::vector<float> logits[2];
+        for (int i = 0; i < 2; ++i) {
+            llama_set_embeddings_nextn(contexts[i], true, output || i == 1);
+            auto * batch = llama_batch_ext_init(contexts[i]);
+            for (int j = 0; j < rows; ++j) {
+                const int id = llama_batch_ext_add_token(batch, 0, (start+j)*7 % 128);
+                const llama_pos pos[] = {start+j, start+j, start+j, 0};
+                assert(id >= 0 && llama_batch_ext_set_pos(batch, id, pos));
+                assert(llama_batch_ext_set_embd_state(batch, id, {hidden.data()+size_t(j)*n_embd, 1, size_t(n_embd)}));
+                assert(llama_batch_ext_set_output_logits(batch, id, output));
+            }
+            assert(llama_process(contexts[i], LLAMA_PROCESS_TYPE_DECODE, batch) == 0);
+            if (output) {
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+                for (int j = 0; j < rows; ++j) {
+                    const float * values = llama_get_logits_ith(contexts[i], j);
+                    logits[i].insert(logits[i].end(), values, values+n_vocab);
+                }
+            }
+            llama_batch_ext_free(batch);
+        }
+        assert(state(contexts[0]) == state(contexts[1]));
+        if (output) { compare(logits[0], logits[1], true); }
+    };
+    decode(0, 3, false);
+    const auto checkpoint = state(contexts[0]);
+    decode(3, 4, false);
+    decode(7, 3, false);
+    assert(seen[0].query > 0 && seen[0].ffn > 0);
+    if (model->hparams.dsv4_compress_ratios[model->hparams.n_layer()] > 0) {
+        assert(seen[0].indexer > 0);
+    }
+    assert(seen[1].query == 0 && seen[1].indexer == 0 && seen[1].ffn == 0);
+    decode(10, 1, true);
+    decode(11, 4, true);
+    for (auto * ctx : contexts) {
+        assert(llama_state_seq_set_data_ext(ctx, checkpoint.data(), checkpoint.size(), 0, 0) == checkpoint.size());
+    }
+    decode(3, 5, false);
+    decode(8, 1, true);
+    if (n_ubatch > 4) {
+        decode(9, n_ubatch, false);
+        decode(9+n_ubatch, 1, true);
+    }
+    for (auto * ctx : contexts) { llama_free(ctx); }
+    puts("MTP history: Q8 cache bytes, draft logits, checkpoint replay and skipped query/FFN nodes pass");
 }
 
 // Force reuse and replacement with distinct per-expert auxiliaries through the production fill callback.
@@ -566,13 +660,15 @@ static void test_kv_lending_hooks(llama_model & model) {
 }
 
 static int test_main(int argc, char ** argv) {
+    const bool history_only = argc > 1 && !strcmp(argv[argc-1], "--history-only");
+    if (history_only) { --argc; }
 #if defined(GGML_USE_HIP) && !defined(_WIN32)
     if (argc == 5 && !strcmp(argv[1], "--rocm-banks")) { return test_actual_cache(argv[2], argv[3], argv[4]); }
 #endif
     rocm = argc == 5 && !strcmp(argv[1], "--rocm");
     ngram_inputs = argc == 5 && !strcmp(argv[1], "--ngram");
     const int first = rocm || ngram_inputs ? 2 : 1;
-    if (argc != (rocm || ngram_inputs ? 5 : 3)) { fprintf(stderr, "usage: %s [--rocm|--ngram] compressed.gguf reconstructed.gguf [output-directory]\n", argv[0]); return 1; }
+    if (argc != (rocm || ngram_inputs ? 5 : 3)) { fprintf(stderr, "usage: %s [--rocm|--ngram] compressed.gguf reconstructed.gguf [output-directory] [--history-only]\n", argv[0]); return 1; }
     if (rocm || ngram_inputs) { output_directory = argv[4]; }
     llama_backend_init();
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
@@ -583,6 +679,17 @@ static int test_main(int argc, char ** argv) {
     assert(cache_device);
     auto * quant = load(argv[first], false);
     test_kv_lending_hooks(*quant);
+    test_mtp_history(quant);
+    if (history_only) {
+        auto * cached = load(argv[first], true);
+        test_mtp_history(cached);
+        auto * mixed = load(argv[first], true, true);
+        test_mtp_history(mixed, 256);
+        llama_model_free(mixed);
+        llama_model_free(cached); llama_model_free(quant);
+        llama_backend_free();
+        return 0;
+    }
     auto * ref = load(argv[first+1], false);
     ngram_inputs = ngram_inputs || quant->exl3_ngram_bits != 0;
     auto load_params = llama_model_default_params();
@@ -642,6 +749,12 @@ static int test_main(int argc, char ** argv) {
     llama_model_free(roundtrip);
     fclose(file);
     auto * cached = load(argv[first], true);
+    test_mtp_history(cached);
+    {
+        auto * mixed = load(argv[first], true, true);
+        test_mtp_history(mixed, 256);
+        llama_model_free(mixed);
+    }
     test_eviction(*cached);
     for (bool mtp : {false, true}) {
         for (int rows : {1,4,5}) {
