@@ -1,0 +1,8 @@
+/build/
+/results/
+/README.md
+/reference/*.json
+/reference/*.md
+/reference/*.patch
+/reference/*standalone.cuh
+__pycache__/
