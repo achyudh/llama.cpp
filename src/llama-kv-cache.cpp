@@ -1700,6 +1700,9 @@ bool llama_kv_cache::resize_kv_stream(size_t resident_size, bool decode, uint32_
 
     const int64_t t_start_us = ggml_time_us();
 
+    // a new plan invalidates a previous cap: the phase switch traded the compute buffers
+    stream->capped = false;
+
     // write the resident pages back and free the pool and the slots before allocating the new ones, so that the old
     // and new never coexist
     stream->release_pool();
@@ -1751,7 +1754,70 @@ bool llama_kv_cache::resize_kv_stream(size_t resident_size, bool decode, uint32_
         }
     }
 
-    // the budget is the user's: when it does not fit, say so and leave the cache without a pool (every page is in the
+    // the budget is the user's: when it does not fit, first try a shrunken pool that fits the free VRAM (the pages
+    // beyond pool+ring stream from the host store); only when even that fails, leave the cache without a pool, for the
+    // caller to report and to try again before the next batch
+    if (!ok) {
+        for (auto & [ctx, buf] : ctxs_bufs) {
+            buf.reset();
+        }
+
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(stream->device(), &free, &total);
+
+        const size_t page_pool = bytes_per_cell*llama_kv_stream::page_size;
+        const uint32_t n_floor = std::min(n_pages, 8u);
+        const uint32_t n_fit   = (uint32_t) (free/page_pool);
+
+        uint32_t n_slots_fit = 0;
+        uint32_t n_ring_fit  = 0;
+        if (decode && stream->ring_packed()) {
+            const uint32_t n_need = std::min(n_pages, kv_stream_pages_next(n_tokens) + kv_stream_headroom_pages);
+            if (n_fit >= n_need) {
+                n_slots_fit = n_slots;
+                n_ring_fit  = n_ring;
+            } else {
+                // the pool cannot cover every attended page: the ring cycles the streamed ones (at least 2)
+                n_ring_fit  = 2;
+                n_slots_fit = n_fit > n_ring_fit ? n_fit - n_ring_fit : 0;
+            }
+        } else {
+            n_slots_fit = n_fit;
+        }
+        n_slots_fit = std::min(n_slots_fit, n_slots);
+
+        if (n_slots_fit >= n_floor) {
+            LLAMA_LOG_WARN("%s: KV streaming: the %s pool of %u pages does not fit (%.0f MiB free of %.0f MiB): "
+                           "shrinking to %u pool + %u ring pages, the rest streams from host\n", __func__,
+                           decode ? "decode" : "prefill", n_slots, free/1048576.0, total/1048576.0,
+                           n_slots_fit, n_ring_fit);
+
+            const int64_t n_rows_fit = (int64_t) n_slots_fit*llama_kv_stream::page_size;
+            reshape(n_rows_fit);
+
+            ok = true;
+            for (size_t i = 0; i < ctxs_bufs.size() && ok; ++i) {
+                auto & [ctx, buf] = ctxs_bufs[i];
+                buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ctxs_bufts[i]));
+                if (buf) {
+                    ggml_backend_buffer_clear(buf.get(), 0);
+                }
+                ok = buf != nullptr;
+            }
+            if (ok) {
+                try {
+                    stream->set_pool(n_slots_fit, n_ring_fit);
+                    stream->capped = n_slots_fit < n_slots;
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // last resort: neither the budget nor a shrunken pool fits: leave the cache without a pool (every page is in the
     // host store), for the caller to report and to try again before the next batch
     if (!ok) {
         for (auto & [ctx, buf] : ctxs_bufs) {
@@ -1759,27 +1825,35 @@ bool llama_kv_cache::resize_kv_stream(size_t resident_size, bool decode, uint32_
         }
         reshape(n_rows);
         stream->drop_pool();
+        stream->capped = false;
 
         size_t free = 0;
         size_t total = 0;
         ggml_backend_dev_memory(stream->device(), &free, &total);
         const double MiB = 1024.0*1024.0;
         const char * phase = decode ? "decode" : "prefill";
-        LLAMA_LOG_ERROR("%s: KV streaming: the %s pool of %u pages (%.0f MiB of the %.0f MiB %s KV budget) does not fit: "
-                "%s has %.0f MiB free of %.0f MiB. Lower the %s KV budget, or free VRAM that other processes hold. The KV "
-                "cache stays in host memory, and the next batch tries again.\n", __func__, phase, n_slots,
-                (double) n_slots*bytes_per_cell*llama_kv_stream::page_size/MiB, resident_size/MiB, phase,
-                ggml_backend_dev_name(stream->device()), free/MiB, total/MiB, phase);
+        LLAMA_LOG_ERROR("%s: KV streaming: the %s pool of %u pages (%.0f MiB of the %.0f MiB %s KV budget) does not "
+                        "fit, and no shrunken pool fits either: %s has %.0f MiB free of %.0f MiB. Lower the %s KV "
+                        "budget, or free VRAM that other processes hold. The KV cache stays in host memory, and the "
+                        "next batch tries again.\n", __func__, phase, n_slots,
+                        (double) n_slots*bytes_per_cell*llama_kv_stream::page_size/MiB, resident_size/MiB, phase,
+                        ggml_backend_dev_name(stream->device()), free/MiB, total/MiB, phase);
         return false;
     }
 
-    LLAMA_LOG_DEBUG("%s: pool resized to %u pages, slots to %u pages, in %.1f ms\n", __func__, n_slots, stream->n_ring(),
-            (ggml_time_us() - t_start_us)/1000.0);
+    LLAMA_LOG_DEBUG("%s: pool resized to %u pages, slots to %u pages%s, in %.1f ms\n", __func__, n_slots,
+                    stream->n_ring(), stream->capped ? " (capped)" : "",
+                    (ggml_time_us() - t_start_us)/1000.0);
     return true;
 }
 
 bool llama_kv_cache::kv_stream_needs_resize(uint32_t n_tokens) const {
     if (!stream || !stream->ring_packed()) {
+        return false;
+    }
+    // a capped pool was shrunk to the free VRAM: re-planning would hit the same wall and rebuild the graphs for
+    // nothing; the extra pages simply stream until the phase switch
+    if (stream->capped) {
         return false;
     }
     // at most every attended page that is not resident streams
