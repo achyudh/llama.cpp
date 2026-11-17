@@ -160,6 +160,10 @@ public:
     void drop_pool();
     bool has_pool() const { return n_slots > 0; }
 
+    // shrink-to-fit: the pool was capped below the budget by the available VRAM; do not re-plan (and re-build the
+    // graphs) until the phase switches or VRAM frees up
+    bool capped = false;
+
     // rows [c0, c1) of layer ikv, wherever they live; for state save/restore, with the backend idle
     void get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, void * dst);
     void set_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, const void * src);
