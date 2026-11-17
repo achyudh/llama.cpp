@@ -1773,15 +1773,19 @@ bool llama_kv_cache::resize_kv_stream(size_t resident_size, bool decode, uint32_
         uint32_t n_slots_fit = 0;
         uint32_t n_ring_fit  = 0;
         if (decode && stream->ring_packed()) {
-            const uint32_t n_need = std::min(n_pages, kv_stream_pages_next(n_tokens) + kv_stream_headroom_pages);
-            if (n_fit >= n_need) {
-                n_slots_fit = n_slots;
-                n_ring_fit  = n_ring;
-            } else {
-                // the pool cannot cover every attended page: the ring cycles the streamed ones (at least 2)
-                n_ring_fit  = 2;
-                n_slots_fit = n_fit > n_ring_fit ? n_fit - n_ring_fit : 0;
+            // the same plan as the budget, but against the free VRAM: P pool pages and n_need - P ring pages take
+            // P*page_pool + (n_need - P)*page_ring bytes. The ring must hold every streamed page of a ubatch, so
+            // pool + ring cover n_need; when the free VRAM cannot cover that, no plan fits (last resort below).
+            const uint32_t n_need    = std::min(n_pages, kv_stream_pages_next(n_tokens) + kv_stream_headroom_pages);
+            const size_t   page_ring = stream->ring_page_size();
+            if (free >= (size_t) (n_need - 1)*page_pool + page_ring) {
+                n_slots_fit = std::min(n_slots, (uint32_t) ((free - page_ring)/page_pool));
+                n_ring_fit  = n_slots_fit < n_need ? n_need - n_slots_fit : n_ring;
+            } else if (free > (size_t) n_need*page_ring) {
+                n_slots_fit = std::min(n_slots, (uint32_t) ((free - (size_t) n_need*page_ring)/(page_pool - page_ring)));
+                n_ring_fit  = n_need - n_slots_fit;
             }
+            // else: infeasible, the last resort below leaves the cache without a pool
         } else {
             n_slots_fit = n_fit;
         }
